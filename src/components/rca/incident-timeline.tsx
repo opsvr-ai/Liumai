@@ -13,6 +13,7 @@ import {
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
 
 /* ==========================================================================
  *  IncidentTimeline — Horizontal Incident Timeline
@@ -145,6 +146,8 @@ export interface IncidentTimelineProps {
   autoScroll?: boolean;
   /** Show loading skeleton state */
   isLoading?: boolean;
+  /** Called when the user clicks the manual RCA trigger action */
+  onTriggerRca?: () => void;
 }
 
 export function IncidentTimeline({
@@ -152,6 +155,7 @@ export function IncidentTimeline({
   className,
   autoScroll = true,
   isLoading = false,
+  onTriggerRca,
 }: IncidentTimelineProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const latestRef = useRef<HTMLLIElement>(null);
@@ -190,14 +194,7 @@ export function IncidentTimeline({
   }
 
   if (events.length === 0) {
-    return (
-      <div className={cn("flex items-center justify-center h-32 text-muted-foreground", className)}>
-        <div className="text-center">
-          <Clock className="h-6 w-6 mx-auto mb-1" />
-          <p className="text-xs">暂无时间线事件</p>
-        </div>
-      </div>
-    );
+    return <EmptyTimelineState onTriggerRca={onTriggerRca} className={className} />;
   }
 
   return (
@@ -286,12 +283,27 @@ export function IncidentTimeline({
 
 /* ---- Empty State ---- */
 
-export function EmptyTimelineState() {
+export interface EmptyTimelineStateProps {
+  /** Called when the user clicks the manual RCA trigger action */
+  onTriggerRca?: () => void;
+  /** Optional custom class name */
+  className?: string;
+}
+
+export function EmptyTimelineState({ onTriggerRca, className }: EmptyTimelineStateProps) {
   return (
-    <div className="flex items-center justify-center h-32 text-muted-foreground">
-      <div className="text-center">
-        <Clock className="h-6 w-6 mx-auto mb-1" />
-        <p className="text-xs">暂无时间线事件</p>
+    <div className={cn("flex items-center justify-center h-40 text-muted-foreground", className)}>
+      <div className="text-center max-w-xs">
+        <Clock className="h-8 w-8 mx-auto mb-3 text-muted-foreground/60" />
+        <p className="text-sm font-medium text-foreground mb-1">暂无 RCA 记录</p>
+        <p className="text-xs text-muted-foreground leading-relaxed mb-4">
+          当告警触发 RCA 或您手动发起根因分析后，分析记录将显示在此处
+        </p>
+        {onTriggerRca && (
+          <Button variant="outline" size="sm" onClick={onTriggerRca}>
+            手动触发 RCA
+          </Button>
+        )}
       </div>
     </div>
   );
