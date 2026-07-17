@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 
 /* ==========================================================================
  *  RuleWizard — Progressive Disclosure Wizard for Alert-to-RCA Rule Config
@@ -76,6 +77,7 @@ export function RuleWizard({
   isSubmitting = false,
 }: RuleWizardProps) {
   const [currentStep, setCurrentStep] = useState(0);
+  const [cancelConfirmOpen, setCancelConfirmOpen] = useState(false);
 
   const totalSteps = steps.length;
   const isFirstStep = currentStep === 0;
@@ -94,6 +96,15 @@ export function RuleWizard({
       setCurrentStep((prev) => prev - 1);
     }
   }, [currentStep]);
+
+  const handleCancelClick = useCallback(() => {
+    setCancelConfirmOpen(true);
+  }, []);
+
+  const handleCancelConfirm = useCallback(() => {
+    setCancelConfirmOpen(false);
+    onCancel?.();
+  }, [onCancel]);
 
   const handleStepClick = useCallback(
     (index: number) => {
@@ -210,7 +221,7 @@ export function RuleWizard({
       <div className="flex items-center justify-between px-4 md:px-6 py-4 border-t border-border bg-surface-secondary shrink-0">
         <div className="flex items-center gap-2">
           {isFirstStep && onCancel && (
-            <Button variant="ghost" onClick={onCancel}>
+            <Button variant="ghost" onClick={handleCancelClick}>
               取消
             </Button>
           )}
@@ -253,6 +264,18 @@ export function RuleWizard({
           )}
         </div>
       </div>
+
+      {/* Cancel confirmation dialog */}
+      <ConfirmDialog
+        open={cancelConfirmOpen}
+        onOpenChange={setCancelConfirmOpen}
+        title="放弃更改？"
+        description="您输入的规则配置尚未保存，确定要放弃吗？"
+        confirmLabel="放弃"
+        cancelLabel="继续编辑"
+        variant="destructive"
+        onConfirm={handleCancelConfirm}
+      />
     </div>
   );
 }
