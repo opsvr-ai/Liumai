@@ -1,0 +1,58 @@
+services:
+  postgres:
+    image: docker.1ms.run/postgres:16-alpine
+    container_name: liumai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: liumai
+      POSTGRES_USER: liumai
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-liumai_dev}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liumai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: docker.1ms.run/redis:7-alpine
+    container_name: liumai-redis
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: liumai-backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+asyncpg://liumai:${DB_PASSWORD:-liumai_dev}@postgres:5432/liumai
+      HERMES_GATEWAY_URL: ${HERMES_GATEWAY_URL:-http://host.docker.internal:8080}
+      WECOM_CORP_ID: ${WECOM_CORP_ID}
+      WECOM_CORP_SECRET: ${WECOM_CORP_SECRET}
+      WECOM_AGENT_ID: ${WECOM_AGENT_ID}
+      REDIS_URL: redis://redis:6379/0
+      RCA_MAX_CONCURRENCY: ${RCA_MAX_CONCURRENCY:-5}
+    volumes:
+      - ./hermes-skills:/opt/hermes-skills:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Hermes Gateway — 需要先在宿主机安装，详见下方注释
+  # curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+  # 安装后设置环境变量: HERMES_GATEWAY_URL=http://host.docker.internal:8080
+
+  # 前端在 Windows 直接 npm run dev，不经过 Docker（WSL mount 路径 gRPC 断连）
+
+volumes:
+  postgres_data:
+  redis_data:

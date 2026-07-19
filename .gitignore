@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables (contains secrets)
+.env
+
+# AI assistant artifacts
+context-snapshot.json
+.cc10x/
+.codixing/
+.reflect/
+memory/
+.claude/sessions/
+.claude/state/
+
+# Design tooling cache (keep design docs, skip caches)
+.design/telemetry/
+.design/budget.json
+.design/update-cache.json
+
+# Docker
+docker/
+
+# OS files
+.DS_Store
+Thumbs.db
