@@ -474,7 +474,7 @@ def _parse_hermes_tool_progress(
     tool_name: str = chunk.get("tool", "unknown")
     tool_call_id: str = chunk.get("toolCallId", "")
     status: str = chunk.get("status", "running")
-    emoji: str = chunk.get("emoji", "🔧")
+    emoji: str | None = chunk.get("emoji")  # None → frontend preserves previous emoji
     label: str = chunk.get("label", "")
 
     tool_call = {

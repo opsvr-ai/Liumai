@@ -17,8 +17,8 @@ export default function ChatPage() {
         </p>
       </div>
 
-      {/* Chat area — fills remaining height */}
-      <div className="flex-1 min-h-0">
+      {/* Chat area — fills remaining height, centered and width-constrained */}
+      <div className="flex-1 min-h-0 max-w-[48rem] mx-auto w-full">
         <ChatPanel />
       </div>
     </div>

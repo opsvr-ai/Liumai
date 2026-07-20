@@ -42,7 +42,7 @@ export const ChatPanel: FC = () => {
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [showHistory, setShowHistory] = useState(false);
 
-  const viewportRef = useRef<HTMLDivElement>(null);
+  const bottomRef = useRef<HTMLDivElement>(null);
 
   const reloadSessions = useCallback(async () => {
     try {
@@ -52,10 +52,9 @@ export const ChatPanel: FC = () => {
 
   useEffect(() => { reloadSessions(); }, [reloadSessions]);
 
-  // Auto-scroll
+  // Auto-scroll to bottom when messages change (streaming or new message)
   useEffect(() => {
-    const el = viewportRef.current;
-    if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    bottomRef.current?.scrollIntoView({ behavior: "instant" });
   }, [messages]);
 
   // Refresh session list after streaming finishes
@@ -175,9 +174,9 @@ export const ChatPanel: FC = () => {
       {/* Message list */}
       <div className="flex-1 min-h-0">
         <ScrollArea className="h-full">
-          <div ref={viewportRef} className="flex flex-col gap-3 px-3 py-3">
+          <div className={`flex flex-col gap-3 px-3 py-3 ${messages.length === 0 ? "min-h-full justify-center" : ""}`}>
             {messages.length === 0 && (
-              <div className="flex flex-col items-center justify-center py-12 text-center px-4">
+              <div className="flex flex-col items-center justify-center text-center px-4">
                 <div className="h-12 w-12 rounded-full bg-interactive-primary/10 flex items-center justify-center mb-4">
                   <svg className="h-6 w-6 text-interactive-primary" fill="none" viewBox="0 0 24 24"
                     stroke="currentColor" strokeWidth={1.5}>
@@ -197,6 +196,8 @@ export const ChatPanel: FC = () => {
                 {error}
               </div>
             )}
+            {/* Bottom sentinel — auto-scroll target */}
+            <div ref={bottomRef} />
           </div>
         </ScrollArea>
       </div>
