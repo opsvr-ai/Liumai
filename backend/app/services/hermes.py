@@ -21,6 +21,19 @@ from loguru import logger
 
 from app.config import settings
 
+# ── Runtime config (reloadable from DB, starts from env vars) ─────────────────
+_hermes_url: str = settings.HERMES_GATEWAY_URL
+_hermes_api_key: str | None = settings.HERMES_API_KEY
+
+
+def reload_hermes_config(db_entries: dict[str, str]) -> None:
+    """Reload Hermes config from DB values (called on admin save + startup)."""
+    global _hermes_url, _hermes_api_key
+    _hermes_url = db_entries.get("hermes_url", settings.HERMES_GATEWAY_URL)
+    _hermes_api_key = db_entries.get("hermes_api_key", settings.HERMES_API_KEY) or None
+    logger.info("Hermes config reloaded (url={})", _hermes_url)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -71,8 +84,8 @@ class HermesClient:
     def __init__(self) -> None:
         # base_url should end with ``/v1``, e.g.
         # ``http://<host>:8642/v1``
-        self.base_url = settings.HERMES_GATEWAY_URL.rstrip("/")
-        self.api_key = settings.HERMES_API_KEY
+        self.base_url = _hermes_url.rstrip("/")
+        self.api_key = _hermes_api_key
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(600.0, connect=30.0),
             headers=self._headers(),

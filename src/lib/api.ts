@@ -286,6 +286,11 @@ export interface LdapConfig {
   auto_create_user: boolean;
 }
 
+export interface HermesConfig {
+  url: string;
+  api_key: string;
+}
+
 export const authApi = {
   setupStatus() {
     return request<SetupStatus>("GET", "/auth/setup/status");
@@ -307,6 +312,12 @@ export const authApi = {
   },
   saveLdapConfig(data: LdapConfig) {
     return request<LdapConfig>("PUT", "/auth/ldap-config", data);
+  },
+  getHermesConfig() {
+    return request<HermesConfig>("GET", "/auth/hermes-config");
+  },
+  saveHermesConfig(data: HermesConfig) {
+    return request<HermesConfig>("PUT", "/auth/hermes-config", data);
   },
 };
 

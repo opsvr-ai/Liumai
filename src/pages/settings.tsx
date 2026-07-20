@@ -10,13 +10,14 @@ import {
   FlaskConical,
   ChevronDown,
   ChevronRight,
+  Zap,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { authApi, type LdapConfig, type LdapStatus } from "@/lib/api";
+import { authApi, type HermesConfig, type LdapConfig, type LdapStatus } from "@/lib/api";
 import { useAuth } from "@/components/auth/auth-context";
 import { toast } from "sonner";
 
@@ -32,6 +33,13 @@ export default function SettingsPage() {
   const [cfgLoading, setCfgLoading] = useState(true);
   const [cfgSaving, setCfgSaving] = useState(false);
   const [cfgExpanded, setCfgExpanded] = useState(false);
+
+  /* ── Hermes config form ────────────────────────────────── */
+  const [hermesConfig, setHermesConfig] = useState<HermesConfig | null>(null);
+  const [hermesLoading, setHermesLoading] = useState(true);
+  const [hermesSaving, setHermesSaving] = useState(false);
+  const [hermesExpanded, setHermesExpanded] = useState(false);
+  const [hermesTesting, setHermesTesting] = useState(false);
 
   /* ── Change password ────────────────────────────────────── */
   const [pwOpen, setPwOpen] = useState(false);
@@ -60,10 +68,63 @@ export default function SettingsPage() {
       .finally(() => setCfgLoading(false));
   }, []);
 
+  const loadHermesConfig = useCallback(() => {
+    setHermesLoading(true);
+    authApi
+      .getHermesConfig()
+      .then(setHermesConfig)
+      .catch(() => toast.error("加载 Hermes 配置失败"))
+      .finally(() => setHermesLoading(false));
+  }, []);
+
   useEffect(() => {
     loadLdapStatus();
     loadLdapConfig();
-  }, [loadLdapStatus, loadLdapConfig]);
+    loadHermesConfig();
+  }, [loadLdapStatus, loadLdapConfig, loadHermesConfig]);
+
+  /* ── Save Hermes config ────────────────────────────────── */
+  async function handleSaveHermes() {
+    if (!hermesConfig) return;
+    setHermesSaving(true);
+    try {
+      await authApi.saveHermesConfig(hermesConfig);
+      toast.success("Hermes 配置已保存");
+    } catch (e: any) {
+      toast.error(`保存失败: ${e.message}`);
+    } finally {
+      setHermesSaving(false);
+    }
+  }
+
+  async function handleTestHermes() {
+    setHermesTesting(true);
+    try {
+      const resp = await fetch(`${hermesConfig?.url ?? ""}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(hermesConfig?.api_key ? { Authorization: `Bearer ${hermesConfig.api_key}` } : {}),
+        },
+        body: JSON.stringify({
+          model: "hermes-agent",
+          messages: [{ role: "user", content: "ping" }],
+          max_tokens: 5,
+          stream: false,
+        }),
+      });
+      if (resp.ok) {
+        toast.success("Hermes 服务连接成功");
+      } else {
+        const text = await resp.text().catch(() => "");
+        toast.error(`Hermes 返回 ${resp.status}: ${text.slice(0, 200)}`);
+      }
+    } catch (e: any) {
+      toast.error(`无法连接 Hermes: ${e.message}`);
+    } finally {
+      setHermesTesting(false);
+    }
+  }
 
   /* ── Save LDAP config ──────────────────────────────────── */
   async function handleSaveConfig() {
@@ -290,6 +351,99 @@ export default function SettingsPage() {
             ) : (
               <p className="text-sm text-muted-foreground">
                 加载 LDAP 配置失败
+              </p>
+            )}
+          </CardContent>
+        )}
+      </Card>
+
+      {/* ── Hermes Gateway ──────────────────────────────── */}
+      <Card>
+        <CardHeader
+          className="pb-3 cursor-pointer select-none"
+          onClick={() => setHermesExpanded(!hermesExpanded)}
+        >
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <Zap className="h-4 w-4" />
+              Hermes 智能引擎
+            </CardTitle>
+            <div className="flex items-center gap-2">
+              {hermesExpanded ? (
+                <ChevronDown className="h-4 w-4 text-muted-foreground" />
+              ) : (
+                <ChevronRight className="h-4 w-4 text-muted-foreground" />
+              )}
+            </div>
+          </div>
+        </CardHeader>
+
+        {hermesExpanded && (
+          <CardContent className="space-y-4">
+            {hermesLoading ? (
+              <div className="space-y-3">
+                <Skeleton className="h-9 w-full" />
+                <Skeleton className="h-9 w-full" />
+              </div>
+            ) : hermesConfig ? (
+              <>
+                <div>
+                  <label className="text-xs text-muted-foreground mb-1 block">
+                    API 地址
+                  </label>
+                  <Input
+                    value={hermesConfig.url}
+                    onChange={(e) =>
+                      setHermesConfig((prev) =>
+                        prev ? { ...prev, url: e.target.value } : prev,
+                      )
+                    }
+                    placeholder="http://host.docker.internal:8642/v1"
+                  />
+                  <p className="text-[11px] text-muted-foreground/60 mt-0.5">
+                    Hermes API Server 地址，应包含 /v1 路径
+                  </p>
+                </div>
+
+                <div>
+                  <label className="text-xs text-muted-foreground mb-1 block">
+                    API Key（可选）
+                  </label>
+                  <Input
+                    type="password"
+                    value={hermesConfig.api_key}
+                    onChange={(e) =>
+                      setHermesConfig((prev) =>
+                        prev ? { ...prev, api_key: e.target.value } : prev,
+                      )
+                    }
+                    placeholder="（留空则不使用认证）"
+                  />
+                </div>
+
+                <div className="flex items-center gap-2 pt-2 border-t border-border/50">
+                  <Button
+                    size="sm"
+                    onClick={handleSaveHermes}
+                    disabled={hermesSaving}
+                  >
+                    <Save className="h-3.5 w-3.5 mr-1" />
+                    {hermesSaving ? "保存中…" : "保存配置"}
+                  </Button>
+                  <Button
+                    variant="ghostMuted"
+                    size="sm"
+                    onClick={handleTestHermes}
+                    disabled={hermesTesting}
+                  >
+                    <FlaskConical className="h-3.5 w-3.5 mr-1" />
+                    {hermesTesting ? "测试中…" : "测试连接"}
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                加载 Hermes 配置失败
               </p>
             )}
           </CardContent>

@@ -33,20 +33,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await init_db()
 
-    # Load LDAP config from DB (if saved by admin), fall back to env vars
+    # Load persisted config from DB (fall back to env vars)
     try:
         from app.models import SystemConfig
         from app.models.database import async_session_factory
-        from app.services.ldap import reload_ldap_config
 
         async with async_session_factory() as session:
             from sqlalchemy import select
             rows = await session.execute(select(SystemConfig))
             db_cfg: dict[str, str] = {r.key: r.value for r in rows.scalars()}
+
         if db_cfg:
+            from app.services.ldap import reload_ldap_config
             reload_ldap_config(db_cfg)
+
+            from app.services.hermes import reload_hermes_config
+            reload_hermes_config(db_cfg)
     except Exception:
-        logger.warning("Could not load LDAP config from DB — using env defaults")
+        logger.warning("Could not load config from DB — using env defaults")
 
     yield
 

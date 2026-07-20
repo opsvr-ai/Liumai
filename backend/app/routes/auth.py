@@ -239,3 +239,55 @@ async def save_ldap_config(
     reload_ldap_config(entries)
 
     return body
+
+
+# ── Hermes config ──────────────────────────────────────────────────────────
+
+class HermesConfigOut(BaseModel):
+    url: str = "http://host.docker.internal:8642/v1"
+    api_key: str = ""
+
+
+@router.get("/hermes-config", response_model=HermesConfigOut)
+async def get_hermes_config(
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> HermesConfigOut:
+    """Return current Hermes Gateway configuration."""
+    from app.models import SystemConfig
+
+    rows = await db.execute(select(SystemConfig))
+    cfg: dict[str, str] = {r.key: r.value for r in rows.scalars()}
+    return HermesConfigOut(
+        url=cfg.get("hermes_url", "http://host.docker.internal:8642/v1"),
+        api_key=cfg.get("hermes_api_key", ""),
+    )
+
+
+@router.put("/hermes-config", response_model=HermesConfigOut)
+async def save_hermes_config(
+    body: HermesConfigOut,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> HermesConfigOut:
+    """Save Hermes Gateway configuration. Changes take effect for new connections."""
+    from app.models import SystemConfig
+
+    entries = {
+        "hermes_url": body.url,
+        "hermes_api_key": body.api_key,
+    }
+    for key, value in entries.items():
+        row = await db.get(SystemConfig, key)
+        if row:
+            row.value = value
+            row.updated_at = func.now()
+        else:
+            db.add(SystemConfig(key=key, value=value))
+
+    await db.flush()
+
+    from app.services.hermes import reload_hermes_config
+    reload_hermes_config(entries)
+
+    return body
