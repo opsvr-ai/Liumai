@@ -1,0 +1,63 @@
+# ============================================================
+# Docker build context ignore — keeps the context small & fast
+# ============================================================
+
+# Dependencies (re-installed inside Docker)
+node_modules/
+backend/venv/
+backend/.venv/
+
+# Version control
+.git/
+.gitignore
+.gitattributes
+
+# Docker
+docker-compose*.yml
+.dockerignore
+
+# IDE & editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python runtime
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude & AI tool metadata
+.claude/
+.codegraph/
+.codixing/
+.cc10x/
+.reflect/
+.remember/
+.ruff_cache/
+context-snapshot.json
+
+# Design artifacts (large, not needed at runtime)
+.design/
+
+# Documentation (large, not needed in image)
+hermes-docs/
+memory/
+
+# Misc
+*.md
+!README.md

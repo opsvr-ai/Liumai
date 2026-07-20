@@ -19,6 +19,12 @@ EXCEPTION
 END $$;
 
 DO $$ BEGIN
+    CREATE TYPE auth_type AS ENUM ('LOCAL', 'LDAP');
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
     CREATE TYPE rca_trigger_type AS ENUM ('PASSIVE', 'ACTIVE');
 EXCEPTION
     WHEN duplicate_object THEN NULL;
@@ -119,11 +125,15 @@ INSERT INTO teams (id, name)
 -- Add password_hash column (safe for re-runs)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
 
+-- Add auth_type column (safe for re-runs)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_type auth_type NOT NULL DEFAULT 'LDAP';
+
 -- Seed admin with default password 'admin123' (bcrypt hash)
 -- IMPORTANT: change this password in production!
-INSERT INTO users (id, team_id, username, role, password_hash)
+INSERT INTO users (id, team_id, username, role, password_hash, auth_type)
     VALUES (1, 1, 'admin', 'ADMIN',
-            '$2b$12$LJ3m4ys3GZfnYMz8kVsKaOTSxlf5ZvFGGqFvGkQ7OqQsLJkANhPXO')
+            '$2b$12$HlecgoPIhDe2E1maMkRVIeKxvyl/gJpAPsJKtDfrIGXRwyLphOKjS',
+            'LOCAL')
     ON CONFLICT (id) DO NOTHING;
 
 -- ═══════════════════════════════════════════════════════════════════════════════

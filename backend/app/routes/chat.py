@@ -13,7 +13,7 @@ from typing import Any
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -302,13 +302,13 @@ async def get_chat_session(
     )
 
 
-@router.post("/sessions/{session_id}/messages", status_code=status.HTTP_204_NO_CONTENT)
+@router.post("/sessions/{session_id}/messages")
 async def save_messages(
     session_id: int,
     body: SaveMessagesRequest,
     db: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
-) -> None:
+) -> Response:
     """Save (replace) all messages in a session."""
     row = await db.get(ChatSession, session_id)
     if not row or row.user_id != user.id:
@@ -337,16 +337,18 @@ async def save_messages(
         row.title = body.title
 
     row.updated_at = func.now()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/sessions/{session_id}")
 async def delete_chat_session(
     session_id: int,
     db: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
-) -> None:
+) -> Response:
     """Delete a chat session and all its messages."""
     row = await db.get(ChatSession, session_id)
     if not row or row.user_id != user.id:
         raise HTTPException(status_code=404, detail="会话不存在")
     await db.delete(row)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

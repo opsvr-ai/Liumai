@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
@@ -244,11 +244,11 @@ async def update_rule(
     )
 
 
-@router.delete("/{rule_id}", status_code=204)
+@router.delete("/{rule_id}")
 async def delete_rule(
     rule_id: int,
     db: AsyncSession = Depends(get_db_session),
-) -> None:
+) -> Response:
     """Delete an alert rule."""
     result = await db.execute(select(AlertRule).where(AlertRule.id == rule_id))
     rule = result.scalar_one_or_none()
@@ -261,6 +261,7 @@ async def delete_rule(
     await db.delete(rule)
     await db.flush()
     logger.info("AlertRule deleted: id={}", rule_id)
+    return Response(status_code=204)
 
 
 @router.post("/{rule_id}/toggle", response_model=RuleResponse)

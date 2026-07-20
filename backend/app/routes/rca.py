@@ -144,11 +144,11 @@ async def trigger_rca(
     db.add(session)
     await db.flush()
 
-    # ── Spawn Hermes agent (fire-and-forget) ───────────────────────────
+    # ── Run Hermes analysis ────────────────────────────────────────────
     if status_ == RcaStatus.RUNNING:
         try:
             hermes = HermesClient()
-            hermes_session_id = await hermes.trigger_skill(
+            result = await hermes.trigger_skill(
                 skill_name="rca-fault-delimitation",
                 params={
                     "trigger": "manual",
@@ -158,9 +158,12 @@ async def trigger_rca(
                     "data_sources": req.data_sources,
                 },
             )
-            session.hermes_session_id = hermes_session_id
+            session.hermes_session_id = result["session_id"]
+            session.root_cause_summary = result["output"][:500]
+            session.status = RcaStatus.COMPLETED
+            session.completed_at = datetime.utcnow()
         except Exception:
-            logger.exception("Failed to spawn Hermes RCA session")
+            logger.exception("Hermes RCA failed")
             session.status = RcaStatus.FAILED
 
         await db.flush()
@@ -300,6 +303,6 @@ async def get_queue_status(
 async def _count_by_status(db: AsyncSession, status_: RcaStatus) -> int:
     """Count RCA sessions with a given status."""
     result = await db.execute(
-        select(func.count()).where(RcaSession.status == status_)
+        select(func.count()).where(RcaSession.status == status_.value)
     )
     return result.scalar_one()

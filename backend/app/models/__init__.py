@@ -36,6 +36,13 @@ class UserRole(str, enum.Enum):
     VIEWER = "VIEWER"
 
 
+class AuthType(str, enum.Enum):
+    """How a user authenticates — local password or LDAP/AD."""
+
+    LOCAL = "LOCAL"
+    LDAP = "LDAP"
+
+
 class RcaTriggerType(str, enum.Enum):
     """How the RCA session was initiated."""
 
@@ -103,6 +110,11 @@ class User(Base):
         Enum(UserRole, name="user_role", create_type=True),
         nullable=False,
         default=UserRole.VIEWER,
+    )
+    auth_type = Column(
+        Enum(AuthType, name="auth_type", create_type=True),
+        nullable=False,
+        default=AuthType.LDAP,
     )
     created_at = Column(
         DateTime(timezone=True),

@@ -240,7 +240,7 @@ async def ingest_alert(
 
         # Fire-and-forget: spawn Hermes agent session in background
         try:
-            hermes_session_id = await hermes.trigger_skill(
+            result = await hermes.trigger_skill(
                 skill_name="rca-fault-delimitation",
                 params={
                     "alert_id": alert.alert_id,
@@ -253,8 +253,10 @@ async def ingest_alert(
                     "rule_id": target_rule.id,
                 },
             )
-            rca.hermes_session_id = hermes_session_id
-            rca.status = RcaStatus.RUNNING
+            rca.hermes_session_id = result["session_id"]
+            rca.root_cause_summary = result["output"][:500]
+            rca.status = RcaStatus.COMPLETED
+            rca.completed_at = datetime.now(timezone.utc)
         except Exception:
             logger.exception("Failed to spawn Hermes RCA session")
             rca.status = RcaStatus.FAILED

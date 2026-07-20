@@ -12,7 +12,7 @@ from typing import Annotated
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
+import bcrypt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,17 +22,18 @@ from app.models.database import get_db_session
 
 # ── Password hashing ───────────────────────────────────────────────────────────
 
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-
 def hash_password(password: str) -> str:
     """Return a bcrypt hash of *password*."""
-    return _pwd_ctx.hash(password)
+    return bcrypt.hashpw(
+        password.encode("utf-8"), bcrypt.gensalt(),
+    ).decode("utf-8")
 
 
 def verify_password(plain: str, hashed: str) -> bool:
     """Check *plain* against *hashed*."""
-    return _pwd_ctx.verify(plain, hashed)
+    return bcrypt.checkpw(
+        plain.encode("utf-8"), hashed.encode("utf-8"),
+    )
 
 
 # ── JWT ────────────────────────────────────────────────────────────────────────

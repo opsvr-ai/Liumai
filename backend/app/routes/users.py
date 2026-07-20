@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, hash_password, require_admin
-from app.models import User, UserRole
+from app.models import AuthType, User, UserRole
 from app.models.database import get_db_session
 
 router = APIRouter()
@@ -18,6 +18,7 @@ class UserOut(BaseModel):
     id: int
     username: str
     role: str
+    auth_type: str
     team_id: int
     created_at: str | None = None
     model_config = {"from_attributes": True}
@@ -46,6 +47,7 @@ async def list_users(
     return [
         UserOut(
             id=u.id, username=u.username, role=u.role.value,
+            auth_type=u.auth_type.value,
             team_id=u.team_id,
             created_at=u.created_at.isoformat() if u.created_at else None,
         )
@@ -71,11 +73,12 @@ async def create_user(
         password_hash=hash_password(body.password),
         role=UserRole(role),
         team_id=body.team_id,
+        auth_type=AuthType.LOCAL,
     )
     db.add(user)
     await db.flush()
     await db.refresh(user)
-    return UserOut(id=user.id, username=user.username, role=user.role.value, team_id=user.team_id)
+    return UserOut(id=user.id, username=user.username, role=user.role.value, auth_type=user.auth_type.value, team_id=user.team_id)
 
 
 @router.put("/{user_id}", response_model=UserOut)
@@ -99,15 +102,15 @@ async def update_user(
         user.team_id = body.team_id
     await db.flush()
     await db.refresh(user)
-    return UserOut(id=user.id, username=user.username, role=user.role.value, team_id=user.team_id)
+    return UserOut(id=user.id, username=user.username, role=user.role.value, auth_type=user.auth_type.value, team_id=user.team_id)
 
 
-@router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{user_id}")
 async def delete_user(
     user_id: int,
     db: AsyncSession = Depends(get_db_session),
     _admin: User = Depends(require_admin),
-) -> None:
+) -> Response:
     """Delete a user (admin only)."""
     user = await db.get(User, user_id)
     if not user:
@@ -115,3 +118,4 @@ async def delete_user(
     if user.id == 1:
         raise HTTPException(status_code=400, detail="不能删除默认管理员")
     await db.delete(user)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

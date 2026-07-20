@@ -12,6 +12,8 @@ interface AuthState {
   username: string | null;
   role: string | null;
   login: (username: string, password: string) => Promise<void>;
+  setup: (username: string, password: string) => Promise<void>;
+  checkSetup: () => Promise<boolean>;
   logout: () => void;
   isAuthenticated: boolean;
   isAdmin: boolean;
@@ -19,7 +21,8 @@ interface AuthState {
 
 const AuthContext = createContext<AuthState>({
   token: null, username: null, role: null,
-  login: async () => {}, logout: () => {},
+  login: async () => {}, setup: async () => {}, checkSetup: async () => false,
+  logout: () => {},
   isAuthenticated: false, isAdmin: false,
 });
 
@@ -52,6 +55,36 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setRole(data.role);
   }, []);
 
+  const setup = useCallback(async (user: string, password: string) => {
+    const res = await fetch("/api/auth/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: user, password }),
+    });
+    if (!res.ok) {
+      const msg = await res.text().catch(() => "初始化失败");
+      throw new Error(msg);
+    }
+    const data = await res.json() as { token: string; username: string; role: string };
+    localStorage.setItem("liumai_token", data.token);
+    localStorage.setItem("liumai_user", data.username);
+    localStorage.setItem("liumai_role", data.role);
+    setToken(data.token);
+    setUsername(data.username);
+    setRole(data.role);
+  }, []);
+
+  const checkSetup = useCallback(async (): Promise<boolean> => {
+    try {
+      const res = await fetch("/api/auth/setup/status");
+      if (!res.ok) return false;
+      const data = await res.json() as { needs_setup: boolean };
+      return data.needs_setup;
+    } catch {
+      return false;
+    }
+  }, []);
+
   const logout = useCallback(() => {
     localStorage.removeItem("liumai_token");
     localStorage.removeItem("liumai_user");
@@ -61,10 +94,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const value = useMemo<AuthState>(
     () => ({
-      token, username, role, login, logout,
+      token, username, role, login, setup, checkSetup, logout,
       isAuthenticated: !!token, isAdmin: role === "ADMIN",
     }),
-    [token, username, role, login, logout],
+    [token, username, role, login, setup, checkSetup, logout],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

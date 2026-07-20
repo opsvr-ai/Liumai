@@ -1,188 +1,81 @@
 /* ==========================================================================
- *  Six Pulses (六脉) Design Token System
- *  Tailwind v4 @theme + shadcn/ui CSS Variable Overrides
+ * 六脉 (Liumai) — Minimalist Light Theme
  *
- *  Dark theme default (v1 only — no light theme).
- *  Every color, font, spacing, radius, shadow, and motion value
- *  lives here. No hardcoded values outside this file.
+ * Design language: ChatGPT-inspired — neutral, clean, content-first.
+ * The UI chrome retreats so the data speaks.
  *
- *  Conventions:
- *    @theme        — Concrete token values → generate Tailwind utilities
- *    @theme inline — shadcn/ui variable indirection (var() references)
- *    :root / .dark — shadcn/ui CSS custom properties for component use
- *
- *  Token naming:
- *    --color-{role}     → bg-*, text-*, border-* utilities
- *    --font-{role}      → font-* utilities
- *    --font-size-{role} → text-* utilities (combined with line-height)
- *    --font-weight-*    → font-* weight utilities
- *    --line-height-*    → leading-* utilities
- *    --radius-{role}    → rounded-* utilities
- *    --shadow-{role}    → shadow-* utilities
- *    --duration-*       → duration-* utilities
- *    --ease-*           → ease-* utilities
+ * References: .design/patterns/motion.md, .design/patterns/accessibility.md
  * ========================================================================== */
 
 @import "tailwindcss";
 
 
 /* ==========================================================================
- *  Section 1: Six Pulses Semantic Tokens
- *
- *  These are the project's own design tokens. Every component and layout
- *  references these. Changing a value here propagates everywhere.
+ *  Section 1: Semantic Design Tokens
  * ========================================================================== */
 @theme {
 
-  /* --------------------------------------------------------------------
-   *  1a. Surface Colors
-   *  Dark gray canvas in the #1a1b1e range. Never pure black (#000000).
-   *  --------------------------------------------------------------------
-   *  surface-primary   — Main application canvas (darkest)
-   *  surface-secondary — Card / elevated surface backgrounds
-   *  surface-tertiary  — Popover / dropdown / modal surface backgrounds
-   * -------------------------------------------------------------------- */
-  --color-surface-primary:  oklch(14.5% 0.005 240);
-  --color-surface-secondary: oklch(18%  0.006 240);
-  --color-surface-tertiary:  oklch(22%  0.007 240);
+  /* ── 1a. Surface (light, airy, neutral) ────────────────────────────────── */
+  --color-surface-primary:    #ffffff;
+  --color-surface-secondary:  #f7f7f8;
+  --color-surface-tertiary:   #ececf1;
 
-  /* --------------------------------------------------------------------
-   *  1b. Text Hierarchy
-   *  --------------------------------------------------------------------
-   *  text-primary   — High-emphasis body / heading text (near-white)
-   *  text-secondary — Medium-emphasis secondary content (light gray)
-   *  text-muted     — Low-emphasis labels / placeholder / metadata (dim gray)
-   *  text-inverse   — Dark-on-light scenario (e.g., text on brand buttons)
-   * -------------------------------------------------------------------- */
-  --color-text-primary:   oklch(93% 0.005 240);
-  --color-text-secondary: oklch(65% 0.02  240);
-  --color-text-muted:     oklch(45% 0.015 240);
-  --color-text-inverse:   oklch(15% 0.01  240);
+  /* ── 1b. Text hierarchy ────────────────────────────────────────────────── */
+  --color-text-primary:    #1a1a2e;
+  --color-text-secondary:  #6b6b80;
+  --color-text-muted:      #8e8ea0;
+  --color-text-inverse:    #ffffff;
 
-  /* --------------------------------------------------------------------
-   *  1c. Interactive / Brand Colors
-   *  Used for primary actions, links, and focus indicators. Blue hue
-   *  chosen for professional, calm, trustworthy tone (ops domain).
-   * -------------------------------------------------------------------- */
-  --color-interactive-primary: oklch(55% 0.18 255);
-  --color-interactive-hover:   oklch(50% 0.19 255);
-  --color-interactive-active:  oklch(42% 0.20 255);
+  /* ── 1c. Interactive (subtle, professional blue-gray) ──────────────────── */
+  --color-interactive-primary: #4f6bf7;
+  --color-interactive-hover:   #3d54d4;
+  --color-interactive-active:  #2e43b8;
 
-  /* --------------------------------------------------------------------
-   *  1d. Semantic Status Colors
-   *  Each incident / alert status has a distinct hue.
-   *  Used for badges, dots, sidebar strips, and textual indicators.
-   *  MUST always be paired with icon + label (WCAG 1.4.1).
-   * -------------------------------------------------------------------- */
-  --color-status-resolved:       oklch(62% 0.19 145);  /* green  */
-  --color-status-active:         oklch(55% 0.20  30);  /* red    */
-  --color-status-investigating:  oklch(70% 0.18  85);  /* amber  */
-  --color-status-info:           oklch(55% 0.15 255);  /* blue   */
+  /* ── 1d. Status (semantic, same hue families) ──────────────────────────── */
+  --color-status-resolved:      #10a861;  /* green  */
+  --color-status-active:        #ef4444;  /* red    */
+  --color-status-investigating: #f59e0b;  /* amber  */
+  --color-status-info:          #4f6bf7;  /* blue   */
 
-  /* --------------------------------------------------------------------
-   *  1e. Border and Divider Colors
-   * -------------------------------------------------------------------- */
-  --color-border-default: oklch(30% 0.01 240);
-  --color-border-subtle:  oklch(22% 0.008 240);
+  /* ── 1e. Border / divider ──────────────────────────────────────────────── */
+  --color-border-default: #e5e5e8;
+  --color-border-subtle:  #f0f0f2;
 
-  /* --------------------------------------------------------------------
-   *  1f. Overlay (Modal Backdrop)
-   * -------------------------------------------------------------------- */
-  --color-overlay: oklch(0% 0 0 / 0.6);
+  /* ── 1f. Overlay ───────────────────────────────────────────────────────── */
+  --color-overlay: rgb(0 0 0 / 0.4);
 
-  /* ====================================================================
-   *  Section 2: Typography Tokens
-   * ==================================================================== */
-
-  /* --------------------------------------------------------------------
-   *  2a. Font Families
-   *  --font-sans — Primary UI type (system stack for zero cost)
-   *  --font-mono — Data surfaces: metrics, timestamps, trace IDs, logs
-   * -------------------------------------------------------------------- */
-  --font-sans: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji",
-               "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
-  --font-mono: "JetBrains Mono", "IBM Plex Mono", "SF Mono", ui-monospace,
-               "Cascadia Code", "Source Code Pro", Menlo, Consolas, monospace;
-
-  /* --------------------------------------------------------------------
-   *  2b. Font Size Scale
-   *  Tailwind v4 defaults (xs 0.75rem … 4xl 2.25rem) are inherited.
-   *  Additional size for dense data displays:
-   *  data — 0.8125rem (13px) sits between sm (14px) and xs (12px)
-   * -------------------------------------------------------------------- */
+  /* ── Typography ────────────────────────────────────────────────────────── */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", ui-monospace,
+               Menlo, Consolas, monospace;
   --font-size-data: 0.8125rem;
-
-  /* --------------------------------------------------------------------
-   *  2c. Font Weights
-   * -------------------------------------------------------------------- */
   --font-weight-normal:   400;
   --font-weight-medium:   500;
   --font-weight-semibold: 600;
   --font-weight-bold:     700;
-
-  /* --------------------------------------------------------------------
-   *  2d. Line Heights
-   *  tight       — Headings and labels
-   *  normal      — Body text paragraphs
-   *  data-dense  — Tables, metric grids, log rows
-   * -------------------------------------------------------------------- */
   --line-height-tight:      1.15;
   --line-height-normal:     1.5;
   --line-height-data-dense: 1.3;
 
-  /* ====================================================================
-   *  Section 3: Border Radius Tokens
-   *  shadcn/ui default --radius is 0.5rem (mapped separately below).
-   *  These provide finer-grained control.
-   * ==================================================================== */
+  /* ── Radius ────────────────────────────────────────────────────────────── */
   --radius-sm:  0.25rem;
   --radius-md:  0.375rem;
   --radius-lg:  0.5rem;
   --radius-xl:  0.75rem;
   --radius-2xl: 1rem;
 
-  /* ====================================================================
-   *  Section 4: Shadow / Elevation Tokens
-   *  Dark-theme-appropriate shadows use black with varying opacity.
-   * ==================================================================== */
-  --shadow-sm: 0 1px 2px 0 oklch(0% 0 0 / 0.3);
-  --shadow-md: 0 4px 6px -1px oklch(0% 0 0 / 0.3),
-               0 2px 4px -2px oklch(0% 0 0 / 0.2);
-  --shadow-lg: 0 10px 15px -3px oklch(0% 0 0 / 0.4),
-               0 4px 6px -4px oklch(0% 0 0 / 0.2);
+  /* ── Shadows (light theme — subtle, airy) ──────────────────────────────── */
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.04);
+  --shadow-md: 0 4px 12px rgb(0 0 0 / 0.06);
+  --shadow-lg: 0 12px 32px rgb(0 0 0 / 0.08);
 
-  /* ====================================================================
-   *  Section 5: Motion Tokens
-   *
-   *  Durations and easing curves for all transitions and animations.
-   *  Every animation MUST reference these tokens — never hardcode values.
-   *
-   *  Durations:
-   *    instant (0ms)   — Theme switches, reduced-motion override target
-   *    fast    (100ms) — Micro-interactions: hover, active, focus
-   *    normal  (200ms) — Standard: panel open/close, element appear, state change
-   *    slow    (300ms) — Entrance: modal overlay fade, emphasis transitions
-   *    slide   (250ms) — Slide-out drawer, sidebar collapse, Sheet
-   *
-   *  Easing curves:
-   *    ease-out        — Decelerate: enter / reveal animations
-   *    ease-in         — Accelerate: exit / dismiss animations
-   *    ease-in-out     — Standard: expand / collapse, size transitions
-   *    ease-linear     — Color / opacity transitions only (no spatial motion)
-   *
-   *  Functional-only animation: animation must communicate a state change or
-   *  spatial relationship. Never animate for decoration (no pulsing logos,
-   *  glowing borders, spinning loaders that persist). The single exception is
-   *  a 3-second subtle pulse on the status badge when a NEW alert arrives.
-   *
-   *  Reference: .design/patterns/motion.md
-   * ==================================================================== */
+  /* ── Motion ────────────────────────────────────────────────────────────── */
   --duration-instant: 0ms;
   --duration-fast:    100ms;
   --duration-normal:  200ms;
   --duration-slow:    300ms;
   --duration-slide:   250ms;
-
   --ease-out:     cubic-bezier(0.16, 1, 0.3, 1);
   --ease-in:      cubic-bezier(0.4, 0, 0.68, 0.06);
   --ease-in-out:  cubic-bezier(0.65, 0, 0.35, 1);
@@ -191,41 +84,8 @@
 
 
 /* ==========================================================================
- *  Section 6: shadcn/ui Compatibility Layer
- *
- *  Two mechanisms work together to make shadcn/ui components consume the
- *  Six Pulses token system:
- *
- *  6a. @theme inline — Maps shadcn Tailwind utility names to CSS variables
- *      (e.g., bg-background → var(--background)).
- *
- *  6b. :root / .dark — Defines the actual CSS variable values that shadcn/ui
- *      components read directly (e.g., --background: oklch(…)).
- *
- *  Mapping between Six Pulses tokens and shadcn/ui CSS variables:
- *    --background         ← --color-surface-primary          (main canvas)
- *    --foreground         ← --color-text-primary             (primary text)
- *    --card               ← --color-surface-secondary        (card bg)
- *    --card-foreground    ← --color-text-primary             (card text)
- *    --popover            ← --color-surface-tertiary         (popover bg)
- *    --popover-foreground ← --color-text-primary             (popover text)
- *    --primary            ← --color-interactive-primary      (brand action)
- *    --primary-foreground ← near-white                       (on primary)
- *    --secondary          ← --color-surface-tertiary         (secondary bg)
- *    --secondary-foreground ← --color-text-secondary         (secondary text)
- *    --muted              ← --color-surface-secondary        (muted bg)
- *    --muted-foreground   ← --color-text-muted               (muted text)
- *    --accent             ← --color-surface-tertiary         (accent bg)
- *    --accent-foreground  ← --color-text-primary             (accent text)
- *    --destructive        ← --color-status-active (red)      (danger)
- *    --destructive-foreground ← white                        (on destructive)
- *    --border             ← --color-border-default           (borders)
- *    --input              ← --color-border-default           (input border)
- *    --ring               ← --color-interactive-primary @ 0.8  (focus ring)
- *    --radius             ← 0.5rem                           (shadcn default)
+ *  Section 2: shadcn/ui Compatibility Layer
  * ========================================================================== */
-
-/* --- 6a. Tailwind utility → CSS variable indirection --- */
 @theme inline {
   --color-background:           var(--background);
   --color-foreground:           var(--foreground);
@@ -246,100 +106,76 @@
   --color-border:               var(--border);
   --color-input:                var(--input);
   --color-ring:                 var(--ring);
+  --color-success:              var(--success);
+  --color-success-foreground:   var(--success-foreground);
+  --color-info:                 var(--info);
+  --color-info-foreground:      var(--info-foreground);
 }
 
-/* --- 6b. shadcn/ui CSS variable definitions (dark theme) --- */
-:root,
-.dark {
-  --background:           oklch(14.5% 0.005 240);
-  --foreground:           oklch(93%  0.005 240);
-  --card:                 oklch(18%  0.006 240);
-  --card-foreground:      oklch(93%  0.005 240);
-  --popover:              oklch(22%  0.007 240);
-  --popover-foreground:   oklch(93%  0.005 240);
-  --primary:              oklch(55%  0.18  255);
-  --primary-foreground:   oklch(15%  0.01  240);
-  --secondary:            oklch(22%  0.007 240);
-  --secondary-foreground: oklch(65%  0.02  240);
-  --muted:                oklch(18%  0.006 240);
-  --muted-foreground:     oklch(45%  0.015 240);
-  --accent:               oklch(22%  0.007 240);
-  --accent-foreground:    oklch(93%  0.005 240);
-  --destructive:          oklch(55%  0.20  30);
-  --destructive-foreground: oklch(98% 0 0);
-  --border:               oklch(30%  0.01  240);
-  --input:                oklch(30%  0.01  240);
-  --ring:                 oklch(55%  0.18  255 / 0.8);
-  --radius:               0.5rem;
+/* ── shadcn CSS variables (light theme) ──────────────────────────────────── */
+:root {
+  --background:           #ffffff;
+  --foreground:           #1a1a2e;
+  --card:                 #ffffff;
+  --card-foreground:      #1a1a2e;
+  --popover:              #ffffff;
+  --popover-foreground:   #1a1a2e;
+  --primary:              #4f6bf7;
+  --primary-foreground:   #ffffff;
+  --secondary:            #f7f7f8;
+  --secondary-foreground: #1a1a2e;
+  --muted:                #f7f7f8;
+  --muted-foreground:     #8e8ea0;
+  --accent:               #f0f0fd;
+  --accent-foreground:    #4f6bf7;
+  --destructive:          #ef4444;
+  --destructive-foreground: #ffffff;
+  --success:              #10a861;
+  --success-foreground:   #ffffff;
+  --info:                 #4f6bf7;
+  --info-foreground:      #ffffff;
+  --border:               #e5e5e8;
+  --input:                #e5e5e8;
+  --ring:                 rgb(79 107 247 / 0.25);
+  --radius:               0.75rem;
 }
 
 
 /* ==========================================================================
- *  Section 7: Monospace Data Typography Utility
- *
- *  Apply tabular-nums on monospace text so numeric values (metric readings,
- *  timestamps, trace IDs, log line numbers) align vertically.
- *
- *  Usage:
- *    <span class="font-mono tabular-nums">1,024</span>
+ *  Section 3: Base Element Reset
  * ========================================================================== */
-@utility tabular-nums {
-  font-variant-numeric: tabular-nums;
+* {
+  border-color: var(--border);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 
 /* ==========================================================================
- *  Section 8: Global Reduced Motion
- *
- *  Respect the user's OS-level motion preference by zeroing all animation
- *  and transition durations. Per-element overrides can use Tailwind's
- *  `motion-safe:` / `motion-reduce:` variants.
- * ========================================================================== */
-@media (prefers-reduced-motion: reduce) {
-  *,
-  *::before,
-  *::after {
-    animation-duration: 0.01ms !important;
-    transition-duration: 0.01ms !important;
-  }
-}
-
-
-/* ==========================================================================
- *  Section 9: Global Focus Styles and Accessibility
- *
- *  Focus-visible outline provides a high-contrast keyboard focus indicator
- *  that appears only when the user is navigating via keyboard (not mouse).
- *  This applies to all interactive elements globally, ensuring every
- *  focusable control has a visible focus ring.
- *
- *  Properties:
- *    outline: 2px solid var(--color-interactive-primary)
- *    outline-offset: 2px
- *
- *  Contrast verification (dark theme):
- *    --color-interactive-primary (oklch(55% 0.18 255) ≈ #4a7eff) on
- *    --color-surface-primary (oklch(14.5% 0.005 240) ≈ #1c1d21)
- *    yields approximately 7.1:1 — well above the 3:1 minimum required by
- *    WCAG 2.1 SC 1.4.11 (Non-text Contrast) for UI components.
- *
- *  shadcn/ui components additionally use --ring for their focus indicator:
- *    --ring: oklch(55% 0.18 255 / 0.8)
- *    This softer ring is intended for components that carry their own focus
- *    styling (buttons, inputs, selects), while the global :focus-visible
- *    provides a consistent fallback for all other interactive elements.
- *
- *  Reference: .design/patterns/accessibility.md
+ *  Section 4: Focus Ring
  * ========================================================================== */
 :focus-visible {
-  outline: 2px solid var(--color-interactive-primary);
+  outline: 2px solid var(--primary);
   outline-offset: 2px;
 }
 
-/* Ensure focus rings are removed for mouse clicks but still visible for keyboard
- * navigation. The :focus-visible pseudo-class handles this natively in modern
- * browsers. For older browsers, provide a subtle fallback that doesn't obscure
- * the UI. */
 :focus:not(:focus-visible) {
   outline: none;
+}
+
+
+/* ==========================================================================
+ *  Section 5: Reduced Motion
+ * ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

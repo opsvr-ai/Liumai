@@ -1,6 +1,22 @@
+# ============================================================
+# 六脉 (Liumai) — RCA Dashboard platform
+# ============================================================
+# Start everything:
+#   docker compose up -d
+#
+# Build + start (after code changes):
+#   docker compose up -d --build
+#
+# Start only specific services:
+#   docker compose up -d postgres redis
+# ============================================================
+
 services:
+  # ===========================================================
+  # PostgreSQL 16 — primary data store
+  # ===========================================================
   postgres:
-    image: docker.1ms.run/postgres:16-alpine
+    image: postgres:16-alpine
     container_name: liumai-postgres
     restart: unless-stopped
     environment:
@@ -11,20 +27,35 @@ services:
       - postgres_data:/var/lib/postgresql/data
       - ./backend/migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     ports:
-      - "5432:5432"
+      - "${DB_PORT:-5432}:5432"
+    networks:
+      - liumai-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U liumai"]
       interval: 10s
       timeout: 5s
       retries: 5
 
+  # ===========================================================
+  # Redis 7 — caching & session store
+  # ===========================================================
   redis:
-    image: docker.1ms.run/redis:7-alpine
+    image: redis:7-alpine
     container_name: liumai-redis
     restart: unless-stopped
     volumes:
       - redis_data:/data
+    networks:
+      - liumai-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
+  # ===========================================================
+  # FastAPI backend — RCA analysis engine
+  # ===========================================================
   backend:
     build:
       context: .
@@ -34,25 +65,52 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://liumai:${DB_PASSWORD:-liumai_dev}@postgres:5432/liumai
       HERMES_GATEWAY_URL: ${HERMES_GATEWAY_URL:-http://host.docker.internal:8080}
-      WECOM_CORP_ID: ${WECOM_CORP_ID}
-      WECOM_CORP_SECRET: ${WECOM_CORP_SECRET}
-      WECOM_AGENT_ID: ${WECOM_AGENT_ID}
+      HERMES_API_KEY: ${HERMES_API_KEY:-}
+      WECOM_CORP_ID: ${WECOM_CORP_ID:-}
+      WECOM_CORP_SECRET: ${WECOM_CORP_SECRET:-}
+      WECOM_AGENT_ID: ${WECOM_AGENT_ID:-}
       REDIS_URL: redis://redis:6379/0
       RCA_MAX_CONCURRENCY: ${RCA_MAX_CONCURRENCY:-5}
     volumes:
       - ./hermes-skills:/opt/hermes-skills:ro
     ports:
-      - "8000:8000"
+      - "${BACKEND_PORT:-8000}:8000"
+    networks:
+      - liumai-net
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_started
+    extra_hosts:
+      # host.docker.internal → host gateway (Linux Docker 20.10+)
+      # Allows the backend to reach Hermes Gateway running on the host
+      - "host.docker.internal:host-gateway"
 
-  # Hermes Gateway — 需要先在宿主机安装，详见下方注释
-  # curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
-  # 安装后设置环境变量: HERMES_GATEWAY_URL=http://host.docker.internal:8080
+  # ===========================================================
+  # nginx + React frontend — dashboard UI
+  # ===========================================================
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    container_name: liumai-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    networks:
+      - liumai-net
+    depends_on:
+      - backend
 
-  # 前端在 Windows 直接 npm run dev，不经过 Docker（WSL mount 路径 gRPC 断连）
+  # Hermes Gateway — install on host:
+  #   curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+  # Set HERMES_GATEWAY_URL=http://host.docker.internal:8080 in .env
 
 volumes:
   postgres_data:
   redis_data:
+
+networks:
+  liumai-net:
+    driver: bridge
