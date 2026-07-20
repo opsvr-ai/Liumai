@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Activity, History, Home, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
+import { Activity, Database, History, Home, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-context";
 import { DashboardShell, type SidebarItem } from "@/components/layout/dashboard-shell";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -15,6 +15,7 @@ import HistoryPage from "@/pages/history/history-page";
 import SettingsPage from "@/pages/settings";
 import UsersPage from "@/pages/users";
 import SkillsPage from "@/pages/skills";
+import DataSourcesPage from "@/pages/datasources";
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth();
@@ -34,6 +35,7 @@ function Shell({ children }: { children: React.ReactNode }) {
       { id: "chat", label: "智能对话", icon: <MessageCircle className="h-4 w-4" />, isActive: location.pathname.startsWith("/chat"), onClick: () => navigate("/chat") },
       { id: "rca", label: "RCA 分析", icon: <Activity className="h-4 w-4" />, isActive: location.pathname.startsWith("/rca"), onClick: () => navigate("/rca") },
       { id: "rules", label: "告警规则", icon: <Shield className="h-4 w-4" />, isActive: location.pathname.startsWith("/rules"), onClick: () => navigate("/rules") },
+      { id: "datasources", label: "数据源", icon: <Database className="h-4 w-4" />, isActive: location.pathname.startsWith("/datasources"), onClick: () => navigate("/datasources") },
       { id: "history", label: "历史记录", icon: <History className="h-4 w-4" />, isActive: location.pathname.startsWith("/history"), onClick: () => navigate("/history") },
       { id: "skills", label: "技能中心", icon: <Wrench className="h-4 w-4" />, isActive: location.pathname.startsWith("/skills"), onClick: () => navigate("/skills") },
     ];
@@ -80,6 +82,7 @@ export default function App() {
                     <Route path="/settings" element={<SettingsPage />} />
                     <Route path="/users" element={<UsersPage />} />
                     <Route path="/skills" element={<SkillsPage />} />
+                    <Route path="/datasources" element={<DataSourcesPage />} />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>
                 </Shell>

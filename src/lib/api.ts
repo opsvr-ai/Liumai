@@ -334,6 +334,45 @@ export const authApi = {
   },
 };
 
+/* ── Data Sources ──────────────────────────────────── */
+
+export interface DataSourceOut {
+  id: number;
+  name: string;
+  type: string;
+  config: Record<string, unknown>;
+  enabled: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+const TYPE_LABELS: Record<string, string> = {
+  prometheus: "Prometheus",
+  zabbix: "Zabbix",
+  clickhouse: "ClickHouse",
+  kafka: "Kafka",
+  api: "API",
+};
+
+export const dataSourceApi = {
+  list(type?: string) {
+    const q = type ? `?type=${type}` : "";
+    return request<DataSourceOut[]>("GET", `/datasources${q}`);
+  },
+  create(data: { name: string; type: string; config: Record<string, unknown> }) {
+    return request<DataSourceOut>("POST", "/datasources", data);
+  },
+  update(id: number, data: { name?: string; config?: Record<string, unknown>; enabled?: boolean }) {
+    return request<DataSourceOut>("PUT", `/datasources/${id}`, data);
+  },
+  delete(id: number) {
+    return request<void>("DELETE", `/datasources/${id}`);
+  },
+  test(id: number) {
+    return request<{ ok: boolean; message: string }>("POST", `/datasources/${id}/test`);
+  },
+};
+
 /* ── Hermes skills & toolsets ─────────────────────── */
 
 export interface HermesSkill {
