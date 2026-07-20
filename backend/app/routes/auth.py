@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import create_token, get_current_user, hash_password, verify_password
+from app.auth import create_token, get_current_user, hash_password, require_admin, verify_password
 from app.models import AuthType, User, UserRole
 from app.models.database import get_db_session
 from app.services.ldap import authenticate_ldap, test_ldap_connection
