@@ -92,9 +92,12 @@ export function useChat() {
                   : true,
           };
         } else {
-          // Insert new tool-call message BEFORE any assistant bubble that
-          // may already be accumulating text
-          const insertAt = next.findIndex((m) => m.role === "assistant");
+          // Insert new tool-call message BEFORE the LAST assistant bubble
+          // (the one currently streaming), not the first one
+          let insertAt = -1;
+          for (let i = next.length - 1; i >= 0; i--) {
+            if (next[i].role === "assistant") { insertAt = i; break; }
+          }
           const toolMsg: DisplayMessage = {
             id: `tool-${tcId}`,
             role: "tool",

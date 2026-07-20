@@ -66,17 +66,19 @@ const ToolMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
 
   return (
     <div className="flex gap-3 justify-start" role="article" aria-label="tool call">
-      {/* Tool emoji as avatar — use Hermes-provided emoji */}
+      {/* Avatar — prefer Hermes emoji, fall back to spinner/check */}
       <div
         className={cn(
-          "shrink-0 h-7 w-7 rounded-full flex items-center justify-center mt-0.5 transition-colors text-sm leading-none",
+          "shrink-0 h-7 w-7 rounded-full flex items-center justify-center mt-0.5 transition-colors text-base leading-none",
           isRunning
             ? "bg-status-investigating/10"
             : "bg-status-resolved/10",
         )}
         aria-hidden="true"
       >
-        {isRunning ? (
+        {emoji ? (
+          <span className="leading-none">{emoji}</span>
+        ) : isRunning ? (
           <Loader2 className="h-3.5 w-3.5 text-status-investigating animate-spin" />
         ) : (
           <Check className="h-3.5 w-3.5 text-status-resolved" />
