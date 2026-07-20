@@ -1,7 +1,7 @@
 /** Data sources — manage external monitoring/telemetry connections. */
 
-import { useCallback, useEffect, useState } from "react";
-import { Plus, Pencil, Trash2, RefreshCw, FlaskConical, Check, X, PlusCircle, MinusCircle } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Plus, Pencil, Trash2, RefreshCw, FlaskConical, Check, X, PlusCircle, MinusCircle, Database } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -65,6 +65,11 @@ export default function DataSourcesPage() {
   const [headerRows, setHeaderRows] = useState<{ key: string; value: string }[]>([{ key: "", value: "" }]);
   const [bodyType, setBodyType] = useState<string>("none");
   const [bodyContent, setBodyContent] = useState("");
+
+  const stats = useMemo(() => {
+    const byType = (t: string) => sources.filter((s) => s.type === t).length;
+    return { total: sources.length, prometheus: byType("prometheus"), zabbix: byType("zabbix"), clickhouse: byType("clickhouse"), kafka: byType("kafka"), api: byType("api") };
+  }, [sources]);
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -196,6 +201,23 @@ export default function DataSourcesPage() {
           <Button size="sm" onClick={openCreate}><Plus className="h-4 w-4 mr-1" />新建数据源</Button>
         </div>
       </div>
+
+      {!loading && sources.length > 0 && (
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-3">
+          {[
+            { label: "总计", value: stats.total, icon: Database, color: "text-interactive-primary", bg: "bg-interactive-primary/10" },
+            { label: "Prometheus", value: stats.prometheus, icon: Check, color: "text-status-resolved", bg: "bg-status-resolved/10" },
+            { label: "Zabbix", value: stats.zabbix, icon: Check, color: "text-amber-600", bg: "bg-amber-50" },
+            { label: "ClickHouse", value: stats.clickhouse, icon: Check, color: "text-indigo-600", bg: "bg-indigo-50" },
+            { label: "Kafka / API", value: stats.kafka + stats.api, icon: Check, color: "text-muted-foreground", bg: "bg-surface-secondary" },
+          ].filter((s) => s.value > 0 || s.label === "总计").map((s) => (
+            <Card key={s.label}><CardContent className="p-3 flex items-center gap-3">
+              <div className={`shrink-0 h-9 w-9 rounded-lg ${s.bg} flex items-center justify-center`}><s.icon className={`h-4 w-4 ${s.color}`} /></div>
+              <div><p className="text-lg font-bold text-text-primary">{s.value}</p><p className="text-[11px] text-muted-foreground">{s.label}</p></div>
+            </CardContent></Card>
+          ))}
+        </div>
+      )}
 
       <Card>
         <CardContent className="p-0">

@@ -23,13 +23,16 @@ import {
   PanelLeft,
   Clock,
   Upload,
+  MessageCircle,
+  Activity,
+  BookOpen,
 } from "lucide-react";
 import { useChat } from "@/hooks/useChat";
 import { ChatMessage } from "@/components/chat/ChatMessage";
 import { LiumaiLogo } from "@/components/liumai-logo";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import { chatHistory, chatModes, type ChatModeOut, type ChatSessionSummary } from "@/lib/api";
+import { chatHistory, chatModes, authApi, type ChatModeOut, type ChatSessionSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 /* ── Relative time formatter ─────────────────────────────── */
@@ -64,6 +67,37 @@ export const ChatPanel: FC = () => {
   const [input, setInput] = useState("");
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const defaultWelcome = "可以问我关于系统状态、故障排查、指标分析等问题";
+  const [welcomeText, setWelcomeText] = useState(defaultWelcome);
+  const [welcomeTyping, setWelcomeTyping] = useState(false);
+  const welcomeIndexRef = useRef(0);
+  const welcomeTargetRef = useRef(defaultWelcome);
+
+  // Typewriter — exposed as a stable callback
+  const startTypewriter = useCallback((text: string) => {
+    if (!text || text === welcomeTargetRef.current) return;
+    welcomeTargetRef.current = text;
+    welcomeIndexRef.current = 0;
+    setWelcomeText("");
+    setWelcomeTyping(true);
+    const chars = [...text];
+    const timer = setInterval(() => {
+      welcomeIndexRef.current++;
+      if (welcomeIndexRef.current <= chars.length) {
+        setWelcomeText(chars.slice(0, welcomeIndexRef.current).join(""));
+      } else {
+        clearInterval(timer);
+        setWelcomeTyping(false);
+      }
+    }, 40);
+  }, []);
+
+  /* ── Mode icon map ────────────────────────────────── */
+  const modeIcons: Record<string, typeof MessageCircle> = {
+    default: MessageCircle,
+    rca: Activity,
+    knowledge: BookOpen,
+  };
 
   /* ── Mode state ───────────────────────────────────── */
   const [modes, setModes] = useState<ChatModeOut[]>([]);
@@ -77,16 +111,35 @@ export const ChatPanel: FC = () => {
   const [attachedContent, setAttachedContent] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const [converting, setConverting] = useState(false);
+
   const handleFileSelect = useCallback(
     async (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (!file) return;
       setAttachedFile(file);
+      setAttachedContent("");
+      setConverting(true);
       try {
-        const text = await file.text();
-        setAttachedContent(text);
-      } catch {
-        setAttachedContent(`[无法读取文件内容: ${file.name}]`);
+        const token = localStorage.getItem("liumai_token");
+        const form = new FormData();
+        form.append("file", file);
+        const res = await fetch("/api/chat/convert-file", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: form,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: "转换失败" }));
+          throw new Error(err.detail || "转换失败");
+        }
+        const data = await res.json();
+        setAttachedContent(data.content);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : "转换失败";
+        setAttachedContent(`[${msg}: ${file.name}]`);
+      } finally {
+        setConverting(false);
       }
     },
     [],
@@ -107,6 +160,12 @@ export const ChatPanel: FC = () => {
   }, []);
 
   useEffect(() => { reloadSessions(); }, [reloadSessions]);
+
+  // Fetch personalised welcome text (re-fetch on new session)
+  useEffect(() => {
+    const username = localStorage.getItem("liumai_user") || "用户";
+    authApi.generateWelcome(username).then((r) => startTypewriter(r.text)).catch(() => {});
+  }, [startTypewriter]);
 
   // Load modes
   useEffect(() => {
@@ -146,8 +205,21 @@ export const ChatPanel: FC = () => {
     });
   }, [input, isStreaming, sendMessage, activeMode, rcaTimeStart, rcaTimeEnd, attachedContent, attachedFile, clearAttachment]);
 
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Auto-resize textarea: 3–5 lines, then scroll
+  const autoResize = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const lineHeight = 24; // matches leading-relaxed text-sm
+    const minH = lineHeight * 3 + 16; // 3 lines + padding
+    const maxH = lineHeight * 5 + 16; // 5 lines + padding
+    el.style.height = `${Math.min(Math.max(el.scrollHeight, minH), maxH)}px`;
+  }, []);
+
   const handleKeyDown = useCallback(
-    (e: KeyboardEvent<HTMLInputElement>) => {
+    (e: KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         handleSend();
@@ -155,6 +227,9 @@ export const ChatPanel: FC = () => {
     },
     [handleSend],
   );
+
+  // Run auto-resize whenever input changes
+  useEffect(() => { autoResize(); }, [input, autoResize]);
 
   const applyRcaPreset = useCallback((preset: string) => {
     setRcaPreset(preset);
@@ -171,7 +246,9 @@ export const ChatPanel: FC = () => {
   const handleNewSession = useCallback(() => {
     clearMessages();
     setActiveMode(null);
-  }, [clearMessages]);
+    const username = localStorage.getItem("liumai_user") || "用户";
+    authApi.generateWelcome(username).then((r) => startTypewriter(r.text)).catch(() => {});
+  }, [clearMessages, startTypewriter]);
 
   const handleLoadSession = useCallback(
     async (id: number) => {
@@ -289,28 +366,12 @@ export const ChatPanel: FC = () => {
         {/* Top bar — minimal spacer */}
         <div className="shrink-0 h-2" />
 
-        {/* Messages */}
-        <div className="flex-1 min-h-0">
+        {/* Messages — flex-1 when chatting, auto-height when empty */}
+        <div className={cn(messages.length === 0 ? "shrink-0" : "flex-1 min-h-0")}>
           <ScrollArea className="h-full">
             <div
-              className={cn(
-                "flex flex-col gap-4 px-4 py-2",
-                messages.length === 0 && "min-h-full justify-center",
-              )}
+              className="flex flex-col gap-4 px-4 py-2"
             >
-              {messages.length === 0 && (
-                <div className="flex flex-col items-center justify-center text-center px-4">
-                  <div className="mb-5">
-                    <LiumaiLogo size={56} className="text-interactive-primary" />
-                  </div>
-                  <h2 className="text-lg font-semibold text-text-primary mb-1.5">
-                    运维智能助手
-                  </h2>
-                  <p className="text-sm text-muted-foreground max-w-sm">
-                    可以问我关于系统状态、故障排查、指标分析等问题
-                  </p>
-                </div>
-              )}
               {messages.map((msg) => (
                 <ChatMessage key={msg.id} message={msg} />
               ))}
@@ -324,131 +385,108 @@ export const ChatPanel: FC = () => {
           </ScrollArea>
         </div>
 
-        {/* ── Mode selector ──────────────────────────────── */}
-        {modes.length > 0 && (
-          <div className="shrink-0 px-4 pb-1 flex flex-wrap items-center gap-1.5">
-            {modes.map((m) => (
-              <button
-                key={m.slug}
-                type="button"
-                onClick={() => setActiveMode(activeMode === m.slug ? null : m.slug)}
-                className={cn(
-                  "px-3 py-1 rounded-full text-[12px] font-medium transition-colors border",
-                  activeMode === m.slug
-                    ? "bg-interactive-primary text-white border-interactive-primary"
-                    : "bg-transparent text-muted-foreground border-border hover:border-muted-foreground/30",
-                )}
-              >
-                {m.name}
-              </button>
-            ))}
-          </div>
-        )}
-
-        {/* ── Knowledge QA: file upload ───────────────────── */}
-        {activeMode === "knowledge" && (
-          <div className="shrink-0 px-4 pb-2 flex items-center gap-2">
-            <input
-              ref={fileInputRef}
-              type="file"
-              onChange={handleFileSelect}
-              className="hidden"
-              accept=".txt,.md,.json,.log,.py,.js,.ts,.csv,.xml,.yaml,.yml,.ini,.cfg,.env,.html,.css,.sql,.java,.go,.rs,.c,.cpp,.h,.sh,.bat,.ps1,.pdf"
-            />
-            <Button
-              variant={attachedFile ? "default" : "outline"}
-              size="sm"
-              onClick={() => fileInputRef.current?.click()}
-            >
-              <Upload className="h-3.5 w-3.5 mr-1" />
-              {attachedFile ? attachedFile.name : "上传文档"}
-            </Button>
-            {attachedFile && (
-              <button
-                type="button"
-                onClick={clearAttachment}
-                className="text-xs text-muted-foreground hover:text-status-active"
-              >
-                移除
-              </button>
+        {/* ── Unified input area — centered when empty, bottom when chatting ── */}
+        <div
+          className={cn(
+            "px-4 pb-4 pt-2 transition-all duration-500 ease-out",
+            messages.length === 0
+              ? "flex-1 flex flex-col justify-center items-center pb-16"
+              : "shrink-0",
+          )}
+        >
+          <div className="w-full max-w-[48rem] mx-auto space-y-4">
+            {/* Welcome — logo + tagline centered above input */}
+            {messages.length === 0 && (
+              <div className="flex flex-col items-center text-center pb-1">
+                <LiumaiLogo size={48} className="text-interactive-primary mb-4" />
+                <h2 className="text-lg font-semibold text-text-primary mb-1">运维智能助手</h2>
+                <p className="text-sm text-muted-foreground min-h-[20px]">
+                  {welcomeText}
+                  {welcomeTyping && (
+                    <span className="inline-block w-0.5 h-4 bg-interactive-primary ml-0.5 align-middle animate-pulse" />
+                  )}
+                </p>
+              </div>
             )}
-            <span className="text-[11px] text-muted-foreground">
-              支持文本/Markdown/代码/PDF
-            </span>
-          </div>
-        )}
 
-        {/* ── RCA time window picker ──────────────────────── */}
-        {activeMode === "rca" && (
-          <div className="shrink-0 px-4 pb-2 flex flex-wrap items-center gap-2">
-            <Clock className="h-3.5 w-3.5 text-muted-foreground" />
-            {[
-              ["none", "自定义"],
-              ["15m", "15分钟"],
-              ["1h", "1小时"],
-              ["4h", "4小时"],
-              ["24h", "24小时"],
-            ].map(([val, label]) => (
-              <button
-                key={val}
-                type="button"
-                onClick={() => applyRcaPreset(val)}
-                className={cn(
-                  "px-2 py-0.5 rounded text-[11px] transition-colors border",
-                  rcaPreset === val
-                    ? "bg-interactive-primary/10 text-interactive-primary border-interactive-primary/30"
-                    : "text-muted-foreground border-transparent hover:border-border",
-                )}
-              >
-                {label}
-              </button>
-            ))}
-            {rcaPreset === "none" && (
-              <>
-                <input
-                  type="datetime-local"
-                  value={rcaTimeStart}
-                  onChange={(e) => setRcaTimeStart(e.target.value)}
-                  className="h-7 rounded border border-border bg-surface-secondary px-2 text-[11px] text-text-primary"
-                />
-                <span className="text-[11px] text-muted-foreground">→</span>
-                <input
-                  type="datetime-local"
-                  value={rcaTimeEnd}
-                  onChange={(e) => setRcaTimeEnd(e.target.value)}
-                  className="h-7 rounded border border-border bg-surface-secondary px-2 text-[11px] text-text-primary"
-                />
-              </>
-            )}
-          </div>
-        )}
-
-        {/* Input — pill-shaped */}
-        <div className="shrink-0 px-4 pb-4 pt-2">
-          <div className="relative flex items-center max-w-[48rem] mx-auto">
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={isStreaming ? "等待回复中…" : "输入消息，Enter 发送"}
-              disabled={isStreaming}
-              className="w-full h-12 rounded-2xl border border-border bg-surface-secondary pl-5 pr-12 text-sm text-text-primary placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-interactive-primary/20 focus:border-interactive-primary disabled:opacity-50 transition-shadow"
-              aria-label="聊天输入"
-            />
-            <Button
-              size="icon"
-              onClick={handleSend}
-              disabled={!input.trim() || isStreaming}
-              className="absolute right-2 rounded-xl h-8 w-8"
-              aria-label={isStreaming ? "发送中…" : "发送"}
-            >
-              {isStreaming ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Send className="h-4 w-4" />
+            {/* ── Input card: tab bar + extensions + textarea ── */}
+            <div className="rounded-2xl border border-border bg-surface-secondary shadow-sm overflow-hidden transition-shadow focus-within:ring-2 focus-within:ring-interactive-primary/20 focus-within:border-interactive-primary">
+              {/* Tab bar — pill-style with icons */}
+              {modes.length > 0 && (
+                <div className="flex items-center gap-1 px-2.5 py-2">
+                  {modes.map((m) => {
+                    const Icon = modeIcons[m.slug] || MessageCircle;
+                    const isActive = activeMode === m.slug || (!activeMode && m.slug === "default");
+                    return (
+                      <button
+                        key={m.slug}
+                        type="button"
+                        onClick={() => setActiveMode(isActive ? null : m.slug)}
+                        className={cn(
+                          "flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium transition-all duration-200",
+                          isActive
+                            ? "bg-interactive-primary/8 text-interactive-primary shadow-sm"
+                            : "text-muted-foreground hover:text-text-secondary hover:bg-surface-primary/40",
+                        )}
+                      >
+                        <Icon className="h-3 w-3" />
+                        {m.name}
+                        {isActive && (
+                          <span className="ml-0.5 h-1.5 w-1.5 rounded-full bg-interactive-primary animate-pulse" />
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
               )}
-            </Button>
+
+              {/* Mode extensions */}
+              {activeMode === "knowledge" && (
+                <div className="px-4 py-2 flex items-center gap-2 border-t border-border/30">
+                  <input ref={fileInputRef} type="file" onChange={handleFileSelect} className="hidden" accept=".pdf,.docx,.pptx,.xlsx,.xls,.epub,.html,.csv,.json,.xml,.ipynb,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.zip,.txt,.md,.py,.js,.ts,.log,.sql,.yaml,.yml,.ini,.cfg,.css,.rss" />
+                  <Button variant={attachedFile ? "default" : "outline"} size="sm" onClick={() => fileInputRef.current?.click()} disabled={converting}>
+                    {converting ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Upload className="h-3.5 w-3.5 mr-1" />}
+                    {converting ? "转换中…" : attachedFile ? attachedFile.name : "上传文档"}
+                  </Button>
+                  {attachedFile && !converting && <button type="button" onClick={clearAttachment} className="text-xs text-muted-foreground hover:text-status-active">移除</button>}
+                  <span className="text-[11px] text-muted-foreground">支持 PDF/Word/Excel/PPT/图片/代码 等</span>
+                </div>
+              )}
+              {activeMode === "rca" && (
+                <div className="px-4 py-2 flex flex-wrap items-center gap-2 border-t border-border/30">
+                  <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+                  {[["none","自定义"],["15m","15分钟"],["1h","1小时"],["4h","4小时"],["24h","24小时"]].map(([val, label]) => (
+                    <button key={val} type="button" onClick={() => applyRcaPreset(val)} className={cn("px-2 py-0.5 rounded text-[11px] transition-colors border", rcaPreset === val ? "bg-interactive-primary/10 text-interactive-primary border-interactive-primary/30" : "text-muted-foreground border-transparent hover:border-border")}>{label}</button>
+                  ))}
+                  {rcaPreset === "none" && (<><input type="datetime-local" value={rcaTimeStart} onChange={(e) => setRcaTimeStart(e.target.value)} className="h-7 rounded border border-border bg-surface-primary px-2 text-[11px] text-text-primary" /><span className="text-[11px] text-muted-foreground">→</span><input type="datetime-local" value={rcaTimeEnd} onChange={(e) => setRcaTimeEnd(e.target.value)} className="h-7 rounded border border-border bg-surface-primary px-2 text-[11px] text-text-primary" /></>)}
+                </div>
+              )}
+
+              {/* Textarea */}
+              <div className={cn("relative flex items-end", (activeMode === "knowledge" || activeMode === "rca") && "border-t border-border/30")}>
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder={isStreaming ? "等待回复中…" : "输入消息，Enter 发送，Shift+Enter 换行"}
+                  disabled={isStreaming}
+                  rows={1}
+                  className="w-full bg-transparent pl-5 pr-12 py-3 text-sm text-text-primary placeholder:text-muted-foreground/50 disabled:opacity-50 resize-none leading-relaxed outline-none"
+                  style={{ minHeight: "56px" }}
+                  aria-label="聊天输入"
+                />
+                <Button
+                  size="icon"
+                  onClick={handleSend}
+                  disabled={!input.trim() || isStreaming}
+                  className="absolute right-2 bottom-2 rounded-xl h-8 w-8 shrink-0"
+                  aria-label={isStreaming ? "发送中…" : "发送"}
+                >
+                  {isStreaming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                </Button>
+              </div>
+            </div>
           </div>
         </div>
       </div>

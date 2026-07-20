@@ -17,12 +17,22 @@ async def _proxy(
     body: dict | None = None,
     params: dict | None = None,
 ) -> JSONResponse:
-    """Forward a request to the Hermes Jobs API and return its response."""
+    """Forward a request to the Hermes Jobs API and return its response.
+
+    Jobs API lives at the root ``/api/jobs`` path, NOT under ``/v1/``.
+    We strip any trailing ``/v1`` (or ``/v1/``) from the configured
+    Hermes URL before appending the jobs path.
+    """
     from app.services.hermes import _hermes_url, _hermes_api_key
 
     import httpx
+    import re
 
-    url = f"{_hermes_url.rstrip('/')}/api/jobs{path}"
+    base = _hermes_url.rstrip("/")
+    # Strip /v1 suffix so we hit the root-level /api/jobs endpoint
+    base = re.sub(r"/v1$", "", base)
+
+    url = f"{base}/api/jobs{path}"
     headers: dict[str, str] = {}
     if _hermes_api_key:
         headers["Authorization"] = f"Bearer {_hermes_api_key}"

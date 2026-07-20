@@ -84,6 +84,11 @@ async def get_current_user(
     row = await db.get(User, int(user_id))
     if row is None:
         raise HTTPException(status_code=401, detail="用户不存在")
+    # Touch last_active_at (throttled: max once per 60s to reduce writes)
+    now = datetime.now(timezone.utc)
+    if row.last_active_at is None or (now - row.last_active_at).total_seconds() > 60:
+        row.last_active_at = now
+        await db.flush()
     return row
 
 

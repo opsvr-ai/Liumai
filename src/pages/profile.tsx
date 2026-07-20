@@ -60,15 +60,29 @@ export default function ProfilePage() {
     }
   }, [tab]);
 
-  const handleAvatarSave = useCallback(async () => {
+  const handleAvatarUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (file.size > 2 * 1024 * 1024) { toast.error("图片不能超过 2MB"); return; }
+    if (!file.type.startsWith("image/")) { toast.error("仅支持图片文件"); return; }
     setSavingAvatar(true);
     try {
-      const updated = await profileApi.updateMe({ avatar_url: avatarUrl || null });
-      setProfile(updated);
+      const token = localStorage.getItem("liumai_token");
+      const form = new FormData();
+      form.append("file", file);
+      const res = await fetch("/api/users/me/avatar", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: form,
+      });
+      if (!res.ok) throw new Error();
+      const data = await res.json() as { avatar_url: string };
+      setAvatarUrl(data.avatar_url);
+      setProfile((p) => p ? { ...p, avatar_url: data.avatar_url } : null);
       toast.success("头像已更新");
-    } catch { toast.error("保存失败"); }
-    finally { setSavingAvatar(false); }
-  }, [avatarUrl]);
+    } catch { toast.error("上传失败"); }
+    finally { setSavingAvatar(false); e.target.value = ""; }
+  }, []);
 
   const handlePasswordChange = useCallback(async () => {
     if (!oldPw || !newPw) { toast.error("请填写完整"); return; }
@@ -143,32 +157,39 @@ export default function ProfilePage() {
           {tab === "info" && (
             <div className="space-y-6">
               <div className="flex items-center gap-4">
-                <div className="shrink-0 h-20 w-20 rounded-full bg-interactive-primary flex items-center justify-center text-white text-3xl font-bold select-none">
-                  {profile.username.charAt(0).toUpperCase()}
-                </div>
+                {/* Clickable avatar preview */}
+                <label className="shrink-0 cursor-pointer group relative" title="点击上传头像">
+                  {avatarUrl || profile.avatar_url ? (
+                    <img
+                      src={avatarUrl || profile.avatar_url || ""}
+                      alt="头像"
+                      className="h-20 w-20 rounded-full object-cover border-2 border-border group-hover:border-interactive-primary transition-colors"
+                    />
+                  ) : (
+                    <div className="h-20 w-20 rounded-full bg-interactive-primary flex items-center justify-center text-white text-3xl font-bold select-none group-hover:opacity-80 transition-opacity">
+                      {profile.username.charAt(0).toUpperCase()}
+                    </div>
+                  )}
+                  {savingAvatar && (
+                    <div className="absolute inset-0 rounded-full bg-black/30 flex items-center justify-center">
+                      <Loader2 className="h-6 w-6 text-white animate-spin" />
+                    </div>
+                  )}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleAvatarUpload}
+                    className="hidden"
+                  />
+                </label>
                 <div>
                   <h2 className="text-xl font-semibold text-text-primary">{profile.username}</h2>
                   <div className="flex gap-2 mt-1">
                     <Badge variant="default">{roleLabel[profile.role] || profile.role}</Badge>
                     <Badge variant="outline">{authLabel[profile.auth_type] || profile.auth_type}</Badge>
                   </div>
+                  <p className="text-xs text-muted-foreground mt-1">点击头像上传新图片（支持 PNG/JPG/GIF/WebP，≤2MB）</p>
                 </div>
-              </div>
-              <div className="space-y-3 bg-surface-secondary/50 rounded-xl p-4">
-                <h3 className="text-sm font-medium text-text-primary">头像 URL</h3>
-                <div className="flex gap-2">
-                  <Input
-                    value={avatarUrl}
-                    onChange={(e) => setAvatarUrl(e.target.value)}
-                    placeholder="https://example.com/avatar.png"
-                    className="flex-1"
-                  />
-                  <Button size="sm" onClick={handleAvatarSave} disabled={savingAvatar}>
-                    {savingAvatar && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
-                    保存
-                  </Button>
-                </div>
-                <p className="text-xs text-muted-foreground">输入图片 URL 作为头像，留空则使用首字母头像</p>
               </div>
             </div>
           )}

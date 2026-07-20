@@ -301,6 +301,13 @@ export interface HermesConfig {
   api_key: string;
 }
 
+export interface LlmConfig {
+  base_url: string;
+  api_key: string;
+  model: string;
+  welcome_prompt: string;
+}
+
 export const authApi = {
   setupStatus() {
     return request<SetupStatus>("GET", "/auth/setup/status");
@@ -331,6 +338,15 @@ export const authApi = {
   },
   testHermes() {
     return request<{ ok: boolean; message: string }>("POST", "/auth/hermes-test");
+  },
+  getLlmConfig() {
+    return request<LlmConfig>("GET", "/auth/llm-config");
+  },
+  saveLlmConfig(data: LlmConfig) {
+    return request<LlmConfig>("PUT", "/auth/llm-config", data);
+  },
+  generateWelcome(username: string) {
+    return request<{ text: string }>("POST", "/auth/generate-welcome", { username });
   },
 };
 
@@ -422,6 +438,9 @@ export const hermesDiscovery = {
   setCacheInterval(refresh_secs: number) {
     return request<{ refresh_secs: number }>("PUT", "/chat/hermes/cache-interval", { refresh_secs });
   },
+  health() {
+    return request<{ ok: boolean; status_code: number; latency_ms: number }>("GET", "/chat/hermes-health");
+  },
 };
 
 /* ── Users ────────────────────────────────────────── */
@@ -432,6 +451,7 @@ export interface UserOut {
   role: string;
   auth_type: string;
   team_id: number;
+  last_active_at: string | null;
   created_at: string | null;
 }
 
@@ -555,11 +575,19 @@ export const profileApi = {
 
 /* ── Hermes Jobs ────────────────────────────────── */
 
+export interface JobSchedule {
+  kind: string;
+  minutes?: number;
+  expr?: string;
+  display?: string;
+}
+
 export interface JobItem {
   id: string;
   name: string;
   prompt: string;
-  schedule: { kind: string; expr: string };
+  schedule: JobSchedule | null;
+  schedule_display: string;
   skills: string[];
   deliver: string;
   state: "scheduled" | "paused" | "running" | "completed";
@@ -567,15 +595,21 @@ export interface JobItem {
   next_run_at: string | null;
   last_run_at: string | null;
   last_status: string | null;
-  repeat: { times: number | null; completed: number } | null;
+  created_at: string | null;
+}
+
+interface JobsListResponse {
+  jobs: JobItem[];
 }
 
 export const jobsApi = {
-  list: (includeDisabled = false) =>
-    request<JobItem[]>("GET", `/jobs?include_disabled=${includeDisabled}`),
+  list: async (includeDisabled = false): Promise<JobItem[]> => {
+    const res = await request<JobsListResponse>("GET", `/jobs?include_disabled=${includeDisabled}`);
+    return res.jobs || [];
+  },
   get: (id: string) => request<JobItem>("GET", `/jobs/${id}`),
-  create: (data: Partial<JobItem>) => request<JobItem>("POST", "/jobs", data),
-  update: (id: string, data: Partial<JobItem>) =>
+  create: (data: Record<string, unknown>) => request<JobItem>("POST", "/jobs", data),
+  update: (id: string, data: Record<string, unknown>) =>
     request<JobItem>("PATCH", `/jobs/${id}`, data),
   delete: (id: string) => request<void>("DELETE", `/jobs/${id}`),
   pause: (id: string) => request<JobItem>("POST", `/jobs/${id}/pause`),

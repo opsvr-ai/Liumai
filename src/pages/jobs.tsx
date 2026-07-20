@@ -52,7 +52,7 @@ export default function JobsPage() {
   const openEdit = (job: JobItem) => {
     setEditingJob(job);
     setFormName(job.name);
-    setFormSchedule(job.schedule?.expr || "");
+    setFormSchedule(job.schedule_display || job.schedule?.display || "");
     setFormPrompt(job.prompt);
     setFormSkills((job.skills || []).join(", "));
     setDialogOpen(true);
@@ -184,7 +184,7 @@ export default function JobsPage() {
                         <p className="font-medium text-text-primary">{job.name}</p>
                         <p className="text-xs text-muted-foreground truncate max-w-[200px]">{job.prompt}</p>
                       </td>
-                      <td className="px-4 py-3 font-mono text-xs text-text-secondary">{job.schedule?.expr || "—"}</td>
+                      <td className="px-4 py-3 font-mono text-xs text-text-secondary">{job.schedule_display || job.schedule?.display || "—"}</td>
                       <td className="px-4 py-3"><Badge variant={st.variant}>{st.label}</Badge></td>
                       <td className="px-4 py-3 text-xs text-muted-foreground hidden md:table-cell">
                         {job.last_run_at ? new Date(job.last_run_at).toLocaleString("zh-CN") : "—"}

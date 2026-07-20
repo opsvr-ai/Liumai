@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -307,29 +309,26 @@ class HermesTestResult(BaseModel):
 async def test_hermes_connection(
     _admin: User = Depends(require_admin),
 ) -> HermesTestResult:
-    """Proxy a test ping to Hermes through the backend (avoids browser CORS)."""
+    """Test Hermes connectivity via its GET /health/detailed endpoint."""
     from app.services.hermes import _hermes_url, _hermes_api_key
 
     import httpx
-    url = f"{_hermes_url.rstrip('/')}/chat/completions"
-    headers = {"Content-Type": "application/json"}
+    url = f"{_hermes_url.rstrip('/')}/health/detailed"
+    headers: dict[str, str] = {}
     if _hermes_api_key:
         headers["Authorization"] = f"Bearer {_hermes_api_key}"
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-            resp = await client.post(
-                url,
-                json={
-                    "model": "hermes-agent",
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 5,
-                    "stream": False,
-                },
-                headers=headers,
-            )
+            resp = await client.get(url, headers=headers)
         if resp.status_code < 500:
-            return HermesTestResult(ok=True, message=f"Hermes 服务正常 (HTTP {resp.status_code})")
+            detail = ""
+            try:
+                body = resp.json()
+                detail = f" — {json.dumps(body, ensure_ascii=False)}"
+            except Exception:
+                detail = ""
+            return HermesTestResult(ok=True, message=f"Hermes 服务正常 (HTTP {resp.status_code}){detail}")
         else:
             return HermesTestResult(ok=False, message=f"Hermes 返回 {resp.status_code}: {resp.text[:200]}")
     except httpx.ConnectError:
@@ -338,3 +337,120 @@ async def test_hermes_connection(
         return HermesTestResult(ok=False, message="连接 Hermes 超时 — 请检查网络延迟")
     except Exception as exc:
         return HermesTestResult(ok=False, message=f"连接失败: {exc}")
+
+
+# ── LLM model config (platform-internal use) ────────────────────────────────
+
+class LlmConfigOut(BaseModel):
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    welcome_prompt: str = ""
+
+
+@router.get("/llm-config", response_model=LlmConfigOut)
+async def get_llm_config(
+    _admin: User = Depends(require_admin),
+) -> LlmConfigOut:
+    """Get the configured platform LLM settings."""
+    from app.models import SystemConfig
+    from app.models.database import async_session_factory
+    async with async_session_factory() as s:
+        rows = await s.execute(
+            select(SystemConfig).where(SystemConfig.key.in_(["llm_base_url", "llm_api_key", "llm_model"]))
+        )
+        cfg = {r.key: r.value for r in rows.scalars()}
+    return LlmConfigOut(
+        base_url=cfg.get("llm_base_url", ""),
+        api_key=cfg.get("llm_api_key", ""),
+        model=cfg.get("llm_model", ""),
+    )
+
+
+@router.put("/llm-config", response_model=LlmConfigOut)
+async def save_llm_config(
+    body: LlmConfigOut,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> LlmConfigOut:
+    """Save platform LLM settings."""
+    from app.models import SystemConfig
+    entries = {"llm_base_url": body.base_url, "llm_api_key": body.api_key, "llm_model": body.model, "welcome_prompt": body.welcome_prompt}
+    for key, value in entries.items():
+        row = await db.get(SystemConfig, key)
+        if row:
+            row.value = value
+            row.updated_at = func.now()
+        else:
+            db.add(SystemConfig(key=key, value=value))
+    await db.flush()
+    return body
+
+
+# ── Welcome message generation ──────────────────────────────────────────────
+
+class WelcomeRequest(BaseModel):
+    username: str
+
+
+@router.post("/generate-welcome")
+async def generate_welcome(
+    body: WelcomeRequest,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Generate a personalised welcome message using the configured LLM."""
+    from app.models import SystemConfig
+    from app.models.database import async_session_factory
+    import httpx
+
+    # Load config
+    async with async_session_factory() as s:
+        rows = await s.execute(
+            select(SystemConfig).where(SystemConfig.key.in_([
+                "llm_base_url", "llm_api_key", "llm_model", "welcome_prompt",
+            ]))
+        )
+        cfg = {r.key: r.value for r in rows.scalars()}
+
+    base_url = cfg.get("llm_base_url", "").strip()
+    api_key = cfg.get("llm_api_key", "").strip()
+    model = cfg.get("llm_model", "").strip()
+
+    if not base_url or not model:
+        return {"text": "可以问我关于系统状态、故障排查、指标分析等问题"}
+
+    prompt = cfg.get("welcome_prompt", "").strip()
+    if not prompt:
+        prompt = "你是一个运维平台的智能助手。请为用户 {username} 生成一句简短的欢迎语（不超过30字），介绍你能帮他做什么。只返回欢迎语本身，不要加引号。"
+
+    system_prompt = prompt.replace("{username}", body.username)
+
+    try:
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        base = base_url.rstrip("/")
+        url = f"{base}/chat/completions" if not base.endswith("/v1") else f"{base}/chat/completions"
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            resp = await client.post(
+                url,
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": "你好"},
+                    ],
+                    "max_tokens": 60,
+                    "temperature": 0.8,
+                },
+                headers=headers,
+            )
+        if resp.status_code < 500:
+            data = resp.json()
+            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if text:
+                return {"text": text.strip().strip('"').strip("'")}
+        return {"text": "可以问我关于系统状态、故障排查、指标分析等问题"}
+    except Exception:
+        return {"text": "可以问我关于系统状态、故障排查、指标分析等问题"}

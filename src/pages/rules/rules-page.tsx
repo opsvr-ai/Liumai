@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { Plus, Pencil, Trash2, Power, PowerOff, RefreshCw } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Plus, Pencil, Trash2, Power, PowerOff, RefreshCw, Shield, CheckCircle, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -51,6 +51,13 @@ export default function RulesPage() {
 
   const sevLabel: Record<string, string> = { critical: "严重", high: "高", medium: "中", low: "低" };
 
+  const stats = useMemo(() => ({
+    total: rules.length,
+    enabled: rules.filter((r) => r.enabled).length,
+    disabled: rules.filter((r) => !r.enabled).length,
+    critical: rules.filter((r) => r.severity === "critical").length,
+  }), [rules]);
+
   return (
     <div className="p-4 md:p-6 space-y-6 max-w-6xl mx-auto">
       <div className="flex items-center justify-between">
@@ -60,6 +67,22 @@ export default function RulesPage() {
           <Button size="sm" onClick={openCreate}><Plus className="h-4 w-4 mr-1" />新建规则</Button>
         </div>
       </div>
+
+      {!loading && rules.length > 0 && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {[
+            { label: "总计", value: stats.total, icon: Shield, color: "text-interactive-primary", bg: "bg-interactive-primary/10" },
+            { label: "已启用", value: stats.enabled, icon: CheckCircle, color: "text-status-resolved", bg: "bg-status-resolved/10" },
+            { label: "已禁用", value: stats.disabled, icon: PowerOff, color: "text-muted-foreground", bg: "bg-surface-secondary" },
+            { label: "严重", value: stats.critical, icon: AlertTriangle, color: "text-status-active", bg: "bg-status-active/10" },
+          ].map((s) => (
+            <Card key={s.label}><CardContent className="p-3 flex items-center gap-3">
+              <div className={`shrink-0 h-9 w-9 rounded-lg ${s.bg} flex items-center justify-center`}><s.icon className={`h-4 w-4 ${s.color}`} /></div>
+              <div><p className="text-lg font-bold text-text-primary">{s.value}</p><p className="text-[11px] text-muted-foreground">{s.label}</p></div>
+            </CardContent></Card>
+          ))}
+        </div>
+      )}
 
       <Card>
         <CardContent className="p-0">

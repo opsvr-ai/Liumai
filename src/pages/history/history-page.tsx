@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Clock, Eye, RefreshCw } from "lucide-react";
+import { Clock, Eye, RefreshCw, FileText, CheckCircle, XCircle, PlayCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -22,12 +22,35 @@ export default function HistoryPage() {
 
   useEffect(() => { refresh(); }, [refresh]);
 
+  const stats = useMemo(() => ({
+    total: items.length,
+    completed: items.filter((i) => i.status === "completed").length,
+    failed: items.filter((i) => i.status === "failed").length,
+    running: items.filter((i) => i.status === "running" || i.status === "queued").length,
+  }), [items]);
+
   return (
     <div className="p-4 md:p-6 space-y-6 max-w-6xl mx-auto">
       <div className="flex items-center justify-between">
         <div><h2 className="text-lg font-semibold">历史记录</h2><p className="text-sm text-muted-foreground mt-0.5">所有 RCA 分析会话</p></div>
         <Button variant="ghostMuted" size="icon-sm" onClick={refresh}><RefreshCw className="h-4 w-4" /></Button>
       </div>
+
+      {!loading && items.length > 0 && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+          {[
+            { label: "总计", value: stats.total, icon: FileText, color: "text-interactive-primary", bg: "bg-interactive-primary/10" },
+            { label: "完成", value: stats.completed, icon: CheckCircle, color: "text-status-resolved", bg: "bg-status-resolved/10" },
+            { label: "失败", value: stats.failed, icon: XCircle, color: "text-status-active", bg: "bg-status-active/10" },
+            { label: "运行中", value: stats.running, icon: PlayCircle, color: "text-amber-600", bg: "bg-amber-50" },
+          ].map((s) => (
+            <Card key={s.label}><CardContent className="p-3 flex items-center gap-3">
+              <div className={`shrink-0 h-9 w-9 rounded-lg ${s.bg} flex items-center justify-center`}><s.icon className={`h-4 w-4 ${s.color}`} /></div>
+              <div><p className="text-lg font-bold text-text-primary">{s.value}</p><p className="text-[11px] text-muted-foreground">{s.label}</p></div>
+            </CardContent></Card>
+          ))}
+        </div>
+      )}
 
       <Card>
         <CardHeader><CardTitle className="text-sm font-medium flex items-center gap-2"><Clock className="h-4 w-4" /> 全部会话</CardTitle></CardHeader>

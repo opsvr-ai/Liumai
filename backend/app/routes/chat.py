@@ -13,7 +13,7 @@ from typing import Any
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -578,3 +578,110 @@ async def get_cache_interval(
     row = await db.get(SystemConfig, "skills_refresh_secs")
     db_secs = int(row.value) if row and row.value.isdigit() else None
     return {"refresh_secs": db_secs or get_cache_refresh_secs()}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# File conversion (MarkItDown)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+import os
+import tempfile
+import uuid
+
+from fastapi import UploadFile
+
+ALLOWED_EXTENSIONS = {
+    ".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".epub",
+    ".html", ".htm", ".csv", ".json", ".xml", ".ipynb",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
+    ".zip", ".txt", ".md", ".py", ".js", ".ts", ".log", ".sql",
+    ".java", ".go", ".rs", ".c", ".cpp", ".h", ".sh", ".bat", ".ps1",
+    ".yaml", ".yml", ".ini", ".cfg", ".env", ".css", ".rss",
+}
+
+
+@router.post("/convert-file")
+async def convert_file(
+    file: UploadFile = File(...),
+) -> dict:
+    """Convert an uploaded file to Markdown using Microsoft MarkItDown.
+
+    Supports PDF, Word, Excel, PPT, images (OCR), HTML, CSV, JSON, code,
+    Jupyter notebooks, ZIP archives, and more.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="未提供文件名")
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件类型: {ext}。支持: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    # Save to a temp file (markitdown needs a real file path for binary formats)
+    suffix = ext if ext else ".txt"
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
+
+        # Convert using markitdown
+        from markitdown import MarkItDown
+        md = MarkItDown()
+        result = md.convert(tmp_path)
+        text = result.text_content.strip()
+
+        if not text:
+            return {
+                "ok": True,
+                "filename": file.filename,
+                "content": f"[文件 {file.filename} 内容为空或无法提取文本]",
+            }
+
+        return {
+            "ok": True,
+            "filename": file.filename,
+            "content": text,
+        }
+    except ImportError:
+        raise HTTPException(status_code=500, detail="markitdown 未安装")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"文件转换失败: {exc}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hermes health
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/hermes-health")
+async def hermes_health() -> dict:
+    """Lightweight Hermes health check — returns ok + latency."""
+    from app.services.hermes import _hermes_url, _hermes_api_key
+    import time, httpx
+
+    url = _hermes_url.rstrip("/")
+    # Strip /v1 so we hit the root-level /health endpoint
+    import re
+    url = re.sub(r"/v1$", "", url)
+
+    headers: dict[str, str] = {}
+    if _hermes_api_key:
+        headers["Authorization"] = f"Bearer {_hermes_api_key}"
+
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=3.0)) as client:
+            resp = await client.get(f"{url}/health", headers=headers)
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        return {"ok": resp.status_code < 500, "status_code": resp.status_code, "latency_ms": latency_ms}
+    except Exception:
+        latency_ms = round((time.monotonic() - t0) * 1000)
+        return {"ok": False, "status_code": 0, "latency_ms": latency_ms}

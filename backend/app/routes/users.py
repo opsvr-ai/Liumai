@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+import os
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +24,7 @@ class UserOut(BaseModel):
     role: str
     auth_type: str
     team_id: int
+    last_active_at: str | None = None
     created_at: str | None = None
     model_config = {"from_attributes": True}
 
@@ -49,6 +54,7 @@ async def list_users(
             id=u.id, username=u.username, role=u.role.value,
             auth_type=u.auth_type.value,
             team_id=u.team_id,
+            last_active_at=u.last_active_at.isoformat() if u.last_active_at else None,
             created_at=u.created_at.isoformat() if u.created_at else None,
         )
         for u in rows.scalars()
@@ -269,3 +275,34 @@ async def get_my_stats(
         "total_sessions": total_sessions,
         "total_messages": total_messages,
     }
+
+
+# Avatar upload directory
+AVATAR_DIR = Path("/app/data/avatars")
+AVATAR_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
+
+
+@router.post("/me/avatar")
+async def upload_avatar(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Upload a profile avatar image.  Returns the avatar URL."""
+    if file.content_type and not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="仅支持图片文件")
+    body = await file.read()
+    if len(body) > AVATAR_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="图片不能超过 2MB")
+    # Generate unique filename preserving extension
+    ext = os.path.splitext(file.filename or "avatar.png")[1] or ".png"
+    safe_ext = ext if ext.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"} else ".png"
+    filename = f"{uuid.uuid4().hex}{safe_ext}"
+    AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+    filepath = AVATAR_DIR / filename
+    filepath.write_bytes(body)
+    # Update user record
+    avatar_url = f"/avatars/{filename}"
+    user.avatar_url = avatar_url
+    await db.flush()
+    return {"avatar_url": avatar_url}

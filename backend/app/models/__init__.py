@@ -117,6 +117,7 @@ class User(Base):
         default=AuthType.LDAP,
     )
     avatar_url = Column(String(512), nullable=True, default=None)
+    last_active_at = Column(DateTime(timezone=True), nullable=True, default=None)
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
