@@ -1,5 +1,5 @@
 import { type ReactNode, useState, useCallback } from "react";
-import { LiumaiLogo } from "@/components/liumai-logo";
+import { LiumaiBrand } from "@/components/liumai-brand";
 import {
   ChevronLeft,
   ChevronRight,
@@ -101,15 +101,8 @@ export function DashboardShell({
         </button>
 
         {/* Logo area */}
-        <button
-          type="button"
-          onClick={onHomeClick}
-          className="flex items-center gap-2 shrink-0"
-        >
-          <LiumaiLogo size={28} className="text-interactive-primary shrink-0" />
-          <span className="text-base md:text-lg font-bold tracking-tight" style={{ fontFeatureSettings: "'ss01'" }}>
-            六脉
-          </span>
+        <button type="button" onClick={onHomeClick}>
+          <LiumaiBrand size={28} />
         </button>
 
         {/* Spacer */}
