@@ -215,3 +215,22 @@ INSERT INTO chat_modes (slug, name, system_prompt, config, enabled) VALUES
 ON CONFLICT (slug) DO NOTHING;
 
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS mode_slug VARCHAR(50);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Data sources — external monitoring/telemetry connections
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS data_sources (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    type        VARCHAR(50)  NOT NULL,
+    config      JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    enabled     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO data_sources (name, type, config) VALUES
+    ('Demo Prometheus', 'prometheus', '{"url": "http://localhost:9090", "query_interval": 60}'::jsonb),
+    ('Demo ClickHouse', 'clickhouse', '{"host": "localhost", "port": 8123, "database": "default", "user": "default", "password": ""}'::jsonb)
+ON CONFLICT DO NOTHING;

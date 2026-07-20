@@ -126,6 +126,40 @@ class User(Base):
         return f"<User id={self.id} username={self.username!r} role={self.role.value}>"
 
 
+class DataSource(Base):
+    """External monitoring / telemetry data source for alert rules.
+
+    Stores connection details per source type: Prometheus, Zabbix,
+    ClickHouse, Kafka, or generic HTTP API.
+    """
+
+    __tablename__ = "data_sources"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False)
+    type = Column(
+        String(50),
+        nullable=False,
+        comment="prometheus | zabbix | clickhouse | kafka | api",
+    )
+    config = Column(JSONB, nullable=False, default=dict)
+    enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<DataSource id={self.id} name={self.name!r} type={self.type!r}>"
+
+
 class AlertRule(Base):
     """Alert-to-RCA trigger rule.
 

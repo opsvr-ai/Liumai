@@ -79,6 +79,7 @@ async def init_db() -> None:
         ChatMode,
         ChatSession,
         CollaborationEvent,
+        DataSource,
         RcaSession,
         SystemConfig,
         Team,
