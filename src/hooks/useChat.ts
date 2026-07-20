@@ -7,7 +7,7 @@ messages, and handling errors.
 */
 
 import { useCallback, useRef, useState } from "react";
-import { chatStream, type ChatMessage, type ToolCallDelta } from "@/lib/api";
+import { chatStream, chatHistory, type ChatMessage, type ToolCallDelta } from "@/lib/api";
 
 /* ==========================================================================
  * Types
@@ -32,6 +32,7 @@ export function useChat() {
   const [messages, setMessages] = useState<DisplayMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<number | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
 
@@ -207,14 +208,72 @@ export function useChat() {
     setMessages([]);
     setError(null);
     setIsStreaming(false);
+    setSessionId(null);
   }, []);
+
+  /** Load a saved session from the backend. */
+  const loadSession = useCallback(async (id: number) => {
+    abortRef.current?.abort();
+    const detail = await chatHistory.get(id);
+    setMessages(
+      detail.messages.map((m) => ({
+        id: String(m.id),
+        role: m.role as DisplayMessage["role"],
+        content: m.content,
+        toolCalls: (m.tool_calls as ToolCallDelta[] | undefined) ?? undefined,
+      })),
+    );
+    setSessionId(id);
+    setError(null);
+    setIsStreaming(false);
+  }, []);
+
+  /** Persist the current messages to the backend. */
+  const saveCurrentSession = useCallback(async () => {
+    const saveable = messages.filter(
+      (m) => m.role === "user" || m.role === "assistant" || m.role === "tool",
+    );
+    if (saveable.length === 0) return;
+
+    const firstUser = messages.find((m) => m.role === "user");
+    const title = firstUser
+      ? firstUser.content.slice(0, 40) + (firstUser.content.length > 40 ? "…" : "")
+      : "新对话";
+
+    if (sessionId) {
+      await chatHistory.saveMessages(
+        sessionId,
+        saveable.map((m) => ({
+          role: m.role,
+          content: m.content,
+          tool_calls: m.toolCalls ?? undefined,
+        })),
+        title,
+      );
+    } else {
+      const created = await chatHistory.create();
+      await chatHistory.saveMessages(
+        created.id,
+        saveable.map((m) => ({
+          role: m.role,
+          content: m.content,
+          tool_calls: m.toolCalls ?? undefined,
+        })),
+        title,
+      );
+      setSessionId(created.id);
+    }
+  }, [messages, sessionId]);
 
   return {
     messages,
     isStreaming,
     error,
+    sessionId,
     sendMessage,
     clearMessages,
+    loadSession,
+    saveCurrentSession,
   } as const;
 }
 

@@ -13,31 +13,31 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 DO $$ BEGIN
-    CREATE TYPE user_role AS ENUM ('admin', 'operator', 'viewer');
+    CREATE TYPE user_role AS ENUM ('ADMIN', 'OPERATOR', 'VIEWER');
 EXCEPTION
     WHEN duplicate_object THEN NULL;
 END $$;
 
 DO $$ BEGIN
-    CREATE TYPE rca_trigger_type AS ENUM ('passive', 'active');
+    CREATE TYPE rca_trigger_type AS ENUM ('PASSIVE', 'ACTIVE');
 EXCEPTION
     WHEN duplicate_object THEN NULL;
 END $$;
 
 DO $$ BEGIN
-    CREATE TYPE rca_status AS ENUM ('queued', 'running', 'completed', 'failed');
+    CREATE TYPE rca_status AS ENUM ('QUEUED', 'RUNNING', 'COMPLETED', 'FAILED');
 EXCEPTION
     WHEN duplicate_object THEN NULL;
 END $$;
 
 DO $$ BEGIN
     CREATE TYPE collab_event_type AS ENUM (
-        'group_created',
-        'member_joined',
-        'agent_progress',
-        'manual_finding',
-        'bot_mentioned',
-        'rca_completed'
+        'GROUP_CREATED',
+        'MEMBER_JOINED',
+        'AGENT_PROGRESS',
+        'MANUAL_FINDING',
+        'BOT_MENTIONED',
+        'RCA_COMPLETED'
     );
 EXCEPTION
     WHEN duplicate_object THEN NULL;
@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS users (
     id          SERIAL PRIMARY KEY,
     team_id     INTEGER      NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
     username    VARCHAR(255) NOT NULL UNIQUE,
-    role        user_role    NOT NULL DEFAULT 'viewer',
+    role        user_role    NOT NULL DEFAULT 'VIEWER',
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_users_team_id ON users(team_id);
@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS rca_sessions (
     team_id             INTEGER          NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
     rule_id             INTEGER          REFERENCES alert_rules(id) ON DELETE SET NULL,
     trigger_type        rca_trigger_type NOT NULL,
-    status              rca_status       NOT NULL DEFAULT 'queued',
+    status              rca_status       NOT NULL DEFAULT 'QUEUED',
     time_window_start   TIMESTAMPTZ,
     time_window_end     TIMESTAMPTZ,
     hermes_session_id   VARCHAR(255)     UNIQUE,
@@ -116,6 +116,37 @@ INSERT INTO teams (id, name)
     VALUES (1, 'Default Team')
     ON CONFLICT (id) DO NOTHING;
 
-INSERT INTO users (id, team_id, username, role)
-    VALUES (1, 1, 'admin', 'admin')
+-- Add password_hash column (safe for re-runs)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
+
+-- Seed admin with default password 'admin123' (bcrypt hash)
+-- IMPORTANT: change this password in production!
+INSERT INTO users (id, team_id, username, role, password_hash)
+    VALUES (1, 1, 'admin', 'ADMIN',
+            '$2b$12$LJ3m4ys3GZfnYMz8kVsKaOTSxlf5ZvFGGqFvGkQ7OqQsLJkANhPXO')
     ON CONFLICT (id) DO NOTHING;
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Chat history
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS chat_sessions (
+    id          SERIAL PRIMARY KEY,
+    user_id     INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title       VARCHAR(255) NOT NULL DEFAULT '新对话',
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id          SERIAL PRIMARY KEY,
+    session_id  INTEGER      NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+    role        VARCHAR(20)  NOT NULL,
+    content     TEXT         NOT NULL DEFAULT '',
+    tool_calls  JSONB,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON chat_messages(created_at ASC);

@@ -11,11 +11,18 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import get_current_user
+from app.models import ChatMessage, ChatSession, User
+from app.models.database import get_db_session
 from app.services.hermes import HermesClient
 
 router = APIRouter()
@@ -167,3 +174,179 @@ async def chat_stream_endpoint(body: ChatRequest) -> StreamingResponse:
             "X-Accel-Buffering": "no",  # disable nginx buffering
         },
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chat history CRUD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class ChatSessionOut(BaseModel):
+    """Serialised chat session (without messages)."""
+
+    id: int
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    message_count: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+class ChatSessionDetail(BaseModel):
+    """Chat session with full message list."""
+
+    id: int
+    title: str
+    created_at: datetime
+    updated_at: datetime
+    messages: list[dict] = []
+
+    model_config = {"from_attributes": True}
+
+
+class SaveMessagesRequest(BaseModel):
+    """Bulk-save messages for a session (upsert: clear + re-insert)."""
+
+    messages: list[dict] = Field(default_factory=list)
+    title: str | None = None
+
+
+@router.get("/sessions", response_model=list[ChatSessionOut])
+async def list_chat_sessions(
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> list[ChatSessionOut]:
+    """List chat sessions for the current user, newest first."""
+    rows = await db.execute(
+        select(
+            ChatSession.id,
+            ChatSession.title,
+            ChatSession.created_at,
+            ChatSession.updated_at,
+            func.count(ChatMessage.id).label("message_count"),
+        )
+        .outerjoin(ChatMessage, ChatMessage.session_id == ChatSession.id)
+        .where(ChatSession.user_id == user.id)
+        .group_by(ChatSession.id)
+        .order_by(ChatSession.updated_at.desc())
+    )
+    return [
+        ChatSessionOut(
+            id=r.id,
+            title=r.title,
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+            message_count=r.message_count,
+        )
+        for r in rows
+    ]
+
+
+@router.post(
+    "/sessions",
+    response_model=ChatSessionOut,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_chat_session(
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> ChatSessionOut:
+    """Create a new empty chat session."""
+    session = ChatSession(user_id=user.id, title="新对话")
+    db.add(session)
+    await db.flush()
+    await db.refresh(session)
+    return ChatSessionOut(
+        id=session.id,
+        title=session.title,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+        message_count=0,
+    )
+
+
+@router.get("/sessions/{session_id}", response_model=ChatSessionDetail)
+async def get_chat_session(
+    session_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> ChatSessionDetail:
+    """Get a chat session with all messages."""
+    row = await db.get(ChatSession, session_id)
+    if not row or row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    msg_rows = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.created_at.asc())
+    )
+    messages = [
+        {
+            "id": m.id,
+            "role": m.role,
+            "content": m.content,
+            "tool_calls": m.tool_calls,
+            "created_at": m.created_at.isoformat(),
+        }
+        for m in msg_rows.scalars()
+    ]
+
+    return ChatSessionDetail(
+        id=row.id,
+        title=row.title,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        messages=messages,
+    )
+
+
+@router.post("/sessions/{session_id}/messages", status_code=status.HTTP_204_NO_CONTENT)
+async def save_messages(
+    session_id: int,
+    body: SaveMessagesRequest,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> None:
+    """Save (replace) all messages in a session."""
+    row = await db.get(ChatSession, session_id)
+    if not row or row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    # Delete existing messages
+    from sqlalchemy import delete
+
+    await db.execute(
+        delete(ChatMessage).where(ChatMessage.session_id == session_id)
+    )
+
+    # Insert new messages
+    for m in body.messages:
+        db.add(
+            ChatMessage(
+                session_id=session_id,
+                role=m.get("role", "user"),
+                content=m.get("content", ""),
+                tool_calls=m.get("tool_calls"),
+            )
+        )
+
+    # Update title if provided
+    if body.title:
+        row.title = body.title
+
+    row.updated_at = func.now()
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_chat_session(
+    session_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> None:
+    """Delete a chat session and all its messages."""
+    row = await db.get(ChatSession, session_id)
+    if not row or row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    await db.delete(row)

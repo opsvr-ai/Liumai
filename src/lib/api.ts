@@ -262,3 +262,48 @@ export async function* chatStream(
     reader.releaseLock();
   }
 }
+
+/* ── Chat history ────────────────────────────────── */
+
+export interface ChatSessionSummary {
+  id: number;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+}
+
+export interface ChatSessionDetail extends ChatSessionSummary {
+  messages: Array<{
+    id: number;
+    role: string;
+    content: string;
+    tool_calls?: unknown;
+    created_at: string;
+  }>;
+}
+
+export const chatHistory = {
+  list() {
+    return request<ChatSessionSummary[]>("GET", "/chat/sessions");
+  },
+  create() {
+    return request<ChatSessionSummary>("POST", "/chat/sessions");
+  },
+  get(sessionId: number) {
+    return request<ChatSessionDetail>("GET", `/chat/sessions/${sessionId}`);
+  },
+  saveMessages(
+    sessionId: number,
+    messages: Array<{ role: string; content: string; tool_calls?: unknown }>,
+    title?: string,
+  ) {
+    return request<void>("POST", `/chat/sessions/${sessionId}/messages`, {
+      messages,
+      title,
+    });
+  },
+  delete(sessionId: number) {
+    return request<void>("DELETE", `/chat/sessions/${sessionId}`);
+  },
+};

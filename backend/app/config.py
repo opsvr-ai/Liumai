@@ -6,8 +6,26 @@ Sensitive values (secrets, passwords) must NEVER be logged or exposed in error r
 
 from __future__ import annotations
 
-from pydantic import Field
+from typing import Annotated, Any
+
+from pydantic import BeforeValidator, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _coerce_int_placeholder(v: Any) -> int:
+    """Coerce env-var strings (including placeholder values) to int.
+
+    Gracefully handles cases where ``.env`` still has template values like
+    ``your_agent_id`` — returns 0 (disabled) instead of crashing startup.
+    """
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.strip():
+        try:
+            return int(v)
+        except ValueError:
+            return 0
+    return 0
 
 
 class Settings(BaseSettings):
@@ -45,7 +63,7 @@ class Settings(BaseSettings):
         default="",
         description="WeCom self-built app secret.",
     )
-    WECOM_AGENT_ID: int = Field(
+    WECOM_AGENT_ID: Annotated[int, BeforeValidator(_coerce_int_placeholder)] = Field(
         default=0,
         description="WeCom self-built app AgentId.",
     )
@@ -57,7 +75,7 @@ class Settings(BaseSettings):
     )
 
     # ── RCA ───────────────────────────────────────────────────────────────
-    RCA_MAX_CONCURRENCY: int = Field(
+    RCA_MAX_CONCURRENCY: Annotated[int, BeforeValidator(_coerce_int_placeholder)] = Field(
         default=5,
         ge=1,
         le=100,
@@ -78,6 +96,55 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field(
         default="INFO",
         description="Logging level (DEBUG, INFO, WARNING, ERROR).",
+    )
+
+    # ── Auth ──────────────────────────────────────────────────────────────
+    JWT_SECRET: str = Field(
+        default="change-me-in-production",
+        description="HMAC secret for signing JWT tokens.",
+    )
+    JWT_ALGORITHM: str = Field(
+        default="HS256",
+        description="JWT signing algorithm.",
+    )
+    JWT_EXPIRE_MINUTES: int = Field(
+        default=480,
+        ge=1,
+        description="JWT token expiry in minutes.",
+    )
+
+    # ── LDAP ──────────────────────────────────────────────────────────────
+    LDAP_ENABLED: bool = Field(
+        default=False,
+        description="Enable LDAP/AD authentication.",
+    )
+    LDAP_SERVER: str = Field(
+        default="ldap://localhost:389",
+        description="LDAP server URI.",
+    )
+    LDAP_BASE_DN: str = Field(
+        default="dc=example,dc=com",
+        description="LDAP base DN for user search.",
+    )
+    LDAP_USER_FILTER: str = Field(
+        default="(uid={username})",
+        description="LDAP filter template for user lookup.",
+    )
+    LDAP_BIND_DN: str = Field(
+        default="",
+        description="Optional bind DN for LDAP search.",
+    )
+    LDAP_BIND_PASSWORD: str = Field(
+        default="",
+        description="Optional bind password for LDAP search.",
+    )
+    LDAP_USERNAME_ATTR: str = Field(
+        default="uid",
+        description="LDAP attribute mapped to username.",
+    )
+    LDAP_AUTO_CREATE_USER: bool = Field(
+        default=True,
+        description="Auto-create local user on first LDAP login.",
     )
 
 

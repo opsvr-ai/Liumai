@@ -31,36 +31,36 @@ from app.models.database import Base
 class UserRole(str, enum.Enum):
     """RBAC roles within a single tenant (team)."""
 
-    ADMIN = "admin"          # Global config, rule management
-    OPERATOR = "operator"    # Trigger RCA, view results
-    VIEWER = "viewer"        # Read-only history
+    ADMIN = "ADMIN"
+    OPERATOR = "OPERATOR"
+    VIEWER = "VIEWER"
 
 
 class RcaTriggerType(str, enum.Enum):
     """How the RCA session was initiated."""
 
-    PASSIVE = "passive"     # Alert rule match → auto-trigger
-    ACTIVE = "active"       # Operator manual trigger
+    PASSIVE = "PASSIVE"
+    ACTIVE = "ACTIVE"
 
 
 class RcaStatus(str, enum.Enum):
     """Lifecycle state of an RCA session."""
 
-    QUEUED = "queued"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
+    QUEUED = "QUEUED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
 
 
 class CollaborationEventType(str, enum.Enum):
     """Types of events in the emergency collaboration timeline."""
 
-    GROUP_CREATED = "group_created"
-    MEMBER_JOINED = "member_joined"
-    AGENT_PROGRESS = "agent_progress"
-    MANUAL_FINDING = "manual_finding"
-    BOT_MENTIONED = "bot_mentioned"
-    RCA_COMPLETED = "rca_completed"
+    GROUP_CREATED = "GROUP_CREATED"
+    MEMBER_JOINED = "MEMBER_JOINED"
+    AGENT_PROGRESS = "AGENT_PROGRESS"
+    MANUAL_FINDING = "MANUAL_FINDING"
+    BOT_MENTIONED = "BOT_MENTIONED"
+    RCA_COMPLETED = "RCA_COMPLETED"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -98,6 +98,7 @@ class User(Base):
         index=True,
     )
     username = Column(String(255), nullable=False, unique=True)
+    password_hash = Column(String(255), nullable=True)
     role = Column(
         Enum(UserRole, name="user_role", create_type=True),
         nullable=False,
@@ -244,4 +245,61 @@ class CollaborationEvent(Base):
             f"<CollaborationEvent id={self.id} "
             f"type={self.event_type.value} "
             f"session={self.rca_session_id}>"
+        )
+
+
+class ChatSession(Base):
+    """A single chat conversation thread."""
+
+    __tablename__ = "chat_sessions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    title = Column(String(255), nullable=False, default="新对话")
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<ChatSession id={self.id} title={self.title!r}>"
+
+
+class ChatMessage(Base):
+    """A single message within a chat session."""
+
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(
+        Integer,
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role = Column(String(20), nullable=False)  # user / assistant / tool
+    content = Column(Text, nullable=False, default="")
+    tool_calls = Column(JSONB, nullable=True)  # serialised ToolCallDelta[]
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<ChatMessage id={self.id} role={self.role!r} "
+            f"session={self.session_id}>"
         )
