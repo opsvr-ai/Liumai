@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { Activity, Eye, Play, RefreshCw, X } from "lucide-react";
+import { Activity, Eye, RefreshCw, X } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sheet, SheetContent } from "@/components/ui/sheet";
@@ -19,9 +18,6 @@ export default function RcaPage() {
   const [loading, setLoading] = useState(true);
   const [detail, setDetail] = useState<RcaSessionDetail | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
-  const [start, setStart] = useState(() => new Date(Date.now() - 30 * 60000).toISOString().slice(0, 16));
-  const [end, setEnd] = useState(() => new Date().toISOString().slice(0, 16));
-  const [triggering, setTriggering] = useState(false);
 
   const refresh = useCallback(() => {
     setLoading(true);
@@ -38,17 +34,6 @@ export default function RcaPage() {
     if (sid) rca.detail(Number(sid)).then((d) => { setDetail(d); setDetailOpen(true); }).catch(() => {});
   }, [searchParams]);
 
-  async function handleTrigger() {
-    setTriggering(true);
-    try {
-      const res = await rca.trigger({ time_window_start: new Date(start).toISOString(), time_window_end: new Date(end).toISOString() });
-      toast.success(`RCA 分析完成 · 会话 #${res.session_id}`);
-      refresh();
-      rca.detail(res.session_id).then((d) => { setDetail(d); setDetailOpen(true); }).catch(() => {});
-    } catch (e: any) { toast.error(`触发失败: ${e.message}`); }
-    finally { setTriggering(false); }
-  }
-
   async function openDetail(sid: number) {
     setSearchParams({ s: String(sid) });
     try { const d = await rca.detail(sid); setDetail(d); setDetailOpen(true); }
@@ -60,24 +45,13 @@ export default function RcaPage() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold">RCA 分析</h2>
-          <p className="text-sm text-muted-foreground mt-0.5">活跃 {queue?.active_count ?? "—"} · 排队 {queue?.queued_count ?? "—"}</p>
+          <p className="text-sm text-muted-foreground mt-0.5">自动触发记录 · 活跃 {queue?.active_count ?? "—"} · 排队 {queue?.queued_count ?? "—"}</p>
         </div>
         <Button variant="ghostMuted" size="icon-sm" onClick={refresh} aria-label="刷新"><RefreshCw className="h-4 w-4" /></Button>
       </div>
 
       <Card>
-        <CardHeader><CardTitle className="text-sm font-medium flex items-center gap-2"><Play className="h-4 w-4" /> 手动触发 RCA</CardTitle></CardHeader>
-        <CardContent>
-          <div className="flex flex-wrap items-end gap-3">
-            <div className="space-y-1"><label className="text-xs text-muted-foreground">开始时间</label><Input type="datetime-local" value={start} onChange={(e) => setStart(e.target.value)} className="w-52" /></div>
-            <div className="space-y-1"><label className="text-xs text-muted-foreground">结束时间</label><Input type="datetime-local" value={end} onChange={(e) => setEnd(e.target.value)} className="w-52" /></div>
-            <Button onClick={handleTrigger} disabled={triggering}><Play className="h-4 w-4 mr-1.5" />{triggering ? "触发中..." : "触发 RCA"}</Button>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader><CardTitle className="text-sm font-medium flex items-center gap-2"><Activity className="h-4 w-4" /> 会话列表</CardTitle></CardHeader>
+        <CardHeader><CardTitle className="text-sm font-medium flex items-center gap-2"><Activity className="h-4 w-4" /> 自动触发记录</CardTitle></CardHeader>
         <CardContent className="p-0">
           {loading ? (
             <div className="p-4 space-y-2">{Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-10 w-full" />)}</div>
