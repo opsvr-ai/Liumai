@@ -263,6 +263,62 @@ export async function* chatStream(
   }
 }
 
+/* ── Auth / Setup ─────────────────────────────────── */
+
+export interface SetupStatus {
+  needs_setup: boolean;
+}
+
+export interface LdapStatus {
+  enabled: boolean;
+  ok: boolean;
+  message: string;
+}
+
+export const authApi = {
+  setupStatus() {
+    return request<SetupStatus>("GET", "/auth/setup/status");
+  },
+  setup(username: string, password: string) {
+    return request<{ token: string; username: string; role: string }>("POST", "/auth/setup", { username, password });
+  },
+  login(username: string, password: string) {
+    return request<{ token: string; username: string; role: string }>("POST", "/auth/login", { username, password });
+  },
+  changePassword(old_password: string, new_password: string) {
+    return request<void>("POST", "/auth/change-password", { old_password, new_password });
+  },
+  ldapStatus() {
+    return request<LdapStatus>("GET", "/auth/ldap-status");
+  },
+};
+
+/* ── Users ────────────────────────────────────────── */
+
+export interface UserOut {
+  id: number;
+  username: string;
+  role: string;
+  auth_type: string;
+  team_id: number;
+  created_at: string | null;
+}
+
+export const userApi = {
+  list() {
+    return request<UserOut[]>("GET", "/users");
+  },
+  create(data: { username: string; password: string; role: string; team_id?: number }) {
+    return request<UserOut>("POST", "/users", data);
+  },
+  update(userId: number, data: { role?: string; password?: string; team_id?: number }) {
+    return request<UserOut>("PUT", `/users/${userId}`, data);
+  },
+  delete(userId: number) {
+    return request<void>("DELETE", `/users/${userId}`);
+  },
+};
+
 /* ── Chat history ────────────────────────────────── */
 
 export interface ChatSessionSummary {
