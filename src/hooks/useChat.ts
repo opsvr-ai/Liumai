@@ -78,11 +78,19 @@ export function useChat() {
         );
 
         if (existingIdx >= 0) {
-          // Update in place — completed when Hermes signals it
-          const status = tc.hermes_status;
+          // Update in place — preserve hermes_emoji/label/status from earlier
+          // progress events so regular delta chunks don't overwrite them
+          const prevTc = next[existingIdx].toolCalls?.[0];
+          const mergedTc: ToolCallDelta = {
+            ...tc,
+            hermes_emoji: tc.hermes_emoji || prevTc?.hermes_emoji,
+            hermes_label: tc.hermes_label || prevTc?.hermes_label,
+            hermes_status: tc.hermes_status || prevTc?.hermes_status,
+          };
+          const status = mergedTc.hermes_status;
           next[existingIdx] = {
             ...next[existingIdx],
-            toolCalls: [tc],
+            toolCalls: [mergedTc],
             isStreaming: status === "completed"
               ? false
               : status === "running"
@@ -92,11 +100,13 @@ export function useChat() {
                   : true,
           };
         } else {
-          // Insert new tool-call message BEFORE the LAST assistant bubble
-          // (the one currently streaming), not the first one
-          let insertAt = -1;
-          for (let i = next.length - 1; i >= 0; i--) {
-            if (next[i].role === "assistant") { insertAt = i; break; }
+          // Insert new tool message at the end of the list, but BEFORE
+          // a currently-streaming assistant bubble if one exists.
+          // This keeps tools scoped to the CURRENT round, not previous ones.
+          let insertAt = next.length;
+          const lastMsg = next[next.length - 1];
+          if (lastMsg && lastMsg.role === "assistant" && lastMsg.isStreaming) {
+            insertAt = next.length - 1;
           }
           const toolMsg: DisplayMessage = {
             id: `tool-${tcId}`,
@@ -105,11 +115,7 @@ export function useChat() {
             toolCalls: [tc],
             isStreaming: true,
           };
-          if (insertAt >= 0) {
-            next.splice(insertAt, 0, toolMsg);
-          } else {
-            next.push(toolMsg);
-          }
+          next.splice(insertAt, 0, toolMsg);
         }
       }
 
