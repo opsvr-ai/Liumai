@@ -71,6 +71,32 @@ export const ChatPanel: FC = () => {
   const [rcaTimeEnd, setRcaTimeEnd] = useState("");
   const [rcaPreset, setRcaPreset] = useState("none");
 
+  /* ── File attachment (knowledge QA mode) ──────────── */
+  const [attachedFile, setAttachedFile] = useState<File | null>(null);
+  const [attachedContent, setAttachedContent] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileSelect = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      setAttachedFile(file);
+      try {
+        const text = await file.text();
+        setAttachedContent(text);
+      } catch {
+        setAttachedContent(`[无法读取文件内容: ${file.name}]`);
+      }
+    },
+    [],
+  );
+
+  const clearAttachment = useCallback(() => {
+    setAttachedFile(null);
+    setAttachedContent("");
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }, []);
+
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const reloadSessions = useCallback(async () => {
@@ -102,8 +128,14 @@ export const ChatPanel: FC = () => {
 
   const handleSend = useCallback(async () => {
     if (!input.trim() || isStreaming) return;
-    const text = input;
+    let text = input;
     setInput("");
+    // Knowledge QA: inline attached document content
+    if (activeMode === "knowledge" && attachedContent) {
+      const fileName = attachedFile?.name ?? "文档";
+      text = `[上传文档: ${fileName}]\n\n${attachedContent}\n\n[用户问题]\n${text}`;
+      clearAttachment();
+    }
     const twStart = activeMode === "rca" ? (rcaTimeStart || new Date(Date.now() - 15 * 60000).toISOString()) : undefined;
     const twEnd = activeMode === "rca" ? (rcaTimeEnd || new Date().toISOString()) : undefined;
     await sendMessage(text, {
@@ -111,7 +143,7 @@ export const ChatPanel: FC = () => {
       timeWindowStart: twStart,
       timeWindowEnd: twEnd,
     });
-  }, [input, isStreaming, sendMessage, activeMode, rcaTimeStart, rcaTimeEnd]);
+  }, [input, isStreaming, sendMessage, activeMode, rcaTimeStart, rcaTimeEnd, attachedContent, attachedFile, clearAttachment]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLInputElement>) => {
@@ -321,6 +353,39 @@ export const ChatPanel: FC = () => {
                 {m.name}
               </button>
             ))}
+          </div>
+        )}
+
+        {/* ── Knowledge QA: file upload ───────────────────── */}
+        {activeMode === "knowledge" && (
+          <div className="shrink-0 px-4 pb-2 flex items-center gap-2">
+            <input
+              ref={fileInputRef}
+              type="file"
+              onChange={handleFileSelect}
+              className="hidden"
+              accept=".txt,.md,.json,.log,.py,.js,.ts,.csv,.xml,.yaml,.yml,.ini,.cfg,.env,.html,.css,.sql,.java,.go,.rs,.c,.cpp,.h,.sh,.bat,.ps1,.pdf"
+            />
+            <Button
+              variant={attachedFile ? "default" : "outline"}
+              size="sm"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Upload className="h-3.5 w-3.5 mr-1" />
+              {attachedFile ? attachedFile.name : "上传文档"}
+            </Button>
+            {attachedFile && (
+              <button
+                type="button"
+                onClick={clearAttachment}
+                className="text-xs text-muted-foreground hover:text-status-active"
+              >
+                移除
+              </button>
+            )}
+            <span className="text-[11px] text-muted-foreground">
+              支持文本/Markdown/代码/PDF
+            </span>
           </div>
         )}
 
