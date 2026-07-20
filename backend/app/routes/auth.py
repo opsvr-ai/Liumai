@@ -254,13 +254,14 @@ async def get_hermes_config(
     _admin: User = Depends(require_admin),
 ) -> HermesConfigOut:
     """Return current Hermes Gateway configuration."""
+    from app.config import settings as s
     from app.models import SystemConfig
 
     rows = await db.execute(select(SystemConfig))
     cfg: dict[str, str] = {r.key: r.value for r in rows.scalars()}
     return HermesConfigOut(
-        url=cfg.get("hermes_url", "http://host.docker.internal:8642/v1"),
-        api_key=cfg.get("hermes_api_key", ""),
+        url=cfg.get("hermes_url", s.HERMES_GATEWAY_URL) or s.HERMES_GATEWAY_URL,
+        api_key=cfg.get("hermes_api_key", s.HERMES_API_KEY or ""),
     )
 
 
