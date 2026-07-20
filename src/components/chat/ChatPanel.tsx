@@ -130,18 +130,28 @@ export const ChatPanel: FC = () => {
   const sidebarContent = (
     <div className={cn(
       "shrink-0 border-r border-border flex flex-col transition-all duration-200 overflow-hidden",
-      sidebarOpen ? "w-[260px]" : "w-0 border-r-0",
+      sidebarOpen ? "w-[260px]" : "w-[52px]",
     )}>
-      {/* New session button */}
-      <div className="shrink-0 px-3 py-3">
-        <button
-          type="button"
-          onClick={handleNewSession}
-          className="flex items-center gap-2.5 w-full rounded-lg px-3 py-2.5 text-[13px] text-text-secondary hover:bg-black/5 transition-colors"
+      {/* Sidebar header — toggle + new session */}
+      <div className="shrink-0 px-3 py-2.5 flex items-center gap-1">
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => setSidebarOpen((v) => !v)}
+          aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}
         >
-          <Plus className="h-4 w-4" />
-          <span>新对话</span>
-        </button>
+          <PanelLeft className={cn("h-4 w-4 transition-transform", !sidebarOpen && "rotate-180")} />
+        </Button>
+        {sidebarOpen && (
+          <button
+            type="button"
+            onClick={handleNewSession}
+            className="flex items-center gap-2.5 flex-1 rounded-lg px-2.5 py-2 text-[13px] text-text-secondary hover:bg-black/5 transition-colors"
+          >
+            <Plus className="h-4 w-4" />
+            <span>新对话</span>
+          </button>
+        )}
       </div>
 
       {/* Session list */}
@@ -210,17 +220,8 @@ export const ChatPanel: FC = () => {
 
       {/* Chat area */}
       <div className="flex-1 flex flex-col min-w-0 max-w-[48rem] mx-auto w-full">
-        {/* Top bar */}
-        <div className="shrink-0 flex items-center justify-between px-3 py-2.5">
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setSidebarOpen((v) => !v)}
-            aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}
-          >
-            <PanelLeft className={cn("h-4 w-4 transition-transform", !sidebarOpen && "rotate-180")} />
-          </Button>
-        </div>
+        {/* Top bar — minimal spacer */}
+        <div className="shrink-0 h-2" />
 
         {/* Messages */}
         <div className="flex-1 min-h-0">
