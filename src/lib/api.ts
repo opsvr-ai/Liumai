@@ -319,6 +319,9 @@ export const authApi = {
   saveHermesConfig(data: HermesConfig) {
     return request<HermesConfig>("PUT", "/auth/hermes-config", data);
   },
+  testHermes() {
+    return request<{ ok: boolean; message: string }>("POST", "/auth/hermes-test");
+  },
 };
 
 /* ── Users ────────────────────────────────────────── */

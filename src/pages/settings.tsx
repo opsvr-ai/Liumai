@@ -100,27 +100,14 @@ export default function SettingsPage() {
   async function handleTestHermes() {
     setHermesTesting(true);
     try {
-      const resp = await fetch(`${hermesConfig?.url ?? ""}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(hermesConfig?.api_key ? { Authorization: `Bearer ${hermesConfig.api_key}` } : {}),
-        },
-        body: JSON.stringify({
-          model: "hermes-agent",
-          messages: [{ role: "user", content: "ping" }],
-          max_tokens: 5,
-          stream: false,
-        }),
-      });
-      if (resp.ok) {
-        toast.success("Hermes 服务连接成功");
+      const result = await authApi.testHermes();
+      if (result.ok) {
+        toast.success(result.message);
       } else {
-        const text = await resp.text().catch(() => "");
-        toast.error(`Hermes 返回 ${resp.status}: ${text.slice(0, 200)}`);
+        toast.error(result.message);
       }
     } catch (e: any) {
-      toast.error(`无法连接 Hermes: ${e.message}`);
+      toast.error(`测试失败: ${e.message}`);
     } finally {
       setHermesTesting(false);
     }

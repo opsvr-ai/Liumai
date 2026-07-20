@@ -292,3 +292,45 @@ async def save_hermes_config(
     reload_hermes_config(entries)
 
     return body
+
+
+class HermesTestResult(BaseModel):
+    ok: bool
+    message: str
+
+
+@router.post("/hermes-test", response_model=HermesTestResult)
+async def test_hermes_connection(
+    _admin: User = Depends(require_admin),
+) -> HermesTestResult:
+    """Proxy a test ping to Hermes through the backend (avoids browser CORS)."""
+    from app.services.hermes import _hermes_url, _hermes_api_key
+
+    import httpx
+    url = f"{_hermes_url.rstrip('/')}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if _hermes_api_key:
+        headers["Authorization"] = f"Bearer {_hermes_api_key}"
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+            resp = await client.post(
+                url,
+                json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 5,
+                    "stream": False,
+                },
+                headers=headers,
+            )
+        if resp.status_code < 500:
+            return HermesTestResult(ok=True, message=f"Hermes 服务正常 (HTTP {resp.status_code})")
+        else:
+            return HermesTestResult(ok=False, message=f"Hermes 返回 {resp.status_code}: {resp.text[:200]}")
+    except httpx.ConnectError:
+        return HermesTestResult(ok=False, message="无法连接到 Hermes 服务 — 请检查地址和网络")
+    except httpx.TimeoutException:
+        return HermesTestResult(ok=False, message="连接 Hermes 超时 — 请检查网络延迟")
+    except Exception as exc:
+        return HermesTestResult(ok=False, message=f"连接失败: {exc}")
