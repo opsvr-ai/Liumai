@@ -493,3 +493,30 @@ async def update_chat_mode(
         config=mode.config or {},
         enabled=mode.enabled,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hermes skills & toolsets discovery
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/hermes/skills")
+async def list_hermes_skills() -> list[dict]:
+    """Proxy: list skills registered with the connected Hermes agent.
+
+    Calls ``GET /v1/skills`` on the Hermes API Server.  Returns an empty
+    list if the Hermes server is unreachable or does not support the endpoint.
+    """
+    hermes = _get_hermes()
+    return await hermes.get_skills()
+
+
+@router.get("/hermes/toolsets")
+async def list_hermes_toolsets() -> list[dict]:
+    """Proxy: list toolsets registered with the connected Hermes agent.
+
+    Calls ``GET /v1/toolsets`` on the Hermes API Server.  Returns an empty
+    list if the Hermes server is unreachable or does not support the endpoint.
+    """
+    hermes = _get_hermes()
+    return await hermes.get_toolsets()

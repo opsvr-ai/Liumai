@@ -414,6 +414,46 @@ class HermesClient:
                     "error": f"无法连接到 Hermes 服务: {exc}",
                 }
 
+    # ── Skills & toolsets discovery ────────────────────────────────────
+
+    async def get_skills(self) -> list[dict[str, Any]]:
+        """List skills registered with the Hermes agent.
+
+        Returns metadata for every skill the agent can invoke — name,
+        description, and category.  Requires ``API_SERVER_KEY`` on the
+        Hermes side if authentication is enabled.
+        """
+        url = f"{self.base_url}/skills"
+        try:
+            resp = await self._client.get(url)
+            resp.raise_for_status()
+            return resp.json()  # list[Skill]
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Hermes /v1/skills returned {}", exc.response.status_code)
+            return []
+        except httpx.RequestError as exc:
+            logger.warning("Hermes /v1/skills request failed: {}", exc)
+            return []
+
+    async def get_toolsets(self) -> list[dict[str, Any]]:
+        """List toolsets (tool groups) registered with the Hermes agent.
+
+        Returns each toolset's name, label, description, enabled/configured
+        status, and the concrete ``tools`` list it expands to.  Requires
+        ``API_SERVER_KEY`` on the Hermes side if authentication is enabled.
+        """
+        url = f"{self.base_url}/toolsets"
+        try:
+            resp = await self._client.get(url)
+            resp.raise_for_status()
+            return resp.json()  # list[Toolset]
+        except httpx.HTTPStatusError as exc:
+            logger.warning("Hermes /v1/toolsets returned {}", exc.response.status_code)
+            return []
+        except httpx.RequestError as exc:
+            logger.warning("Hermes /v1/toolsets request failed: {}", exc)
+            return []
+
     # ── Legacy methods (deprecated) ───────────────────────────────────────
 
     async def get_session_status(self, session_id: str) -> str:
