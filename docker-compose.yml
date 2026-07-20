@@ -24,8 +24,7 @@ services:
       POSTGRES_USER: liumai
       POSTGRES_PASSWORD: ${DB_PASSWORD:-liumai_dev}
     volumes:
-      # Bind-mounted host directory — survives Docker Desktop / WSL restarts
-      - ./data/postgres:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
       - ./backend/migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     ports:
       - "${DB_PORT:-5432}:5432"
@@ -45,8 +44,7 @@ services:
     container_name: liumai-redis
     restart: unless-stopped
     volumes:
-      # Bind-mounted host directories — survive Docker Desktop / WSL restarts
-      - ./data/redis:/data
+      - redis_data:/data
     networks:
       - liumai-net
     healthcheck:
@@ -108,8 +106,14 @@ services:
   #   curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
   # Set HERMES_GATEWAY_URL=http://host.docker.internal:8080 in .env
 
-# All persistent data uses host-directory bind mounts (./data/...)
-# so it survives Docker Desktop and WSL restarts.
+# ══════════════════════════════════════════════════════════════════
+# WARNING: Do NOT run `docker compose down -v` — this permanently
+# deletes all database data (volumes postgres_data / redis_data).
+# Use `docker compose down` (without -v) instead.
+# ══════════════════════════════════════════════════════════════════
+volumes:
+  postgres_data:
+  redis_data:
 
 networks:
   liumai-net:
