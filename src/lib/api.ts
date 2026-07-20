@@ -334,6 +334,32 @@ export const authApi = {
   },
 };
 
+/* ── Hermes skills & toolsets ─────────────────────── */
+
+export interface HermesSkill {
+  name: string;
+  description: string;
+  category: string | null;
+}
+
+export interface HermesToolset {
+  name: string;
+  label: string;
+  description: string;
+  enabled: boolean;
+  configured: boolean;
+  tools: string[];
+}
+
+export const hermesDiscovery = {
+  skills() {
+    return request<HermesSkill[]>("GET", "/chat/hermes/skills");
+  },
+  toolsets() {
+    return request<HermesToolset[]>("GET", "/chat/hermes/toolsets");
+  },
+};
+
 /* ── Users ────────────────────────────────────────── */
 
 export interface UserOut {
