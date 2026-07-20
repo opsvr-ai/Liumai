@@ -43,14 +43,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             rows = await session.execute(select(SystemConfig))
             db_cfg: dict[str, str] = {r.key: r.value for r in rows.scalars()}
 
-        if db_cfg:
-            from app.services.ldap import reload_ldap_config
-            reload_ldap_config(db_cfg)
+        logger.info("Loaded {} config keys from DB", len(db_cfg))
 
-            from app.services.hermes import reload_hermes_config
-            reload_hermes_config(db_cfg)
+        from app.services.ldap import reload_ldap_config
+        reload_ldap_config(db_cfg if db_cfg else {})
+
+        from app.services.hermes import reload_hermes_config
+        reload_hermes_config(db_cfg if db_cfg else {})
     except Exception:
-        logger.warning("Could not load config from DB — using env defaults")
+        logger.exception("Could not load config from DB — using env defaults")
 
     yield
 
