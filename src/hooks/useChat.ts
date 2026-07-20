@@ -6,7 +6,7 @@ accumulating text deltas, tracking tool calls as separate visible
 messages, and handling errors.
 */
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { chatStream, chatHistory, type ChatMessage, type ToolCallDelta } from "@/lib/api";
 
 /* ==========================================================================
@@ -264,6 +264,16 @@ export function useChat() {
       setSessionId(created.id);
     }
   }, [messages, sessionId]);
+
+  // Auto-save when streaming finishes — avoids stale-closure issues
+  const wasStreaming = useRef(isStreaming);
+  useEffect(() => {
+    const justFinished = wasStreaming.current && !isStreaming;
+    wasStreaming.current = isStreaming;
+    if (justFinished && messages.length > 0) {
+      saveCurrentSession();
+    }
+  }, [isStreaming, messages.length, saveCurrentSession]);
 
   return {
     messages,

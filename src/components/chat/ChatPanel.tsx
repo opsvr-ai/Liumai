@@ -36,7 +36,6 @@ export const ChatPanel: FC = () => {
     sendMessage,
     clearMessages,
     loadSession,
-    saveCurrentSession,
   } = useChat();
 
   const [input, setInput] = useState("");
@@ -59,14 +58,14 @@ export const ChatPanel: FC = () => {
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
-  // Send + auto-save
+  // Send (auto-save handled by useChat's useEffect)
   const handleSend = useCallback(async () => {
     if (!input.trim() || isStreaming) return;
     const text = input;
     setInput("");
     await sendMessage(text);
-    try { await saveCurrentSession(); reloadSessions(); } catch { /* ok */ }
-  }, [input, isStreaming, sendMessage, saveCurrentSession, reloadSessions]);
+    try { reloadSessions(); } catch { /* ok */ }
+  }, [input, isStreaming, sendMessage, reloadSessions]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLInputElement>) => {
