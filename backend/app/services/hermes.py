@@ -422,12 +422,17 @@ class HermesClient:
         Returns metadata for every skill the agent can invoke — name,
         description, and category.  Requires ``API_SERVER_KEY`` on the
         Hermes side if authentication is enabled.
+
+        Handles both bare-list and envelope ``{object, data: [...]}`` responses.
         """
         url = f"{self.base_url}/skills"
         try:
             resp = await self._client.get(url)
             resp.raise_for_status()
-            return resp.json()  # list[Skill]
+            data = resp.json()
+            if isinstance(data, dict) and "data" in data:
+                return data["data"]
+            return data  # bare list
         except httpx.HTTPStatusError as exc:
             logger.warning("Hermes /v1/skills returned {}", exc.response.status_code)
             return []
