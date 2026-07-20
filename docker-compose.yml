@@ -24,7 +24,8 @@ services:
       POSTGRES_USER: liumai
       POSTGRES_PASSWORD: ${DB_PASSWORD:-liumai_dev}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # Bind-mounted host directory — survives Docker Desktop / WSL restarts
+      - ./data/postgres:/var/lib/postgresql/data
       - ./backend/migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     ports:
       - "${DB_PORT:-5432}:5432"
@@ -44,7 +45,8 @@ services:
     container_name: liumai-redis
     restart: unless-stopped
     volumes:
-      - redis_data:/data
+      # Bind-mounted host directories — survive Docker Desktop / WSL restarts
+      - ./data/redis:/data
     networks:
       - liumai-net
     healthcheck:
@@ -106,9 +108,8 @@ services:
   #   curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
   # Set HERMES_GATEWAY_URL=http://host.docker.internal:8080 in .env
 
-volumes:
-  postgres_data:
-  redis_data:
+# All persistent data uses host-directory bind mounts (./data/...)
+# so it survives Docker Desktop and WSL restarts.
 
 networks:
   liumai-net:
