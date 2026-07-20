@@ -355,7 +355,7 @@ class ChatMode(Base):
     name = Column(String(100), nullable=False)
     system_prompt = Column(Text, nullable=False, default="")
     config = Column(JSONB, nullable=False, default=dict)
-    enabled = Column(Boolean, nullable=False, default=True)
+    enabled = Column(Boolean, nullable=False, default=True, server_default="true")
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),

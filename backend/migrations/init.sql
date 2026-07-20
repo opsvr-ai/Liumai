@@ -204,14 +204,14 @@ CREATE TABLE IF NOT EXISTS chat_modes (
     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 
-INSERT INTO chat_modes (slug, name, system_prompt, config) VALUES
-    ('default', '通用', '', '{}'::jsonb),
+INSERT INTO chat_modes (slug, name, system_prompt, config, enabled) VALUES
+    ('default', '通用', '', '{}'::jsonb, TRUE),
     ('rca', '故障定界',
      '你是一个专业的故障根因分析（RCA）助手。请严格按照以下步骤：1) 解析时间窗口和服务名称 2) 查询监控指标、日志、事务数据 3) 综合分析识别根因。以 JSON 格式返回结果，包含 root_cause、confidence、evidence、impacted_services、recommended_actions。',
-     '{"time_window": true}'::jsonb),
+     '{"time_window": true}'::jsonb, TRUE),
     ('knowledge', '知识问答',
      '你是一个知识库检索助手。根据用户上传的文档内容回答问题。如文档中没有相关信息，请明确说明。回答应引用原文段落。',
-     '{"file_upload": true}'::jsonb)
+     '{"file_upload": true}'::jsonb, TRUE)
 ON CONFLICT (slug) DO NOTHING;
 
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS mode_slug VARCHAR(50);
