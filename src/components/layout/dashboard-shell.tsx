@@ -187,10 +187,10 @@ export function DashboardShell({
                 type="button"
                 onClick={item.onClick}
                 className={cn(
-                  "flex items-center gap-3 px-2 py-2 rounded-md text-sm transition-colors w-full text-left",
+                  "flex items-center gap-3 px-3 py-2 rounded-lg text-[14px] font-medium transition-colors w-full text-left",
                   item.isActive
-                    ? "bg-interactive-primary/10 text-interactive-primary font-medium"
-                    : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                    ? "bg-white text-foreground shadow-sm"
+                    : "text-[#6b6b80] hover:text-foreground hover:bg-white/60"
                 )}
                 aria-current={item.isActive ? "page" : undefined}
               >

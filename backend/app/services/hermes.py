@@ -4,12 +4,17 @@ Hermes runs an OpenAI-compatible API server on port **8642** (NOT the
 legacy Gateway REST API).  We POST ``/v1/chat/completions`` with a
 system prompt that instructs Hermes to perform Root Cause Analysis (RCA)
 fault investigation.  The response is synchronous — no polling required.
+
+For interactive chat, use :meth:`chat_stream` which enables SSE streaming
+(``stream: true``) and yields parsed delta events suitable for relaying
+to a browser client via Server-Sent Events.
 """
 
 from __future__ import annotations
 
+import json
 import uuid
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import httpx
 from loguru import logger
@@ -83,17 +88,13 @@ class HermesClient:
         self,
         skill_name: str,
         params: dict[str, Any] | None = None,
-    ) -> str:
-        """Legacy compatibility stub.
-
-        ``trigger_skill`` is kept for backward compatibility.  New code
-        should prefer :meth:`run_rca` which is synchronous and returns
-        results directly.
-
-        Delegates to :meth:`run_rca` and returns the generated session ID.
-        """
+    ) -> dict[str, Any]:
+        """Execute an RCA analysis and return both session id and output."""
         result = await self.run_rca(skill_name, params or {})
-        return result["session_id"]
+        return {
+            "session_id": result["session_id"],
+            "output": result["result"]["output"],
+        }
 
     async def run_rca(
         self,
@@ -140,7 +141,7 @@ class HermesClient:
 
         url = f"{self.base_url}/chat/completions"
         payload: dict[str, Any] = {
-            "model": "hermes-rca",
+            "model": "hermes-agent",
             "messages": [
                 {"role": "system", "content": RCA_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
@@ -192,6 +193,209 @@ class HermesClient:
             "result": {"output": content},
         }
 
+    # ── Streaming chat (for interactive conversation) ─────────────────────
+
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str = "hermes-agent",
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Stream a chat completion via Hermes API Server with SSE.
+
+        Sends ``POST /v1/chat/completions`` with ``stream: true`` and yields
+        parsed delta events one at a time.  Each yielded dict has the shape::
+
+            {
+                "type": "delta" | "tool_call" | "done" | "error",
+                "content": str | None,       # text chunk (type=delta)
+                "tool_call": dict | None,    # tool-call delta (type=tool_call)
+                "finish_reason": str | None, # stop / tool_calls / length (type=done)
+                "usage": dict | None,        # token counts (type=done, may be absent)
+                "error": str | None,         # error message (type=error)
+            }
+
+        Args:
+            messages: List of message dicts with ``role`` and ``content`` keys
+                (OpenAI-compatible format).
+            model: Model identifier (default ``"hermes-agent"``).
+            temperature: Sampling temperature (0-2, default 0.7).
+            max_tokens: Maximum tokens to generate (default 4096).
+
+        Yields:
+            Parsed delta events as described above.
+        """
+        url = f"{self.base_url}/chat/completions"
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+
+        logger.info(
+            "Hermes chat stream: model={!r} msg_count={}",
+            model,
+            len(messages),
+        )
+
+        # We use a fresh client for streaming to avoid blocking the shared
+        # client on long-lived connections.
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=30.0),
+            headers=self._headers(),
+        ) as stream_client:
+            try:
+                async with stream_client.stream("POST", url, json=payload) as resp:
+                    resp.raise_for_status()
+
+                    tool_call_buf: dict[int, dict[str, Any]] = {}
+                    current_sse_event: str | None = None
+
+                    async for line in resp.aiter_lines():
+                        # ── Track SSE event: lines ──────────────────────────
+                        if line.startswith("event: "):
+                            current_sse_event = line[7:].strip()
+                            continue
+
+                        if not line.startswith("data: "):
+                            continue
+
+                        data_str = line[6:]  # strip "data: " prefix
+
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            chunk: dict[str, Any] = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            logger.warning(
+                                "Hermes SSE unparseable: {!r}", data_str[:200]
+                            )
+                            continue
+
+                        # Log every chunk so we can diagnose what Hermes sends
+                        logger.info(
+                            "Hermes SSE | event={} keys={} preview={}",
+                            current_sse_event,
+                            list(chunk.keys()),
+                            json.dumps(chunk, ensure_ascii=False)[:400],
+                        )
+
+                        sse_event = current_sse_event
+                        current_sse_event = None
+
+                        # ── Hermes tool progress events ─────────────────────
+                        if sse_event == "hermes.tool.progress":
+                            yield _parse_hermes_tool_progress(chunk, tool_call_buf)
+                            continue
+
+                        # ── Multi-format delta extraction ───────────────────
+                        delta, finish_reason = _extract_delta(chunk)
+
+                        # ── Tool calls ───────────────────────────────────────
+                        raw_tool_calls = _find_tool_calls(delta)
+                        if raw_tool_calls:
+                            for tc in raw_tool_calls:
+                                idx: int = tc.get("index", 0)
+                                if idx not in tool_call_buf:
+                                    tool_call_buf[idx] = {
+                                        "id": tc.get("id", ""),
+                                        "function": {"name": "", "arguments": ""},
+                                    }
+                                entry = tool_call_buf[idx]
+                                if tc.get("id"):
+                                    entry["id"] = tc["id"]
+                                func = tc.get("function", {})
+                                if func.get("name"):
+                                    entry["function"]["name"] += func["name"]
+                                if func.get("arguments"):
+                                    entry["function"]["arguments"] += func["arguments"]
+
+                            assembled = [
+                                tool_call_buf[i]
+                                for i in sorted(tool_call_buf.keys())
+                            ]
+                            logger.info(
+                                "Hermes SSE → tool_call: names={}",
+                                [t["function"]["name"] for t in assembled],
+                            )
+                            yield {
+                                "type": "tool_call",
+                                "content": None,
+                                "tool_calls": assembled,
+                                "finish_reason": None,
+                                "usage": None,
+                                "error": None,
+                            }
+
+                        # ── Text content ────────────────────────────────────
+                        content = _find_content(delta)
+                        if content:
+                            yield {
+                                "type": "delta",
+                                "content": content,
+                                "tool_call": None,
+                                "finish_reason": None,
+                                "usage": None,
+                                "error": None,
+                            }
+
+                        # ── Finish ───────────────────────────────────────────
+                        if finish_reason is not None:
+                            if finish_reason == "tool_calls":
+                                tool_call_buf.clear()
+                            logger.info(
+                                "Hermes SSE → done: finish_reason={}", finish_reason
+                            )
+                            yield {
+                                "type": "done",
+                                "content": None,
+                                "tool_call": None,
+                                "finish_reason": finish_reason,
+                                "usage": chunk.get("usage"),
+                                "error": None,
+                            }
+
+                        # ── Catch-all for unknown shapes ────────────────────
+                        if (
+                            not raw_tool_calls
+                            and not _find_content(delta)
+                            and finish_reason is None
+                        ):
+                            logger.info(
+                                "Hermes SSE → unhandled: {}",
+                                json.dumps(chunk, ensure_ascii=False)[:300],
+                            )
+
+            except httpx.HTTPStatusError as exc:
+                logger.error(
+                    "Hermes chat stream HTTP error: status={} body={!r}",
+                    exc.response.status_code,
+                    exc.response.text[:500],
+                )
+                yield {
+                    "type": "error",
+                    "content": None,
+                    "tool_call": None,
+                    "finish_reason": None,
+                    "usage": None,
+                    "error": f"Hermes API error (HTTP {exc.response.status_code})",
+                }
+            except httpx.RequestError as exc:
+                logger.error("Hermes chat stream request error: {}", exc)
+                yield {
+                    "type": "error",
+                    "content": None,
+                    "tool_call": None,
+                    "finish_reason": None,
+                    "usage": None,
+                    "error": f"无法连接到 Hermes 服务: {exc}",
+                }
+
     # ── Legacy methods (deprecated) ───────────────────────────────────────
 
     async def get_session_status(self, session_id: str) -> str:
@@ -223,3 +427,154 @@ class HermesClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Format-agnostic SSE helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _parse_hermes_tool_progress(
+    chunk: dict[str, Any],
+    _tool_buf: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    """Convert a ``hermes.tool.progress`` SSE event into a :meth:`chat_stream` event.
+
+    Hermes emits tool progress in this shape::
+
+        {
+            "tool": "browser_navigate",
+            "emoji": "🌐",
+            "label": "https://...",
+            "toolCallId": "call_00_xxx",
+            "status": "running" | "completed"
+        }
+
+    We normalise this into the same ``tool_call`` envelope the frontend
+    already understands, adding ``emoji`` and ``label`` for richer display.
+    """
+    tool_name: str = chunk.get("tool", "unknown")
+    tool_call_id: str = chunk.get("toolCallId", "")
+    status: str = chunk.get("status", "running")
+    emoji: str = chunk.get("emoji", "🔧")
+    label: str = chunk.get("label", "")
+
+    tool_call = {
+        "id": tool_call_id,
+        "function": {
+            "name": tool_name,
+            "arguments": label,  # repurpose: Hermes puts description here
+        },
+    }
+
+    logger.info(
+        "Hermes SSE → tool progress: tool={} status={} label={!r}",
+        tool_name,
+        status,
+        label,
+    )
+
+    return {
+        "type": "tool_call",
+        "content": None,
+        "tool_calls": [tool_call],
+        "finish_reason": None,
+        "usage": None,
+        "error": None,
+        # Hermes-specific fields forwarded to the frontend
+        "hermes_emoji": emoji,
+        "hermes_label": label,
+        "hermes_status": status,
+    }
+
+
+def _extract_delta(chunk: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    """Pull ``delta`` and ``finish_reason`` out of an SSE chunk.
+
+    Handles every variant we've seen from OpenAI-compatible servers:
+    * ``choices[0].delta`` + ``choices[0].finish_reason`` (standard)
+    * ``delta`` at chunk root
+    * ``choices[0].message`` (some servers use ``message`` instead of ``delta``)
+    """
+    delta: dict[str, Any] = {}
+    finish_reason: str | None = None
+
+    choices: list[dict[str, Any]] = chunk.get("choices", [])
+    if choices:
+        choice = choices[0]
+        delta = choice.get("delta", {})
+        if not delta:
+            # Some servers put the full message in ``choices[0].message``
+            delta = choice.get("message", {})
+        finish_reason = choice.get("finish_reason")
+
+    # Top-level delta (bypassing choices)
+    if not delta and "delta" in chunk:
+        delta = chunk["delta"]
+
+    # Top-level finish_reason
+    if finish_reason is None and "finish_reason" in chunk:
+        finish_reason = chunk["finish_reason"]
+
+    return delta, finish_reason
+
+
+def _find_tool_calls(delta: dict[str, Any]) -> list[dict[str, Any]]:
+    """Locate tool-call descriptors anywhere in the delta.
+
+    Checks (in order):
+    1. ``delta.tool_calls`` — standard OpenAI streaming
+    2. ``delta.function_call`` — legacy OpenAI (normalised to tool_calls shape)
+    3. ``delta.tool_use`` — Anthropic-style (some proxies)
+    """
+    # Standard
+    tool_calls: Any = delta.get("tool_calls")
+    if isinstance(tool_calls, list) and tool_calls:
+        return tool_calls  # type: ignore[return-value]
+
+    # Legacy function_call
+    func_call: Any = delta.get("function_call")
+    if isinstance(func_call, dict) and func_call:
+        return [{
+            "index": 0,
+            "id": func_call.get("name", "call_0"),
+            "function": {
+                "name": func_call.get("name", ""),
+                "arguments": func_call.get("arguments", ""),
+            },
+        }]
+
+    # Anthropic-style tool_use (some proxies normalise to this)
+    tool_use: Any = delta.get("tool_use")
+    if isinstance(tool_use, dict) and tool_use:
+        return [{
+            "index": 0,
+            "id": tool_use.get("id", "tool_0"),
+            "function": {
+                "name": tool_use.get("name", ""),
+                "arguments": json.dumps(tool_use.get("input", {})),
+            },
+        }]
+
+    return []
+
+
+def _find_content(delta: dict[str, Any]) -> str | None:
+    """Extract text content from a delta dict.
+
+    Handles ``content`` as str or list (some APIs return content as a list of
+    content-block dicts).
+    """
+    content: Any = delta.get("content")
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # Content-block list (e.g. [{"type":"text","text":"hello"}])
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "".join(parts) if parts else None
+    return str(content)

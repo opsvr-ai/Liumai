@@ -82,9 +82,10 @@ async def health_check() -> dict[str, str | int]:
 
 # ── Router registration ─────────────────────────────────────────────────────
 
-from app.routes import alerts, history, rca, rules  # noqa: E402
+from app.routes import alerts, chat, history, rca, rules  # noqa: E402
 
 app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
 app.include_router(rca.router, prefix="/api/rca", tags=["rca"])
 app.include_router(rules.router, prefix="/api/rules", tags=["rules"])
 app.include_router(history.router, prefix="/api/history", tags=["history"])
+app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
