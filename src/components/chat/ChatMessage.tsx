@@ -12,7 +12,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize from "rehype-sanitize";
-import { Bot, User, AlertCircle, Loader2, Check, ChevronDown, ChevronRight } from "lucide-react";
+import { User, AlertCircle, Loader2, Check, ChevronDown, ChevronRight } from "lucide-react";
+import { LiumaiLogo } from "@/components/liumai-logo";
 import type { DisplayMessage } from "@/hooks/useChat";
 import type { ToolCallDelta } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -189,7 +190,7 @@ export const ChatMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
           }`}
           aria-hidden="true"
         >
-          {isError ? <AlertCircle className="h-3.5 w-3.5" /> : <Bot className="h-3.5 w-3.5" />}
+          {isError ? <AlertCircle className="h-3.5 w-3.5" /> : <LiumaiLogo size={14} className="text-current" />}
         </div>
       )}
 

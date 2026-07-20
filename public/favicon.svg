@@ -1,0 +1,13 @@
+<svg width="48" height="48" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <circle cx="24" cy="24" r="22" stroke="#3B82F6" stroke-width="1" opacity="0.15"/>
+  <circle cx="24" cy="24" r="18" stroke="#3B82F6" stroke-width="0.5" opacity="0.1"/>
+  <path d="M4 14 Q14 18 20 20" stroke="#3B82F6" stroke-width="1.8" stroke-linecap="round" opacity="0.7" fill="none"/>
+  <path d="M3 26 Q12 24 19 23" stroke="#3B82F6" stroke-width="1.8" stroke-linecap="round" opacity="0.85" fill="none"/>
+  <path d="M6 38 Q13 32 20 27" stroke="#3B82F6" stroke-width="1.8" stroke-linecap="round" opacity="0.6" fill="none"/>
+  <path d="M44 14 Q34 18 28 20" stroke="#3B82F6" stroke-width="1.8" stroke-linecap="round" opacity="0.7" fill="none"/>
+  <path d="M45 26 Q36 24 29 23" stroke="#3B82F6" stroke-width="1.8" stroke-linecap="round" opacity="0.85" fill="none"/>
+  <path d="M42 38 Q35 32 28 27" stroke="#3B82F6" stroke-width="1.8" stroke-linecap="round" opacity="0.6" fill="none"/>
+  <polygon points="24,17 31,22 31,30 24,35 17,30 17,22" fill="#3B82F6" opacity="0.15"/>
+  <polygon points="24,19 29,22.5 29,28.5 24,32 19,28.5 19,22.5" fill="#3B82F6" opacity="0.85"/>
+  <circle cx="24" cy="25.5" r="3" fill="white" opacity="0.9"/>
+</svg>
