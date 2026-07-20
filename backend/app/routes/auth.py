@@ -91,8 +91,6 @@ async def login(
     - User does NOT exist, or exists with auth_type=LDAP → try LDAP bind.
       Auto-create on first successful LDAP login (when LDAP_AUTO_CREATE_USER).
     """
-    from app.config import settings as s
-
     # 1. Look up by username
     row = await db.execute(select(User).where(User.username == body.username))
     user: User | None = row.scalar_one_or_none()
@@ -108,11 +106,12 @@ async def login(
         )
 
     # 3. LDAP auth — enterprise users
-    if s.LDAP_ENABLED:
+    from app.services.ldap import _ldap_enabled, _ldap_auto_create_user
+    if _ldap_enabled:
         ldap_user = await authenticate_ldap(body.username, body.password)
         if ldap_user:
             if user is None:
-                if s.LDAP_AUTO_CREATE_USER:
+                if _ldap_auto_create_user:
                     user = User(
                         username=ldap_user.username,
                         role=UserRole.OPERATOR,
@@ -174,10 +173,9 @@ async def ldap_status(
     _admin: User = Depends(get_current_user),
 ) -> LdapStatus:
     """Test LDAP connectivity (admin only)."""
-    from app.config import settings as s
-
     ok, msg = await test_ldap_connection()
-    return LdapStatus(enabled=s.LDAP_ENABLED, ok=ok, message=msg)
+    from app.services.ldap import _ldap_enabled
+    return LdapStatus(enabled=_ldap_enabled, ok=ok, message=msg)
 
 
 @router.get("/ldap-config", response_model=LdapConfig)
