@@ -75,8 +75,11 @@ async def init_db() -> None:
     """
     from app.models import (  # noqa: F401 — ensure models are registered
         AlertRule,
+        ChatMessage,
+        ChatSession,
         CollaborationEvent,
         RcaSession,
+        SystemConfig,
         Team,
         User,
     )

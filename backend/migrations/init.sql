@@ -160,3 +160,25 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_chat_messages_session_id ON chat_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_chat_messages_created ON chat_messages(created_at ASC);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- System configuration (runtime settings persisted across restarts)
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS system_config (
+    key         VARCHAR(255) PRIMARY KEY,
+    value       TEXT         NOT NULL DEFAULT '',
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+-- Seed default LDAP config so the UI has entries to edit
+INSERT INTO system_config (key, value) VALUES
+    ('ldap_enabled', 'false'),
+    ('ldap_server', 'ldap://localhost:389'),
+    ('ldap_base_dn', 'dc=example,dc=com'),
+    ('ldap_user_filter', '(uid={username})'),
+    ('ldap_bind_dn', ''),
+    ('ldap_bind_password', ''),
+    ('ldap_username_attr', 'uid'),
+    ('ldap_auto_create_user', 'true')
+ON CONFLICT (key) DO NOTHING;

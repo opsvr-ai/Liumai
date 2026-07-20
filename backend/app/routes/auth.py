@@ -157,6 +157,18 @@ class LdapStatus(BaseModel):
     message: str
 
 
+class LdapConfig(BaseModel):
+    """All LDAP configuration fields exposed to the admin UI."""
+    enabled: bool = False
+    server: str = "ldap://localhost:389"
+    base_dn: str = "dc=example,dc=com"
+    user_filter: str = "(uid={username})"
+    bind_dn: str = ""
+    bind_password: str = ""
+    username_attr: str = "uid"
+    auto_create_user: bool = True
+
+
 @router.get("/ldap-status", response_model=LdapStatus)
 async def ldap_status(
     _admin: User = Depends(get_current_user),
@@ -166,3 +178,66 @@ async def ldap_status(
 
     ok, msg = await test_ldap_connection()
     return LdapStatus(enabled=s.LDAP_ENABLED, ok=ok, message=msg)
+
+
+@router.get("/ldap-config", response_model=LdapConfig)
+async def get_ldap_config(
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> LdapConfig:
+    """Return current LDAP configuration (from DB, falling back to env vars)."""
+    from app.models import SystemConfig
+
+    rows = await db.execute(select(SystemConfig))
+    cfg: dict[str, str] = {r.key: r.value for r in rows.scalars()}
+
+    def _get(key: str, default: str = "") -> str:
+        return cfg.get(key, default)
+
+    return LdapConfig(
+        enabled=_get("ldap_enabled", "false") == "true",
+        server=_get("ldap_server", "ldap://localhost:389"),
+        base_dn=_get("ldap_base_dn", "dc=example,dc=com"),
+        user_filter=_get("ldap_user_filter", "(uid={username})"),
+        bind_dn=_get("ldap_bind_dn", ""),
+        bind_password=_get("ldap_bind_password", ""),
+        username_attr=_get("ldap_username_attr", "uid"),
+        auto_create_user=_get("ldap_auto_create_user", "true") == "true",
+    )
+
+
+@router.put("/ldap-config", response_model=LdapConfig)
+async def save_ldap_config(
+    body: LdapConfig,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> LdapConfig:
+    """Save LDAP configuration to the database. Changes take effect immediately."""
+    from app.models import SystemConfig
+
+    entries: dict[str, str] = {
+        "ldap_enabled": "true" if body.enabled else "false",
+        "ldap_server": body.server,
+        "ldap_base_dn": body.base_dn,
+        "ldap_user_filter": body.user_filter,
+        "ldap_bind_dn": body.bind_dn,
+        "ldap_bind_password": body.bind_password,
+        "ldap_username_attr": body.username_attr,
+        "ldap_auto_create_user": "true" if body.auto_create_user else "false",
+    }
+
+    for key, value in entries.items():
+        row = await db.get(SystemConfig, key)
+        if row:
+            row.value = value
+            row.updated_at = func.now()
+        else:
+            db.add(SystemConfig(key=key, value=value))
+
+    await db.flush()
+
+    # Reload the LDAP config into the running process
+    from app.services.ldap import reload_ldap_config
+    reload_ldap_config(entries)
+
+    return body

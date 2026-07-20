@@ -315,3 +315,26 @@ class ChatMessage(Base):
             f"<ChatMessage id={self.id} role={self.role!r} "
             f"session={self.session_id}>"
         )
+
+
+class SystemConfig(Base):
+    """Key-value configuration store for runtime settings (e.g. LDAP, WeCom).
+
+    Persists admin-configurable settings so they survive container restarts
+    without requiring environment-variable edits.  Env vars still act as
+    initial defaults on first startup — DB values take precedence once saved.
+    """
+
+    __tablename__ = "system_config"
+
+    key = Column(String(255), primary_key=True)
+    value = Column(Text, nullable=False, default="")
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<SystemConfig key={self.key!r} value={self.value[:40]!r}>"

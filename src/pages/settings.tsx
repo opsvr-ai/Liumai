@@ -1,41 +1,99 @@
 import { useCallback, useEffect, useState } from "react";
-import { RefreshCw, Server, Shield, Key, Wifi, WifiOff } from "lucide-react";
+import {
+  RefreshCw,
+  Server,
+  Shield,
+  Key,
+  Wifi,
+  WifiOff,
+  Save,
+  FlaskConical,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { authApi, type LdapStatus } from "@/lib/api";
+import { authApi, type LdapConfig, type LdapStatus } from "@/lib/api";
 import { useAuth } from "@/components/auth/auth-context";
 import { toast } from "sonner";
 
 export default function SettingsPage() {
-  const { user } = useAuth();
-  const [ldap, setLdap] = useState<LdapStatus | null>(null);
+  const { username, role } = useAuth();
+
+  /* ── LDAP status ───────────────────────────────────────── */
+  const [ldapStatus, setLdapStatus] = useState<LdapStatus | null>(null);
   const [ldapLoading, setLdapLoading] = useState(true);
+
+  /* ── LDAP config form ──────────────────────────────────── */
+  const [ldapConfig, setLdapConfig] = useState<LdapConfig | null>(null);
+  const [cfgLoading, setCfgLoading] = useState(true);
+  const [cfgSaving, setCfgSaving] = useState(false);
+  const [cfgExpanded, setCfgExpanded] = useState(false);
 
   /* ── Change password ────────────────────────────────────── */
   const [pwOpen, setPwOpen] = useState(false);
   const [pw, setPw] = useState({ old: "", new: "", confirm: "" });
   const [pwSaving, setPwSaving] = useState(false);
 
-  const loadLdap = useCallback(() => {
+  /* ── Load ──────────────────────────────────────────────── */
+  const loadLdapStatus = useCallback(() => {
     setLdapLoading(true);
     authApi
       .ldapStatus()
-      .then(setLdap)
-      .catch(() => setLdap(null))
+      .then(setLdapStatus)
+      .catch(() => setLdapStatus(null))
       .finally(() => setLdapLoading(false));
   }, []);
 
-  useEffect(() => {
-    loadLdap();
-  }, [loadLdap]);
+  const loadLdapConfig = useCallback(() => {
+    setCfgLoading(true);
+    authApi
+      .getLdapConfig()
+      .then((cfg) => {
+        setLdapConfig(cfg);
+        if (cfg.enabled) setCfgExpanded(true);
+      })
+      .catch(() => toast.error("加载 LDAP 配置失败"))
+      .finally(() => setCfgLoading(false));
+  }, []);
 
+  useEffect(() => {
+    loadLdapStatus();
+    loadLdapConfig();
+  }, [loadLdapStatus, loadLdapConfig]);
+
+  /* ── Save LDAP config ──────────────────────────────────── */
+  async function handleSaveConfig() {
+    if (!ldapConfig) return;
+    setCfgSaving(true);
+    try {
+      await authApi.saveLdapConfig(ldapConfig);
+      toast.success("LDAP 配置已保存，立即生效");
+      loadLdapStatus();
+    } catch (e: any) {
+      toast.error(`保存失败: ${e.message}`);
+    } finally {
+      setCfgSaving(false);
+    }
+  }
+
+  /* ── Change password ────────────────────────────────────── */
   async function handleChangePw() {
-    if (!pw.old || !pw.new) { toast.error("请填写原密码和新密码"); return; }
-    if (pw.new.length < 6) { toast.error("新密码至少 6 位"); return; }
-    if (pw.new !== pw.confirm) { toast.error("两次输入的新密码不一致"); return; }
+    if (!pw.old || !pw.new) {
+      toast.error("请填写原密码和新密码");
+      return;
+    }
+    if (pw.new.length < 6) {
+      toast.error("新密码至少 6 位");
+      return;
+    }
+    if (pw.new !== pw.confirm) {
+      toast.error("两次输入的新密码不一致");
+      return;
+    }
     setPwSaving(true);
     try {
       await authApi.changePassword(pw.old, pw.new);
@@ -49,57 +107,196 @@ export default function SettingsPage() {
     }
   }
 
+  function updateCfg<K extends keyof LdapConfig>(key: K, value: LdapConfig[K]) {
+    setLdapConfig((prev) => (prev ? { ...prev, [key]: value } : prev));
+  }
+
   return (
     <div className="p-4 md:p-6 space-y-6 max-w-3xl mx-auto">
       <div>
         <h2 className="text-lg font-semibold">系统设置</h2>
         <p className="text-sm text-muted-foreground mt-0.5">
-          平台配置与 LDAP 连接状态
+          平台配置与 LDAP 企业目录管理
         </p>
       </div>
 
-      {/* ── LDAP status ─────────────────────────────────── */}
+      {/* ── LDAP configuration ──────────────────────────── */}
       <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-sm font-medium flex items-center gap-2">
-            <Server className="h-4 w-4" />
-            LDAP 企业目录
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          {ldapLoading ? (
-            <div className="space-y-3">
-              <Skeleton className="h-5 w-48" />
-              <Skeleton className="h-4 w-64" />
-            </div>
-          ) : ldap ? (
-            <div className="space-y-3">
-              <div className="flex items-center gap-3">
-                <span className="text-sm text-muted-foreground">状态:</span>
-                {ldap.enabled ? (
-                  <Badge variant="default" className="gap-1">
-                    {ldap.ok ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
-                    {ldap.ok ? "已连接" : "已启用 (未连接)"}
+        <CardHeader
+          className="pb-3 cursor-pointer select-none"
+          onClick={() => setCfgExpanded(!cfgExpanded)}
+        >
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-sm font-medium flex items-center gap-2">
+              <Server className="h-4 w-4" />
+              LDAP / Active Directory 配置
+            </CardTitle>
+            <div className="flex items-center gap-2">
+              {!cfgLoading && ldapStatus && (
+                ldapStatus.enabled ? (
+                  <Badge variant="default" className="gap-1 text-[10px]">
+                    {ldapStatus.ok ? <Wifi className="h-3 w-3" /> : <WifiOff className="h-3 w-3" />}
+                    {ldapStatus.ok ? "已连接" : "未连接"}
                   </Badge>
                 ) : (
-                  <Badge variant="secondary">未启用</Badge>
-                )}
-              </div>
-              <p className="text-sm text-muted-foreground">{ldap.message}</p>
-              <Button variant="ghostMuted" size="sm" onClick={loadLdap}>
-                <RefreshCw className="h-3.5 w-3.5 mr-1" />
-                重新检测
-              </Button>
+                  <Badge variant="secondary" className="text-[10px]">未启用</Badge>
+                )
+              )}
+              {cfgExpanded ? (
+                <ChevronDown className="h-4 w-4 text-muted-foreground" />
+              ) : (
+                <ChevronRight className="h-4 w-4 text-muted-foreground" />
+              )}
             </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              无法获取 LDAP 状态（需要管理员权限）
-            </p>
-          )}
-        </CardContent>
+          </div>
+        </CardHeader>
+
+        {cfgExpanded && (
+          <CardContent className="space-y-4">
+            {cfgLoading ? (
+              <div className="space-y-3">
+                {Array.from({ length: 5 }).map((_, i) => (
+                  <Skeleton key={i} className="h-9 w-full" />
+                ))}
+              </div>
+            ) : ldapConfig ? (
+              <>
+                {/* ── Enabled toggle ──────────────────────── */}
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={ldapConfig.enabled}
+                    onChange={(e) => updateCfg("enabled", e.target.checked)}
+                    className="h-4 w-4 rounded border-border/60 accent-interactive-primary"
+                  />
+                  <span className="text-sm">启用 LDAP 认证</span>
+                </label>
+
+                {/* ── Server ──────────────────────────────── */}
+                <div>
+                  <label className="text-xs text-muted-foreground mb-1 block">
+                    LDAP 服务器地址
+                  </label>
+                  <Input
+                    value={ldapConfig.server}
+                    onChange={(e) => updateCfg("server", e.target.value)}
+                    placeholder="ldap://ldap.example.com:389"
+                  />
+                </div>
+
+                {/* ── Base DN ─────────────────────────────── */}
+                <div>
+                  <label className="text-xs text-muted-foreground mb-1 block">
+                    Base DN
+                  </label>
+                  <Input
+                    value={ldapConfig.base_dn}
+                    onChange={(e) => updateCfg("base_dn", e.target.value)}
+                    placeholder="dc=example,dc=com"
+                  />
+                </div>
+
+                {/* ── User filter ─────────────────────────── */}
+                <div>
+                  <label className="text-xs text-muted-foreground mb-1 block">
+                    用户过滤模板
+                  </label>
+                  <Input
+                    value={ldapConfig.user_filter}
+                    onChange={(e) => updateCfg("user_filter", e.target.value)}
+                    placeholder="(uid={username})"
+                  />
+                  <p className="text-[11px] text-muted-foreground/60 mt-0.5">
+                    {"{username}"} 会被替换为登录用户名
+                  </p>
+                </div>
+
+                {/* ── Bind DN ─────────────────────────────── */}
+                <div>
+                  <label className="text-xs text-muted-foreground mb-1 block">
+                    Bind DN (可选，用于搜索模式)
+                  </label>
+                  <Input
+                    value={ldapConfig.bind_dn}
+                    onChange={(e) => updateCfg("bind_dn", e.target.value)}
+                    placeholder="cn=admin,dc=example,dc=com"
+                  />
+                </div>
+
+                {/* ── Bind password ────────────────────────── */}
+                <div>
+                  <label className="text-xs text-muted-foreground mb-1 block">
+                    Bind Password
+                  </label>
+                  <Input
+                    type="password"
+                    value={ldapConfig.bind_password}
+                    onChange={(e) => updateCfg("bind_password", e.target.value)}
+                    placeholder="(留空则不修改)"
+                  />
+                </div>
+
+                {/* ── Username attr ────────────────────────── */}
+                <div>
+                  <label className="text-xs text-muted-foreground mb-1 block">
+                    用户名属性
+                  </label>
+                  <Input
+                    value={ldapConfig.username_attr}
+                    onChange={(e) => updateCfg("username_attr", e.target.value)}
+                    placeholder="uid"
+                  />
+                </div>
+
+                {/* ── Auto-create ──────────────────────────── */}
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={ldapConfig.auto_create_user}
+                    onChange={(e) => updateCfg("auto_create_user", e.target.checked)}
+                    className="h-4 w-4 rounded border-border/60 accent-interactive-primary"
+                  />
+                  <span className="text-sm">
+                    LDAP 用户首次登录时自动创建本地账号
+                  </span>
+                </label>
+
+                {/* ── Actions ───────────────────────────────── */}
+                <div className="flex items-center gap-2 pt-2 border-t border-border/50">
+                  <Button size="sm" onClick={handleSaveConfig} disabled={cfgSaving}>
+                    <Save className="h-3.5 w-3.5 mr-1" />
+                    {cfgSaving ? "保存中…" : "保存配置"}
+                  </Button>
+                  <Button
+                    variant="ghostMuted"
+                    size="sm"
+                    onClick={loadLdapStatus}
+                    disabled={ldapLoading}
+                  >
+                    <FlaskConical className="h-3.5 w-3.5 mr-1" />
+                    测试连接
+                  </Button>
+                </div>
+
+                {/* ── Status message ────────────────────────── */}
+                {!ldapLoading && ldapStatus && (
+                  <p
+                    className={`text-xs ${ldapStatus.ok ? "text-status-success" : "text-status-active"}`}
+                  >
+                    {ldapStatus.message}
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                加载 LDAP 配置失败
+              </p>
+            )}
+          </CardContent>
+        )}
       </Card>
 
-      {/* ── Auth info ───────────────────────────────────── */}
+      {/* ── Account security ────────────────────────────── */}
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-sm font-medium flex items-center gap-2">
@@ -110,9 +307,9 @@ export default function SettingsPage() {
         <CardContent className="space-y-3">
           <div className="flex items-center justify-between">
             <div>
-              <p className="text-sm font-medium">{user?.username ?? "—"}</p>
+              <p className="text-sm font-medium">{username ?? "—"}</p>
               <p className="text-xs text-muted-foreground">
-                角色: {user?.role ?? "—"}
+                角色: {role ?? "—"}
               </p>
             </div>
             <Button

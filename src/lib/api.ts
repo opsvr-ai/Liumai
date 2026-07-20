@@ -275,6 +275,17 @@ export interface LdapStatus {
   message: string;
 }
 
+export interface LdapConfig {
+  enabled: boolean;
+  server: string;
+  base_dn: string;
+  user_filter: string;
+  bind_dn: string;
+  bind_password: string;
+  username_attr: string;
+  auto_create_user: boolean;
+}
+
 export const authApi = {
   setupStatus() {
     return request<SetupStatus>("GET", "/auth/setup/status");
@@ -290,6 +301,12 @@ export const authApi = {
   },
   ldapStatus() {
     return request<LdapStatus>("GET", "/auth/ldap-status");
+  },
+  getLdapConfig() {
+    return request<LdapConfig>("GET", "/auth/ldap-config");
+  },
+  saveLdapConfig(data: LdapConfig) {
+    return request<LdapConfig>("PUT", "/auth/ldap-config", data);
   },
 };
 
