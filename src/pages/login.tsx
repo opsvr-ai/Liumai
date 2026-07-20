@@ -41,29 +41,29 @@ export default function LoginPage() {
   if (isFirstSetup === null) return null;
 
   return (
-    <div className="min-h-dvh flex bg-surface-secondary">
-      {/* ── Left: Animated logo ────────────────────────────── */}
-      <div className="hidden lg:flex flex-1 items-center justify-center relative overflow-hidden bg-gradient-to-br from-surface-primary via-blue-50/30 to-surface-primary">
-        <LoginLogo className="w-[340px] h-[340px]" />
+    <div className="min-h-dvh flex items-center justify-center bg-surface-secondary px-4 relative overflow-hidden">
+      {/* ── Background decoration ───────────────────────────── */}
+      <div className="absolute inset-0 pointer-events-none overflow-hidden">
+        {/* Soft gradient orbs */}
+        <div className="absolute top-1/4 -left-32 w-96 h-96 rounded-full bg-blue-400/[0.06] blur-[120px]" />
+        <div className="absolute bottom-1/4 -right-32 w-80 h-80 rounded-full bg-indigo-400/[0.05] blur-[100px]" />
       </div>
 
-      {/* ── Right: Login form ──────────────────────────────── */}
-      <div className="flex-1 flex items-center justify-center px-8 bg-surface-primary">
-        <div className="w-full max-w-[380px]">
-          {/* Mobile logo */}
-          <div className="lg:hidden flex justify-center mb-8">
+      {/* ── Glass card ─────────────────────────────────────── */}
+      <div className="relative w-full max-w-[400px]">
+        <div className="backdrop-blur-xl bg-white/70 border border-black/[0.06] rounded-3xl shadow-xl shadow-black/[0.03] p-10">
+          {/* Logo + brand */}
+          <div className="flex flex-col items-center mb-8">
             <LoginLogo className="w-28 h-28" />
-          </div>
-
-          <div className="mb-8">
-            <h1 className="text-[28px] font-bold tracking-tight text-text-primary">
-              {isFirstSetup ? "初始化平台" : "欢迎回来"}
+            <h1 className="text-[25px] font-bold tracking-tight text-text-primary mt-5">
+              {isFirstSetup ? "初始化 六脉" : "六脉"}
             </h1>
-            <p className="text-[15px] text-muted-foreground mt-2">
-              {isFirstSetup ? "创建管理员账户以开始使用" : "登录六脉 · 智能化运维数智平台"}
+            <p className="text-[14px] text-muted-foreground mt-1.5">
+              {isFirstSetup ? "创建管理员账户以开始使用" : "智能化运维数智平台"}
             </p>
           </div>
 
+          {/* Form */}
           {isFirstSetup ? (
             <form onSubmit={handleSetup} className="space-y-4">
               <div className="space-y-1.5">
@@ -105,6 +105,11 @@ export default function LoginPage() {
             </form>
           )}
         </div>
+
+        {/* Footer */}
+        <p className="text-[12px] text-muted-foreground/40 text-center mt-8 tracking-widest">
+          LIUMAI v0.2
+        </p>
       </div>
     </div>
   );
