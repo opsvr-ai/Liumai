@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, hash_password, require_admin
@@ -119,3 +119,153 @@ async def delete_user(
         raise HTTPException(status_code=400, detail="不能删除默认管理员")
     await db.delete(user)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Current-user profile endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class UserProfileOut(BaseModel):
+    id: int
+    username: str
+    role: str
+    auth_type: str
+    team_id: int
+    avatar_url: str | None = None
+    created_at: str | None = None
+    model_config = {"from_attributes": True}
+
+
+class UserProfileUpdate(BaseModel):
+    avatar_url: str | None = None
+
+
+@router.get("/me", response_model=UserProfileOut)
+async def get_my_profile(
+    user: User = Depends(get_current_user),
+) -> UserProfileOut:
+    """Return the current user's profile."""
+    return UserProfileOut(
+        id=user.id,
+        username=user.username,
+        role=user.role.value,
+        auth_type=user.auth_type.value,
+        team_id=user.team_id,
+        avatar_url=user.avatar_url,
+        created_at=user.created_at.isoformat() if user.created_at else None,
+    )
+
+
+@router.put("/me", response_model=UserProfileOut)
+async def update_my_profile(
+    body: UserProfileUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+) -> UserProfileOut:
+    """Update the current user's profile (avatar URL)."""
+    if body.avatar_url is not None:
+        user.avatar_url = body.avatar_url
+    await db.flush()
+    await db.refresh(user)
+    return UserProfileOut(
+        id=user.id,
+        username=user.username,
+        role=user.role.value,
+        auth_type=user.auth_type.value,
+        team_id=user.team_id,
+        avatar_url=user.avatar_url,
+        created_at=user.created_at.isoformat() if user.created_at else None,
+    )
+
+
+@router.get("/me/sessions")
+async def list_my_sessions(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """List the current user's chat sessions."""
+    from app.models import ChatSession as ChatSessionModel
+    offset = (page - 1) * page_size
+    total_q = await db.execute(
+        select(func.count()).select_from(ChatSessionModel).where(
+            ChatSessionModel.user_id == user.id
+        )
+    )
+    total = total_q.scalar_one()
+    rows = await db.execute(
+        select(ChatSessionModel)
+        .where(ChatSessionModel.user_id == user.id)
+        .order_by(ChatSessionModel.updated_at.desc())
+        .offset(offset)
+        .limit(page_size)
+    )
+    sessions = rows.scalars().all()
+    return {
+        "items": [
+            {
+                "id": s.id,
+                "title": s.title,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "updated_at": s.updated_at.isoformat() if s.updated_at else None,
+            }
+            for s in sessions
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.delete("/me/sessions/{session_id}")
+async def delete_my_session(
+    session_id: int,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Delete one of the current user's chat sessions."""
+    from app.models import ChatSession as ChatSessionModel, ChatMessage as ChatMessageModel
+    row = await db.execute(
+        select(ChatSessionModel).where(
+            ChatSessionModel.id == session_id,
+            ChatSessionModel.user_id == user.id,
+        )
+    )
+    session = row.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    await db.execute(
+        delete(ChatMessageModel).where(ChatMessageModel.session_id == session_id)
+    )
+    await db.delete(session)
+    await db.flush()
+    return {"ok": True}
+
+
+@router.get("/me/stats")
+async def get_my_stats(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db_session),
+):
+    """Return usage statistics for the current user."""
+    from app.models import ChatSession as ChatSessionModel, ChatMessage as ChatMessageModel
+    sessions_q = await db.execute(
+        select(func.count()).select_from(ChatSessionModel).where(
+            ChatSessionModel.user_id == user.id
+        )
+    )
+    total_sessions = sessions_q.scalar_one()
+
+    messages_q = await db.execute(
+        select(func.count()).select_from(ChatMessageModel).join(
+            ChatSessionModel, ChatMessageModel.session_id == ChatSessionModel.id
+        ).where(ChatSessionModel.user_id == user.id)
+    )
+    total_messages = messages_q.scalar_one()
+
+    return {
+        "total_sessions": total_sessions,
+        "total_messages": total_messages,
+    }

@@ -16,6 +16,7 @@ import SettingsPage from "@/pages/settings";
 import UsersPage from "@/pages/users";
 import SkillsPage from "@/pages/skills";
 import DataSourcesPage from "@/pages/datasources";
+import ProfilePage from "@/pages/profile";
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth();
@@ -83,6 +84,7 @@ export default function App() {
                     <Route path="/users" element={<UsersPage />} />
                     <Route path="/skills" element={<SkillsPage />} />
                     <Route path="/datasources" element={<DataSourcesPage />} />
+                    <Route path="/profile" element={<ProfilePage />} />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>
                 </Shell>

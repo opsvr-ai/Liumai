@@ -7,16 +7,79 @@ Renders four distinct message types:
 - **error** — red-bordered alert
 */
 
-import { useMemo, useState, type FC } from "react";
+import { useMemo, useState, useEffect, useCallback, type FC } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize from "rehype-sanitize";
-import { User, AlertCircle, Loader2, Check, ChevronDown, ChevronRight } from "lucide-react";
+import { User, AlertCircle, Loader2, Check, X, ChevronDown, ChevronRight, ArrowDown, CornerDownRight, Copy, Terminal, Globe, Search, Database, Code, FileText, Wrench } from "lucide-react";
 import { LiumaiLogo } from "@/components/liumai-logo";
 import type { DisplayMessage } from "@/hooks/useChat";
 import type { ToolCallDelta } from "@/lib/api";
 import { cn } from "@/lib/utils";
+
+/* ==========================================================================
+ * Tool icon mapping — overrides Hermes emoji for known tool patterns
+ * ========================================================================== */
+
+type IconComponent = FC<{ className?: string }>;
+
+const TOOL_ICON_MAP: Record<string, IconComponent> = {
+  // Terminal / shell
+  terminal: Terminal,
+  bash: Terminal,
+  shell: Terminal,
+  execute_command: Terminal,
+  run_shell: Terminal,
+  cmd: Terminal,
+  powershell: Terminal,
+  // Browser / web
+  browser_navigate: Globe,
+  web_fetch: Globe,
+  web_search: Globe,
+  http_request: Globe,
+  curl: Globe,
+  fetch: Globe,
+  // Search
+  search: Search,
+  grep: Search,
+  find: Search,
+  rg: Search,
+  // Database
+  database: Database,
+  db: Database,
+  sql: Database,
+  query: Database,
+  postgres: Database,
+  mysql: Database,
+  clickhouse: Database,
+  prometheus: Database,
+  // Code
+  code: Code,
+  python: Code,
+  js: Code,
+  node: Code,
+  // File ops
+  file_read: FileText,
+  file_write: FileText,
+  cat: FileText,
+  read: FileText,
+  write: FileText,
+  edit: FileText,
+  // Fallback
+  tool: Wrench,
+};
+
+function resolveToolIcon(toolName: string): IconComponent | null {
+  const key = toolName.toLowerCase().replace(/[_-]/g, "");
+  // Exact match first
+  if (TOOL_ICON_MAP[key]) return TOOL_ICON_MAP[key];
+  // Prefix match (e.g. "bash_exec" → Terminal)
+  for (const [pattern, icon] of Object.entries(TOOL_ICON_MAP)) {
+    if (key.startsWith(pattern) || key.includes(pattern)) return icon;
+  }
+  return null;
+}
 
 /* ==========================================================================
  * Tool-argument block
@@ -37,14 +100,17 @@ const ToolArgs: FC<{ tool: ToolCallDelta; isStreaming: boolean }> = ({
   if (!tool.function.arguments && !isStreaming) return null;
 
   return (
-    <div className="mt-2 rounded-md bg-surface-secondary/50 px-2.5 py-2 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all leading-relaxed border border-border/50">
-      {parsedArgs
-        ? JSON.stringify(parsedArgs, null, 2)
-        : (
-          <span className="text-muted-foreground italic">
-            {tool.function.arguments || "等待参数…"}
-          </span>
-        )}
+    <div>
+      <p className="text-[10px] text-muted-foreground/70 mb-0.5">参数</p>
+      <pre className="rounded-md bg-surface-tertiary/60 px-2.5 py-2 text-[11px] font-mono text-text-secondary whitespace-pre-wrap break-all leading-relaxed overflow-x-auto">
+        {parsedArgs
+          ? JSON.stringify(parsedArgs, null, 2)
+          : (
+            <span className="text-muted-foreground italic">
+              {tool.function.arguments || "等待参数…"}
+            </span>
+          )}
+      </pre>
     </div>
   );
 };
@@ -54,104 +120,122 @@ const ToolArgs: FC<{ tool: ToolCallDelta; isStreaming: boolean }> = ({
  * ========================================================================== */
 
 const ToolMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
-  const [expanded, setExpanded] = useState(false);
-
   const tc = message.toolCalls?.[0];
   const toolStatus = tc?.hermes_status;
   const isRunning =
     toolStatus === "running" || (message.isStreaming && !toolStatus);
+  const isError = toolStatus === "error";
+  const isDone = !isRunning && !isError && !message.isStreaming;
   const emoji = tc?.hermes_emoji;
   const label = tc?.hermes_label;
   const toolName = tc?.function?.name || message.content;
-  const hasDetail = !!label || (!!tc?.function?.arguments && !tc?.hermes_emoji);
+  const hasArgs = !!tc?.function?.arguments;
+  const hasDetail = !!label || hasArgs;
+
+  // Auto-expand while running, collapse when done
+  const [expanded, setExpanded] = useState(isRunning || isError);
+  useEffect(() => {
+    if (isDone) setExpanded(false);
+  }, [isDone]);
+
+  // ── Status-driven color tokens ──────────────────────────────────────
+  const palette = isError
+    ? { accent: "bg-status-active", bg: "bg-status-active/[0.04]", text: "text-status-active", icon: X as FC<{className?:string}>, label: "出错" }
+    : isRunning
+      ? { accent: "bg-interactive-primary", bg: "bg-interactive-primary/[0.04]", text: "text-interactive-primary", icon: Loader2 as FC<{className?:string}>, label: "执行中…" }
+      : { accent: "bg-status-resolved", bg: "", text: "text-status-resolved", icon: Check as FC<{className?:string}>, label: "完成" };
+
+  const StatusIcon = palette.icon;
 
   return (
-    <div className="flex gap-3 justify-start" role="article" aria-label="tool call">
-      {/* Avatar — prefer Hermes emoji, fall back to spinner/check */}
-      <div
-        className={cn(
-          "shrink-0 h-7 w-7 rounded-full flex items-center justify-center mt-0.5 transition-colors text-base leading-none",
-          isRunning
-            ? "bg-status-investigating/10"
-            : "bg-status-resolved/10",
-        )}
-        aria-hidden="true"
-      >
-        {emoji ? (
-          <span className="leading-none">{emoji}</span>
-        ) : isRunning ? (
-          <Loader2 className="h-3.5 w-3.5 text-status-investigating animate-spin" />
-        ) : (
-          <Check className="h-3.5 w-3.5 text-status-resolved" />
-        )}
+    <div className="flex gap-2.5 justify-start" role="article" aria-label="tool call">
+      {/* Left flow indicator: arrow down → bar → arrow return */}
+      <div className="shrink-0 flex flex-col items-center self-stretch" aria-hidden="true">
+        <ArrowDown className={cn("h-3 w-3 -mt-0.5", palette.text, isRunning && "animate-pulse")} />
+        <div className={cn("flex-1 w-0.5 rounded-full transition-colors duration-300", palette.accent)} />
+        <CornerDownRight className={cn("h-3 w-3 -mb-0.5", palette.text)} />
       </div>
 
-      <div className="max-w-[85%] min-w-0">
+      <div className="max-w-[85%] min-w-0 flex-1">
         <button
           type="button"
           onClick={() => hasDetail && setExpanded((v) => !v)}
           className={cn(
-            "w-full text-left rounded-2xl rounded-bl-md border px-4 py-2.5 transition-colors",
-            "border-status-investigating/20 bg-status-investigating/[0.03]",
-            hasDetail && "hover:bg-status-investigating/[0.06] cursor-pointer",
+            "w-full text-left rounded-lg px-3 py-2 transition-colors duration-200",
+            palette.bg,
+            hasDetail && "hover:bg-surface-secondary cursor-pointer",
+            !hasDetail && "cursor-default",
           )}
         >
-          {/* ── Header row (always visible) ────────────────────────────── */}
-          <div className="flex items-center gap-1.5 flex-wrap">
-            {/* Hermes emoji as icon */}
-            {emoji ? (
-              <span className="text-base leading-none" aria-hidden="true">
-                {emoji}
-              </span>
-            ) : (
-              <span className="text-sm leading-none" aria-hidden="true">🔧</span>
-            )}
+          {/* ── Header row ──────────────────────────────────────────────── */}
+          <div className="flex items-center gap-1.5 text-[13px] select-none">
+            {/* Icon: mapped lucide icon → Hermes emoji → status icon */}
+            {(() => {
+              const ToolIcon = resolveToolIcon(toolName);
+              if (ToolIcon) {
+                return (
+                  <ToolIcon
+                    className={cn(
+                      "h-3 w-3 shrink-0",
+                      isRunning && "animate-spin",
+                      palette.text,
+                    )}
+                  />
+                );
+              }
+              if (emoji) {
+                return <span className="text-sm leading-none" aria-hidden="true">{emoji}</span>;
+              }
+              return (
+                <StatusIcon
+                  className={cn(
+                    "h-3 w-3 shrink-0",
+                    isRunning && "animate-spin",
+                    palette.text,
+                  )}
+                />
+              );
+            })()}
 
-            <span className="text-sm font-medium text-status-investigating">
+            <span className={cn("font-medium", palette.text)}>
               调用工具
             </span>
 
-            <span className="font-mono text-xs text-text-secondary bg-surface-secondary rounded px-1.5 py-0.5">
+            <span className="font-mono text-[11px] text-text-secondary bg-surface-secondary/80 rounded px-1.5 py-px truncate max-w-[160px]">
               {toolName}
             </span>
 
-            {isRunning ? (
-              <span className="text-xs text-muted-foreground animate-pulse">
-                执行中…
-              </span>
-            ) : (
-              <span className="text-xs text-status-resolved">完成</span>
-            )}
+            <span
+              className={cn(
+                "text-[11px] shrink-0",
+                isRunning ? "text-muted-foreground animate-pulse" : palette.text,
+              )}
+            >
+              {palette.label}
+            </span>
 
-            {/* Expand/collapse chevron */}
             {hasDetail && (
-              <span className="ml-auto text-muted-foreground">
-                {expanded ? (
-                  <ChevronDown className="h-3.5 w-3.5" />
-                ) : (
-                  <ChevronRight className="h-3.5 w-3.5" />
-                )}
+              <span className="ml-auto text-muted-foreground/50 shrink-0">
+                {expanded
+                  ? <ChevronDown className="h-3 w-3 transition-transform duration-200" />
+                  : <ChevronRight className="h-3 w-3 transition-transform duration-200" />
+                }
               </span>
             )}
           </div>
 
-          {/* ── Detail section (expandable) ─────────────────────────────── */}
+          {/* ── Detail section ──────────────────────────────────────────── */}
           {expanded && hasDetail && (
-            <div className="mt-2 pt-2 border-t border-border/50">
+            <div className="mt-2 pt-2 border-t border-border/30">
               {label && (
                 <div className="mb-2">
-                  <p className="text-[11px] text-muted-foreground mb-1">
-                    描述
-                  </p>
-                  <p className="text-xs text-text-secondary break-all leading-relaxed">
-                    {label}
-                  </p>
+                  <p className="text-[10px] text-muted-foreground/70 mb-0.5">描述</p>
+                  <p className="text-[12px] text-text-secondary leading-relaxed">{label}</p>
                 </div>
               )}
-              {!label &&
-                message.toolCalls?.map((t, i) => (
-                  <ToolArgs key={t.id || i} tool={t} isStreaming={isRunning} />
-                ))}
+              {hasArgs && (
+                <ToolArgs tool={tc!} isStreaming={isRunning} />
+              )}
             </div>
           )}
         </button>
@@ -168,6 +252,42 @@ export const ChatMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
   const isUser = message.role === "user";
   const isTool = message.role === "tool";
   const isError = message.role === "error";
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = useCallback(() => {
+    if (!message.content) return;
+    navigator.clipboard.writeText(message.content).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {
+      // Fallback for insecure contexts
+      const ta = document.createElement("textarea");
+      ta.value = message.content;
+      ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }, [message.content]);
+
+  const copyBtn = message.content && !message.isStreaming ? (
+    <button
+      type="button"
+      onClick={handleCopy}
+      className={cn(
+        "shrink-0 self-end mb-0.5 p-1 rounded-md transition-all duration-150",
+        "opacity-0 group-hover:opacity-100",
+        "hover:bg-surface-secondary text-muted-foreground hover:text-text-secondary",
+        copied && "opacity-100 !text-status-resolved",
+      )}
+      aria-label={copied ? "已复制" : "复制"}
+    >
+      {copied ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+    </button>
+  ) : null;
 
   /* ── Tool-call message ───────────────────────────────────────────── */
   if (isTool) {
@@ -177,27 +297,28 @@ export const ChatMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
   /* ── Regular messages ────────────────────────────────────────────── */
   return (
     <div
-      className={`flex gap-3 ${isUser ? "justify-end" : "justify-start"}`}
+      className={`flex gap-1.5 group ${isUser ? "justify-end" : "justify-start"}`}
       role="article"
       aria-label={`${message.role} message`}
     >
-      {!isUser && (
-        <div
-          className={`shrink-0 h-7 w-7 rounded-full flex items-center justify-center mt-0.5 ${
-            isError
-              ? "bg-status-active/10 text-status-active"
-              : "bg-interactive-primary/10 text-interactive-primary"
-          }`}
-          aria-hidden="true"
-        >
-          {isError ? <AlertCircle className="h-3.5 w-3.5" /> : <LiumaiLogo size={14} className="text-current" />}
+      {!isUser && !isError && (
+        <div className="shrink-0 mt-0.5" aria-hidden="true">
+          <LiumaiLogo size={28} />
         </div>
       )}
+      {isError && (
+        <div className="shrink-0 mt-0.5 text-status-active" aria-hidden="true">
+          <AlertCircle className="h-5 w-5" />
+        </div>
+      )}
+
+      {/* Copy button — before bubble for user, after for assistant */}
+      {isUser && copyBtn}
 
       <div
         className={`max-w-[85%] min-w-0 ${
           isUser
-            ? "bg-interactive-primary text-text-inverse rounded-2xl rounded-br-md px-4 py-2.5"
+            ? "bg-[#1a1a2e] text-text-inverse rounded-2xl rounded-br-md px-4 py-2.5"
             : isError
               ? "bg-status-active/5 text-status-active border border-status-active/20 rounded-2xl rounded-bl-md px-4 py-2.5"
               : "bg-surface-secondary text-text-primary rounded-2xl rounded-bl-md px-4 py-2.5"
@@ -290,12 +411,12 @@ export const ChatMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
         )}
       </div>
 
+      {/* Copy button for assistant/error messages */}
+      {!isUser && copyBtn}
+
       {isUser && (
-        <div
-          className="shrink-0 h-7 w-7 rounded-full bg-interactive-primary flex items-center justify-center mt-0.5"
-          aria-hidden="true"
-        >
-          <User className="h-3.5 w-3.5 text-white" />
+        <div className="shrink-0 mt-0.5 text-[#1a1a2e]" aria-hidden="true">
+          <User className="h-5 w-5" />
         </div>
       )}
     </div>

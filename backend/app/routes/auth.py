@@ -24,6 +24,7 @@ class LoginResponse(BaseModel):
     token: str
     username: str
     role: str
+    auth_type: str
 
 
 # ── Setup (first-time admin creation) ──────────────────────────────────────
@@ -76,6 +77,7 @@ async def setup(
     await db.refresh(user)
     return LoginResponse(
         token=create_token(user), username=user.username, role=user.role.value,
+        auth_type=user.auth_type.value,
     )
 
 
@@ -103,6 +105,7 @@ async def login(
             raise HTTPException(status_code=401, detail="用户名或密码错误")
         return LoginResponse(
             token=create_token(user), username=user.username, role=user.role.value,
+            auth_type=user.auth_type.value,
         )
 
     # 3. LDAP auth — enterprise users
@@ -125,6 +128,7 @@ async def login(
                     raise HTTPException(status_code=401, detail="用户不存在且未启用自动创建")
             return LoginResponse(
                 token=create_token(user), username=user.username, role=user.role.value,
+                auth_type=user.auth_type.value,
             )
 
     # 4. Neither local nor LDAP matched

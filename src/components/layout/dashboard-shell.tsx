@@ -1,4 +1,5 @@
 import { type ReactNode, useState, useCallback, useRef, useEffect } from "react";
+import { useNavigate } from "react-router-dom";
 import { LiumaiBrand } from "@/components/liumai-brand";
 import {
   ChevronLeft,
@@ -82,6 +83,7 @@ export function DashboardShell({
   onHomeClick,
   activeIncidentCount = 0,
 }: DashboardShellProps) {
+  const navigate = useNavigate();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
@@ -273,6 +275,14 @@ export function DashboardShell({
                   <p className="text-[13px] font-medium text-text-primary">{userInfo.username}</p>
                   <p className="text-[11px] text-muted-foreground">{roleLabel[userInfo.role] ?? userInfo.role}</p>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => { navigate("/profile"); setUserMenuOpen(false); }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-muted transition-colors"
+                >
+                  <User className="h-3.5 w-3.5" />
+                  个人中心
+                </button>
                 <button
                   type="button"
                   onClick={() => { userInfo.onLogout(); setUserMenuOpen(false); }}

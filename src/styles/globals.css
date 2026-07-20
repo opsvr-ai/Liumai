@@ -142,7 +142,51 @@
 
 
 /* ==========================================================================
- *  Section 3: Base Element Reset
+ *  Section 3: Dark Theme
+ * ========================================================================== */
+.dark {
+  --background: #0f0f13;
+  --foreground: #e4e4ec;
+  --card: #1a1a22;
+  --card-foreground: #e4e4ec;
+  --popover: #1a1a22;
+  --popover-foreground: #e4e4ec;
+  --primary: #4f6bf7;
+  --primary-foreground: #ffffff;
+  --secondary: #1e1e28;
+  --secondary-foreground: #e4e4ec;
+  --muted: #1e1e28;
+  --muted-foreground: #8e8ea0;
+  --accent: #1a1a30;
+  --accent-foreground: #7c8cf8;
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+  --success: #10a861;
+  --success-foreground: #ffffff;
+  --info: #4f6bf7;
+  --info-foreground: #ffffff;
+  --border: #2a2a36;
+  --input: #2a2a36;
+  --ring: rgb(79 107 247 / 0.3);
+
+  /* Semantic surface tokens */
+  --color-surface-primary: #0f0f13;
+  --color-surface-secondary: #1a1a22;
+  --color-surface-tertiary: #22222c;
+  --color-text-primary: #e4e4ec;
+  --color-text-secondary: #9e9eae;
+  --color-text-muted: #6e6e80;
+  --color-text-inverse: #0f0f13;
+  --color-border-default: #2a2a36;
+  --color-border-subtle: #1e1e28;
+  --color-overlay: rgb(0 0 0 / 0.6);
+
+  color-scheme: dark;
+}
+
+
+/* ==========================================================================
+ *  Section 4: Base Element Reset
  * ========================================================================== */
 * {
   border-color: var(--border);

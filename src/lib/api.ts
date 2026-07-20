@@ -515,3 +515,40 @@ export const chatHistory = {
     return request<void>("DELETE", `/chat/sessions/${sessionId}`);
   },
 };
+
+/* ── Profile ────────────────────────────────────── */
+
+export interface ProfileData {
+  id: number;
+  username: string;
+  role: string;
+  auth_type: string;
+  team_id: number;
+  avatar_url: string | null;
+  created_at: string | null;
+}
+
+export interface SessionItem {
+  id: number;
+  title: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface UserStats {
+  total_sessions: number;
+  total_messages: number;
+}
+
+export const profileApi = {
+  getMe: () => request<ProfileData>("GET", "/users/me"),
+  updateMe: (data: { avatar_url?: string | null }) =>
+    request<ProfileData>("PUT", "/users/me", data),
+  getMySessions: (page = 1, pageSize = 20) =>
+    request<{ items: SessionItem[]; total: number; page: number; page_size: number }>(
+      "GET", `/users/me/sessions?page=${page}&page_size=${pageSize}`
+    ),
+  deleteMySession: (id: number) =>
+    request<{ ok: boolean }>("DELETE", `/users/me/sessions/${id}`),
+  getMyStats: () => request<UserStats>("GET", "/users/me/stats"),
+};
