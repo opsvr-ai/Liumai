@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/components/auth/auth-context";
-import { LiumaiLogo } from "@/components/liumai-logo";
+import { LiumaiLogoFull } from "@/components/liumai-logo-full";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
@@ -54,9 +54,7 @@ export default function LoginPage() {
         <div className="backdrop-blur-xl bg-white/70 border border-black/[0.06] rounded-3xl shadow-xl shadow-black/[0.03] p-10">
           {/* Logo + brand */}
           <div className="flex flex-col items-center mb-8">
-            <div className="bg-[#0B0F19] rounded-3xl p-4 inline-block">
-              <LiumaiLogo size={96} />
-            </div>
+            <LiumaiLogoFull size={160} />
             <h1 className="text-[25px] font-bold tracking-tight text-text-primary mt-5">
               {isFirstSetup ? "初始化 六脉" : "六脉"}
             </h1>
