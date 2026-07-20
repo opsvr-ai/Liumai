@@ -371,6 +371,13 @@ export const dataSourceApi = {
   test(id: number) {
     return request<{ ok: boolean; message: string }>("POST", `/datasources/${id}/test`);
   },
+  query(id: number, query: string, params?: Record<string, unknown>, parsePath?: string) {
+    return request<{ rows: unknown[]; count: number; parsed?: unknown }>(
+      "POST",
+      `/datasources/${id}/query`,
+      { query, params, parse_path: parsePath },
+    );
+  },
 };
 
 /* ── Hermes skills & toolsets ─────────────────────── */

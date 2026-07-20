@@ -80,13 +80,19 @@ export default function DataSourcesPage() {
     setEditing(ds);
     setFormType(ds.type);
     setFormName(ds.name);
-    const cfg: Record<string, string> = {};
+    const cfg: Record<string, unknown> = {};
     if (ds.config) {
       for (const [k, v] of Object.entries(ds.config)) {
-        cfg[k] = typeof v === "string" ? v : Array.isArray(v) ? v.join(",") : JSON.stringify(v);
+        if (k === "auth" && typeof v === "object" && v !== null) {
+          cfg.auth = { ...v as Record<string, unknown> };
+        } else if (Array.isArray(v)) {
+          cfg[k] = (v as string[]).join(",");
+        } else {
+          cfg[k] = typeof v === "string" ? v : String(v);
+        }
       }
     }
-    setFormConfig(cfg);
+    setFormConfig(cfg as Record<string, string>);
     setDialogOpen(true);
   }
 
@@ -94,19 +100,23 @@ export default function DataSourcesPage() {
     if (!formName.trim()) { toast.error("请输入名称"); return; }
     setSaving(true);
     try {
+      // Build nested config from form state
       const config: Record<string, unknown> = {};
-      for (const f of TYPE_FIELDS[formType] ?? []) {
-        const v = formConfig[f.key];
-        if (v) {
-          if (f.key === "query_interval" || f.key === "port" || f.key === "poll_interval") {
-            config[f.key] = Number(v) || v;
-          } else if (f.key === "brokers") {
-            config[f.key] = v.split(",").map((s) => s.trim()).filter(Boolean);
-          } else if (f.key === "headers") {
-            try { config[f.key] = JSON.parse(v); } catch { config[f.key] = v; }
-          } else {
-            config[f.key] = v;
+      for (const [k, v] of Object.entries(formConfig)) {
+        if (v === "" || v === undefined) continue;
+        if (k === "auth" && typeof v === "object") {
+          // Prune empty auth fields
+          const auth = { ...(v as Record<string, unknown>) };
+          for (const [ak, av] of Object.entries(auth)) {
+            if (av === "" || av === undefined) delete auth[ak];
           }
+          if (Object.keys(auth).length > 1) config.auth = auth; // keep if has type + something else
+        } else if (k === "brokers" && typeof v === "string") {
+          config[k] = v.split(",").map((s) => s.trim()).filter(Boolean);
+        } else if (k === "port" || k === "timeout_secs") {
+          config[k] = Number(v) || v;
+        } else {
+          config[k] = v;
         }
       }
       if (editing) {
@@ -207,37 +217,130 @@ export default function DataSourcesPage() {
       </Card>
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-        <DialogContent className="max-w-lg">
+        <DialogContent className="max-w-xl max-h-[85vh] overflow-y-auto">
           <DialogTitle>{editing ? "编辑数据源" : "新建数据源"}</DialogTitle>
           <DialogDescription>配置外部监控系统的连接信息</DialogDescription>
-          <div className="space-y-3 mt-2">
+          <div className="space-y-4 mt-2">
+            {/* Name */}
             <div className="space-y-1">
               <label className="text-xs font-medium">名称</label>
               <Input value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="生产环境 Prometheus" />
             </div>
+
+            {/* Type */}
             <div className="space-y-1">
               <label className="text-xs font-medium">类型</label>
-              <select
-                className="w-full h-9 rounded-lg border border-border bg-surface-secondary px-3 text-sm"
-                value={formType}
-                onChange={(e) => { setFormType(e.target.value); setFormConfig({}); }}
-                disabled={!!editing}
-              >
-                {Object.entries(TYPE_META).map(([k, v]) => (
-                  <option key={k} value={k}>{v.label}</option>
-                ))}
+              <select className="w-full h-9 rounded-lg border border-border bg-surface-secondary px-3 text-sm"
+                value={formType} onChange={(e) => { setFormType(e.target.value); setFormConfig({}); }}
+                disabled={!!editing}>
+                {Object.entries(TYPE_META).map(([k, v]) => (<option key={k} value={k}>{v.label}</option>))}
               </select>
             </div>
-            {(TYPE_FIELDS[formType] ?? []).map((f) => (
-              <div key={f.key} className="space-y-1">
-                <label className="text-xs font-medium">{f.label}</label>
-                <Input
-                  value={formConfig[f.key] ?? ""}
-                  onChange={(e) => setFormConfig((prev) => ({ ...prev, [f.key]: e.target.value }))}
-                  placeholder={f.placeholder}
-                />
+
+            {/* ── Type-specific fields ──────────────────────────── */}
+            {(formType === "prometheus" || formType === "zabbix") && (
+              <div className="space-y-1">
+                <label className="text-xs font-medium">URL</label>
+                <Input value={formConfig.url ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, url: e.target.value }))}
+                  placeholder={formType === "prometheus" ? "http://localhost:9090" : "http://zabbix.example.com"} />
               </div>
-            ))}
+            )}
+            {formType === "clickhouse" && (
+              <>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1"><label className="text-xs font-medium">主机</label><Input value={formConfig.host ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, host: e.target.value }))} placeholder="localhost" /></div>
+                  <div className="space-y-1"><label className="text-xs font-medium">端口</label><Input value={formConfig.port ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, port: e.target.value }))} placeholder="8123" /></div>
+                </div>
+                <div className="space-y-1"><label className="text-xs font-medium">数据库</label><Input value={formConfig.database ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, database: e.target.value }))} placeholder="default" /></div>
+              </>
+            )}
+            {formType === "kafka" && (
+              <>
+                <div className="space-y-1"><label className="text-xs font-medium">Brokers (逗号分隔)</label><Input value={formConfig.brokers ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, brokers: e.target.value }))} placeholder="localhost:9092" /></div>
+                <div className="space-y-1"><label className="text-xs font-medium">Topic</label><Input value={formConfig.topic ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, topic: e.target.value }))} placeholder="alerts" /></div>
+              </>
+            )}
+            {formType === "api" && (
+              <>
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="col-span-2 space-y-1"><label className="text-xs font-medium">URL</label><Input value={formConfig.url ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, url: e.target.value }))} placeholder="https://api.example.com/v1/alerts" /></div>
+                  <div className="space-y-1"><label className="text-xs font-medium">Method</label><select className="w-full h-9 rounded-lg border border-border bg-surface-secondary px-3 text-sm" value={formConfig.method ?? "GET"} onChange={(e) => setFormConfig((p) => ({ ...p, method: e.target.value }))}><option>GET</option><option>POST</option><option>PUT</option></select></div>
+                </div>
+              </>
+            )}
+
+            {/* ── Auth section ─────────────────────────────────── */}
+            <div className="border-t border-border pt-3">
+              <p className="text-xs font-medium mb-2">认证方式</p>
+              {(["prometheus", "zabbix", "kafka", "api"] as const).includes(formType as any) && (
+                <>
+                  <select className="w-full h-9 rounded-lg border border-border bg-surface-secondary px-3 text-sm mb-2"
+                    value={(formConfig as any).auth?.type ?? "none"}
+                    onChange={(e) => {
+                      setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, type: e.target.value } }));
+                    }}>
+                    <option value="none">无认证</option>
+                    {formType !== "zabbix" && <option value="basic">Basic Auth</option>}
+                    {formType !== "zabbix" && <option value="bearer">Bearer Token</option>}
+                    {formType === "api" && <option value="api_key_header">API Key (Header)</option>}
+                    {formType === "api" && <option value="api_key_query">API Key (Query)</option>}
+                    {formType === "api" && <option value="oauth2_client_credentials">OAuth2 Client Credentials</option>}
+                  </select>
+
+                  {((formConfig as any)?.auth?.type === "basic") && (
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1"><label className="text-xs text-muted-foreground">用户名</label><Input value={(formConfig as any)?.auth?.username ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, username: e.target.value } }))} /></div>
+                      <div className="space-y-1"><label className="text-xs text-muted-foreground">密码</label><Input type="password" value={(formConfig as any)?.auth?.password ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, password: e.target.value } }))} /></div>
+                    </div>
+                  )}
+                  {((formConfig as any)?.auth?.type === "bearer") && (
+                    <div className="space-y-1"><label className="text-xs text-muted-foreground">Token</label><Input type="password" value={(formConfig as any)?.auth?.token ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, token: e.target.value } }))} /></div>
+                  )}
+                  {((formConfig as any)?.auth?.type === "api_key_header") && (
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1"><label className="text-xs text-muted-foreground">Header 名称</label><Input value={(formConfig as any)?.auth?.key_name ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, key_name: e.target.value } }))} placeholder="X-API-Key" /></div>
+                      <div className="space-y-1"><label className="text-xs text-muted-foreground">Key 值</label><Input type="password" value={(formConfig as any)?.auth?.key_value ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, key_value: e.target.value } }))} /></div>
+                    </div>
+                  )}
+                  {((formConfig as any)?.auth?.type === "api_key_query") && (
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1"><label className="text-xs text-muted-foreground">参数名</label><Input value={(formConfig as any)?.auth?.query_param ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, query_param: e.target.value } }))} placeholder="api_key" /></div>
+                      <div className="space-y-1"><label className="text-xs text-muted-foreground">参数值</label><Input type="password" value={(formConfig as any)?.auth?.query_value ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, query_value: e.target.value } }))} /></div>
+                    </div>
+                  )}
+                  {((formConfig as any)?.auth?.type === "oauth2_client_credentials") && (
+                    <>
+                      <div className="space-y-1"><label className="text-xs text-muted-foreground">Token URL</label><Input value={(formConfig as any)?.auth?.token_url ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, token_url: e.target.value } }))} placeholder="https://auth.example.com/oauth/token" /></div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <div className="space-y-1"><label className="text-xs text-muted-foreground">Client ID</label><Input value={(formConfig as any)?.auth?.client_id ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, client_id: e.target.value } }))} /></div>
+                        <div className="space-y-1"><label className="text-xs text-muted-foreground">Client Secret</label><Input type="password" value={(formConfig as any)?.auth?.client_secret ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, client_secret: e.target.value } }))} /></div>
+                      </div>
+                    </>
+                  )}
+                  {formType === "zabbix" && (
+                    <div className="grid grid-cols-2 gap-2 mt-2">
+                      <div className="space-y-1"><label className="text-xs text-muted-foreground">用户名</label><Input value={(formConfig as any).username ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, username: e.target.value }))} /></div>
+                      <div className="space-y-1"><label className="text-xs text-muted-foreground">密码</label><Input type="password" value={(formConfig as any).password ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, password: e.target.value }))} /></div>
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* ClickHouse direct user/pass */}
+              {formType === "clickhouse" && (
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1"><label className="text-xs text-muted-foreground">用户名</label><Input value={formConfig.user ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, user: e.target.value }))} placeholder="default" /></div>
+                  <div className="space-y-1"><label className="text-xs text-muted-foreground">密码</label><Input type="password" value={formConfig.password ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, password: e.target.value }))} /></div>
+                </div>
+              )}
+            </div>
+
+            {/* ── Timeout ─────────────────────────────────────── */}
+            <div className="space-y-1">
+              <label className="text-xs font-medium">超时 (秒)</label>
+              <Input value={formConfig.timeout_secs ?? "30"} onChange={(e) => setFormConfig((p) => ({ ...p, timeout_secs: e.target.value }))} placeholder="30" />
+            </div>
+
             <div className="flex justify-end gap-2 pt-2">
               <Button variant="ghostMuted" onClick={() => setDialogOpen(false)}>取消</Button>
               <Button onClick={handleSave} disabled={saving}>{saving ? "保存中…" : "保存"}</Button>
