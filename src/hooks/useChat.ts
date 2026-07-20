@@ -280,7 +280,11 @@ export function useChat() {
     const justFinished = wasStreaming.current && !isStreaming;
     wasStreaming.current = isStreaming;
     if (justFinished && messages.length > 0) {
-      saveCurrentSession();
+      saveCurrentSession().catch(() => {
+        // Save failed — the user may not be logged in, or the server
+        // may be unreachable.  Silently ignore; messages remain in
+        // React state for the current session.
+      });
     }
   }, [isStreaming, messages.length, saveCurrentSession]);
 

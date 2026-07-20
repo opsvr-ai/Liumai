@@ -64,14 +64,21 @@ class ChatRequest(BaseModel):
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Lazy-initialised singleton — initialised on first request so tests or
-# alternative configs can replace it before any call is made.
+# Lazy-initialised singleton — automatically recreated when the admin
+# changes the Hermes URL or API key through the settings UI.
 _hermes: HermesClient | None = None
 
 
 def _get_hermes() -> HermesClient:
-    """Return the module-level HermesClient singleton."""
+    """Return the current HermesClient, recreating if config changed."""
     global _hermes
+    from app.services.hermes import _hermes_url, _hermes_api_key
+    current_url = _hermes_url.rstrip("/")
+    current_key = _hermes_api_key
+    if _hermes is not None and (
+        _hermes.base_url != current_url or _hermes.api_key != current_key
+    ):
+        _hermes = None  # force recreation with new config
     if _hermes is None:
         _hermes = HermesClient()
     return _hermes
@@ -115,6 +122,26 @@ async def chat_stream_endpoint(body: ChatRequest) -> StreamingResponse:
     * ``error`` — an unrecoverable error; the stream is terminated
     """
     hermes = _get_hermes()
+
+    # Guard against empty URL (not yet configured by admin)
+    if not hermes.base_url:
+        async def _not_configured():
+            yield _sse_event(
+                "error",
+                json.dumps(
+                    {"type": "error", "error": "Hermes 未配置 — 请在系统设置中配置 Hermes 连接"},
+                    ensure_ascii=False,
+                ),
+            )
+        return StreamingResponse(
+            _not_configured(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     messages: list[dict[str, Any]] = [
         {"role": m.role, "content": m.content} for m in body.messages

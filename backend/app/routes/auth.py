@@ -253,14 +253,15 @@ async def get_hermes_config(
     db: AsyncSession = Depends(get_db_session),
     _admin: User = Depends(require_admin),
 ) -> HermesConfigOut:
-    """Return Hermes Gateway configuration (purely from DB, no env fallback)."""
+    """Return Hermes Gateway configuration (DB first, env vars as fallback)."""
+    from app.config import settings as s
     from app.models import SystemConfig
 
     rows = await db.execute(select(SystemConfig))
     cfg: dict[str, str] = {r.key: r.value for r in rows.scalars()}
     return HermesConfigOut(
-        url=cfg.get("hermes_url", ""),
-        api_key=cfg.get("hermes_api_key", ""),
+        url=cfg.get("hermes_url") or s.HERMES_GATEWAY_URL,
+        api_key=cfg.get("hermes_api_key") or s.HERMES_API_KEY or "",
     )
 
 

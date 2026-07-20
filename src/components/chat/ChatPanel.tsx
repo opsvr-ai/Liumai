@@ -58,14 +58,22 @@ export const ChatPanel: FC = () => {
     if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
+  // Refresh session list after streaming finishes
+  const prevStreaming = useRef(isStreaming);
+  useEffect(() => {
+    if (prevStreaming.current && !isStreaming) {
+      reloadSessions().catch(() => {});
+    }
+    prevStreaming.current = isStreaming;
+  }, [isStreaming, reloadSessions]);
+
   // Send (auto-save handled by useChat's useEffect)
   const handleSend = useCallback(async () => {
     if (!input.trim() || isStreaming) return;
     const text = input;
     setInput("");
     await sendMessage(text);
-    try { reloadSessions(); } catch { /* ok */ }
-  }, [input, isStreaming, sendMessage, reloadSessions]);
+  }, [input, isStreaming, sendMessage]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLInputElement>) => {
