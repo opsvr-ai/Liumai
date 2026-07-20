@@ -201,7 +201,14 @@ export type ChatStreamEvent =
  */
 export async function* chatStream(
   messages: ChatMessage[],
-  opts?: { model?: string; temperature?: number; signal?: AbortSignal },
+  opts?: {
+    model?: string;
+    temperature?: number;
+    signal?: AbortSignal;
+    mode?: string;
+    timeWindowStart?: string;
+    timeWindowEnd?: string;
+  },
 ): AsyncGenerator<ChatStreamEvent> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -215,8 +222,11 @@ export async function* chatStream(
     headers,
     body: JSON.stringify({
       messages,
+      mode: opts?.mode ?? null,
       model: opts?.model ?? "hermes-agent",
       temperature: opts?.temperature ?? 0.7,
+      time_window_start: opts?.timeWindowStart ?? null,
+      time_window_end: opts?.timeWindowEnd ?? null,
     }),
     signal: opts?.signal,
   });
@@ -369,6 +379,27 @@ export interface ChatSessionDetail extends ChatSessionSummary {
     created_at: string;
   }>;
 }
+
+/* ── Chat modes ──────────────────────────────────── */
+
+export interface ChatModeOut {
+  slug: string;
+  name: string;
+  system_prompt: string;
+  config: Record<string, unknown>;
+  enabled: boolean;
+}
+
+export const chatModes = {
+  list() {
+    return request<ChatModeOut[]>("GET", "/chat/modes");
+  },
+  update(slug: string, data: { system_prompt?: string; enabled?: boolean }) {
+    return request<ChatModeOut>("PUT", `/chat/modes/${slug}`, data);
+  },
+};
+
+/* ── Chat history ────────────────────────────────── */
 
 export const chatHistory = {
   list() {

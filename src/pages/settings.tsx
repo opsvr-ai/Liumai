@@ -11,13 +11,14 @@ import {
   ChevronDown,
   ChevronRight,
   Zap,
+  MessageSquare,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { authApi, type HermesConfig, type LdapConfig, type LdapStatus } from "@/lib/api";
+import { authApi, chatModes, type ChatModeOut, type HermesConfig, type LdapConfig, type LdapStatus } from "@/lib/api";
 import { useAuth } from "@/components/auth/auth-context";
 import { toast } from "sonner";
 
@@ -40,6 +41,12 @@ export default function SettingsPage() {
   const [hermesSaving, setHermesSaving] = useState(false);
   const [hermesExpanded, setHermesExpanded] = useState(false);
   const [hermesTesting, setHermesTesting] = useState(false);
+
+  /* ── Mode prompt editing ───────────────────────────────── */
+  const [modes, setModes] = useState<ChatModeOut[]>([]);
+  const [modeEditor, setModeEditor] = useState<ChatModeOut | null>(null);
+  const [modePrompt, setModePrompt] = useState("");
+  const [modeSaving, setModeSaving] = useState(false);
 
   /* ── Change password ────────────────────────────────────── */
   const [pwOpen, setPwOpen] = useState(false);
@@ -82,6 +89,31 @@ export default function SettingsPage() {
     loadLdapConfig();
     loadHermesConfig();
   }, [loadLdapStatus, loadLdapConfig, loadHermesConfig]);
+
+  /* ── Load & save modes ──────────────────────────────────── */
+  useEffect(() => {
+    chatModes.list().then(setModes).catch(() => {});
+  }, []);
+
+  function openModeEditor(m: ChatModeOut) {
+    setModeEditor(m);
+    setModePrompt(m.system_prompt);
+  }
+
+  async function handleSaveMode() {
+    if (!modeEditor) return;
+    setModeSaving(true);
+    try {
+      const updated = await chatModes.update(modeEditor.slug, { system_prompt: modePrompt });
+      setModes((prev) => prev.map((m) => (m.slug === updated.slug ? updated : m)));
+      toast.success(`模式 "${updated.name}" 已更新`);
+      setModeEditor(null);
+    } catch (e: any) {
+      toast.error(`保存失败: ${e.message}`);
+    } finally {
+      setModeSaving(false);
+    }
+  }
 
   /* ── Save Hermes config ────────────────────────────────── */
   async function handleSaveHermes() {
@@ -437,6 +469,74 @@ export default function SettingsPage() {
           </CardContent>
         )}
       </Card>
+
+      {/* ── Chat modes ──────────────────────────────────── */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-medium flex items-center gap-2">
+            <MessageSquare className="h-4 w-4" />
+            对话模式
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {modes.length === 0 ? (
+            <p className="text-sm text-muted-foreground">加载中…</p>
+          ) : (
+            modes.map((m) => (
+              <div
+                key={m.slug}
+                className="flex items-center justify-between gap-3 py-2 border-b border-border/50 last:border-0"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium">{m.name}</p>
+                  <p className="text-xs text-muted-foreground truncate">
+                    {m.system_prompt
+                      ? m.system_prompt.slice(0, 60) + "…"
+                      : "（无提示词）"}
+                  </p>
+                </div>
+                <Button
+                  variant="ghostMuted"
+                  size="sm"
+                  onClick={() => openModeEditor(m)}
+                >
+                  编辑
+                </Button>
+              </div>
+            ))
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── Mode editor dialog ─────────────────────────────── */}
+      {modeEditor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="bg-surface-primary rounded-xl shadow-xl w-full max-w-lg mx-4 p-6 space-y-4">
+            <h3 className="text-sm font-semibold">编辑模式: {modeEditor.name}</h3>
+            <textarea
+              value={modePrompt}
+              onChange={(e) => setModePrompt(e.target.value)}
+              className="w-full h-40 rounded-lg border border-border bg-surface-secondary px-3 py-2 text-sm text-text-primary resize-none focus:outline-none focus:ring-2 focus:ring-interactive-primary/25"
+              placeholder="输入系统提示词…"
+            />
+            <p className="text-[11px] text-muted-foreground">
+              系统提示词会在选择此模式时自动注入到对话开头
+            </p>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghostMuted"
+                size="sm"
+                onClick={() => setModeEditor(null)}
+              >
+                取消
+              </Button>
+              <Button size="sm" onClick={handleSaveMode} disabled={modeSaving}>
+                {modeSaving ? "保存中…" : "保存"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Account security ────────────────────────────── */}
       <Card>

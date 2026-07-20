@@ -21,12 +21,14 @@ import {
   Loader2,
   Plus,
   PanelLeft,
+  Clock,
+  Upload,
 } from "lucide-react";
 import { useChat } from "@/hooks/useChat";
 import { ChatMessage } from "@/components/chat/ChatMessage";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import { chatHistory, type ChatSessionSummary } from "@/lib/api";
+import { chatHistory, chatModes, type ChatModeOut, type ChatSessionSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 /* ── Relative time formatter ─────────────────────────────── */
@@ -62,6 +64,13 @@ export const ChatPanel: FC = () => {
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
+  /* ── Mode state ───────────────────────────────────── */
+  const [modes, setModes] = useState<ChatModeOut[]>([]);
+  const [activeMode, setActiveMode] = useState<string | null>(null);
+  const [rcaTimeStart, setRcaTimeStart] = useState("");
+  const [rcaTimeEnd, setRcaTimeEnd] = useState("");
+  const [rcaPreset, setRcaPreset] = useState("none");
+
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const reloadSessions = useCallback(async () => {
@@ -71,6 +80,11 @@ export const ChatPanel: FC = () => {
   }, []);
 
   useEffect(() => { reloadSessions(); }, [reloadSessions]);
+
+  // Load modes
+  useEffect(() => {
+    chatModes.list().then(setModes).catch(() => {});
+  }, []);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -90,8 +104,14 @@ export const ChatPanel: FC = () => {
     if (!input.trim() || isStreaming) return;
     const text = input;
     setInput("");
-    await sendMessage(text);
-  }, [input, isStreaming, sendMessage]);
+    const twStart = activeMode === "rca" ? (rcaTimeStart || new Date(Date.now() - 15 * 60000).toISOString()) : undefined;
+    const twEnd = activeMode === "rca" ? (rcaTimeEnd || new Date().toISOString()) : undefined;
+    await sendMessage(text, {
+      mode: activeMode ?? undefined,
+      timeWindowStart: twStart,
+      timeWindowEnd: twEnd,
+    });
+  }, [input, isStreaming, sendMessage, activeMode, rcaTimeStart, rcaTimeEnd]);
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLInputElement>) => {
@@ -103,8 +123,21 @@ export const ChatPanel: FC = () => {
     [handleSend],
   );
 
+  const applyRcaPreset = useCallback((preset: string) => {
+    setRcaPreset(preset);
+    if (preset === "none") return;
+    const minutes = { "15m": 15, "1h": 60, "4h": 240, "24h": 1440 }[preset];
+    if (minutes) {
+      const end = new Date();
+      const start = new Date(end.getTime() - minutes * 60000);
+      setRcaTimeStart(start.toISOString().slice(0, 16));
+      setRcaTimeEnd(end.toISOString().slice(0, 16));
+    }
+  }, []);
+
   const handleNewSession = useCallback(() => {
     clearMessages();
+    setActiveMode(null);
   }, [clearMessages]);
 
   const handleLoadSession = useCallback(
@@ -269,6 +302,72 @@ export const ChatPanel: FC = () => {
             </div>
           </ScrollArea>
         </div>
+
+        {/* ── Mode selector ──────────────────────────────── */}
+        {modes.length > 0 && (
+          <div className="shrink-0 px-4 pb-1 flex flex-wrap items-center gap-1.5">
+            {modes.map((m) => (
+              <button
+                key={m.slug}
+                type="button"
+                onClick={() => setActiveMode(activeMode === m.slug ? null : m.slug)}
+                className={cn(
+                  "px-3 py-1 rounded-full text-[12px] font-medium transition-colors border",
+                  activeMode === m.slug
+                    ? "bg-interactive-primary text-white border-interactive-primary"
+                    : "bg-transparent text-muted-foreground border-border hover:border-muted-foreground/30",
+                )}
+              >
+                {m.name}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* ── RCA time window picker ──────────────────────── */}
+        {activeMode === "rca" && (
+          <div className="shrink-0 px-4 pb-2 flex flex-wrap items-center gap-2">
+            <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+            {[
+              ["none", "自定义"],
+              ["15m", "15分钟"],
+              ["1h", "1小时"],
+              ["4h", "4小时"],
+              ["24h", "24小时"],
+            ].map(([val, label]) => (
+              <button
+                key={val}
+                type="button"
+                onClick={() => applyRcaPreset(val)}
+                className={cn(
+                  "px-2 py-0.5 rounded text-[11px] transition-colors border",
+                  rcaPreset === val
+                    ? "bg-interactive-primary/10 text-interactive-primary border-interactive-primary/30"
+                    : "text-muted-foreground border-transparent hover:border-border",
+                )}
+              >
+                {label}
+              </button>
+            ))}
+            {rcaPreset === "none" && (
+              <>
+                <input
+                  type="datetime-local"
+                  value={rcaTimeStart}
+                  onChange={(e) => setRcaTimeStart(e.target.value)}
+                  className="h-7 rounded border border-border bg-surface-secondary px-2 text-[11px] text-text-primary"
+                />
+                <span className="text-[11px] text-muted-foreground">→</span>
+                <input
+                  type="datetime-local"
+                  value={rcaTimeEnd}
+                  onChange={(e) => setRcaTimeEnd(e.target.value)}
+                  className="h-7 rounded border border-border bg-surface-secondary px-2 text-[11px] text-text-primary"
+                />
+              </>
+            )}
+          </div>
+        )}
 
         {/* Input — pill-shaped */}
         <div className="shrink-0 px-4 pb-4 pt-2">

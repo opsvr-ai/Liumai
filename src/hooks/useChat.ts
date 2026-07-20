@@ -140,7 +140,10 @@ export function useChat() {
 
   /** Send a user message and stream the assistant's reply. */
   const sendMessage = useCallback(
-    async (content: string) => {
+    async (
+      content: string,
+      opts?: { mode?: string; timeWindowStart?: string; timeWindowEnd?: string },
+    ) => {
       if (!content.trim() || isStreaming) return;
 
       abortRef.current?.abort();
@@ -170,6 +173,9 @@ export function useChat() {
       try {
         for await (const event of chatStream(apiMessages, {
           signal: controller.signal,
+          mode: opts?.mode,
+          timeWindowStart: opts?.timeWindowStart,
+          timeWindowEnd: opts?.timeWindowEnd,
         })) {
           switch (event.type) {
             case "delta":
