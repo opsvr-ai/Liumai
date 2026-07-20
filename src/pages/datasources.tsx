@@ -1,7 +1,7 @@
 /** Data sources — manage external monitoring/telemetry connections. */
 
 import { useCallback, useEffect, useState } from "react";
-import { Plus, Pencil, Trash2, RefreshCw, FlaskConical, Check, X } from "lucide-react";
+import { Plus, Pencil, Trash2, RefreshCw, FlaskConical, Check, X, PlusCircle, MinusCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -61,6 +61,11 @@ export default function DataSourcesPage() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState<number | null>(null);
 
+  /* ── Headers / body editor state ────────────────── */
+  const [headerRows, setHeaderRows] = useState<{ key: string; value: string }[]>([{ key: "", value: "" }]);
+  const [bodyType, setBodyType] = useState<string>("none");
+  const [bodyContent, setBodyContent] = useState("");
+
   const refresh = useCallback(() => {
     setLoading(true);
     dataSourceApi.list().then(setSources).catch(() => toast.error("加载失败")).finally(() => setLoading(false));
@@ -73,6 +78,9 @@ export default function DataSourcesPage() {
     setFormType("prometheus");
     setFormName("");
     setFormConfig({});
+    setHeaderRows([{ key: "", value: "" }]);
+    setBodyType("none");
+    setBodyContent("");
     setDialogOpen(true);
   }
 
@@ -81,10 +89,21 @@ export default function DataSourcesPage() {
     setFormType(ds.type);
     setFormName(ds.name);
     const cfg: Record<string, unknown> = {};
+    const hdrs: { key: string; value: string }[] = [];
+    let bt = "none";
+    let bc = "";
     if (ds.config) {
       for (const [k, v] of Object.entries(ds.config)) {
         if (k === "auth" && typeof v === "object" && v !== null) {
           cfg.auth = { ...v as Record<string, unknown> };
+        } else if (k === "headers" && typeof v === "object" && v !== null) {
+          for (const [hk, hv] of Object.entries(v as Record<string, unknown>)) {
+            hdrs.push({ key: hk, value: String(hv) });
+          }
+        } else if (k === "body" && typeof v === "object" && v !== null) {
+          const b = v as Record<string, unknown>;
+          bt = String(b.type ?? "none");
+          bc = b.template ? JSON.stringify(b.template, null, 2) : "";
         } else if (Array.isArray(v)) {
           cfg[k] = (v as string[]).join(",");
         } else {
@@ -93,6 +112,9 @@ export default function DataSourcesPage() {
       }
     }
     setFormConfig(cfg as Record<string, string>);
+    setHeaderRows(hdrs.length > 0 ? hdrs : [{ key: "", value: "" }]);
+    setBodyType(bt);
+    setBodyContent(bc);
     setDialogOpen(true);
   }
 
@@ -100,17 +122,13 @@ export default function DataSourcesPage() {
     if (!formName.trim()) { toast.error("请输入名称"); return; }
     setSaving(true);
     try {
-      // Build nested config from form state
       const config: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(formConfig)) {
         if (v === "" || v === undefined) continue;
         if (k === "auth" && typeof v === "object") {
-          // Prune empty auth fields
           const auth = { ...(v as Record<string, unknown>) };
-          for (const [ak, av] of Object.entries(auth)) {
-            if (av === "" || av === undefined) delete auth[ak];
-          }
-          if (Object.keys(auth).length > 1) config.auth = auth; // keep if has type + something else
+          for (const [ak, av] of Object.entries(auth)) { if (av === "" || av === undefined) delete auth[ak]; }
+          if (Object.keys(auth).length > 1) config.auth = auth;
         } else if (k === "brokers" && typeof v === "string") {
           config[k] = v.split(",").map((s) => s.trim()).filter(Boolean);
         } else if (k === "port" || k === "timeout_secs") {
@@ -118,6 +136,18 @@ export default function DataSourcesPage() {
         } else {
           config[k] = v;
         }
+      }
+      // Headers
+      const hdrs: Record<string, string> = {};
+      for (const row of headerRows) {
+        if (row.key.trim()) hdrs[row.key.trim()] = row.value;
+      }
+      if (Object.keys(hdrs).length > 0) config.headers = hdrs;
+      // Body
+      if (formType === "api" && bodyType !== "none" && bodyContent.trim()) {
+        let tmpl: unknown = bodyContent;
+        try { tmpl = JSON.parse(bodyContent); } catch { /* raw string */ }
+        config.body = { type: bodyType, template: tmpl };
       }
       if (editing) {
         await dataSourceApi.update(editing.id, { name: formName, config });
@@ -264,7 +294,53 @@ export default function DataSourcesPage() {
               <>
                 <div className="grid grid-cols-3 gap-2">
                   <div className="col-span-2 space-y-1"><label className="text-xs font-medium">URL</label><Input value={formConfig.url ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, url: e.target.value }))} placeholder="https://api.example.com/v1/alerts" /></div>
-                  <div className="space-y-1"><label className="text-xs font-medium">Method</label><select className="w-full h-9 rounded-lg border border-border bg-surface-secondary px-3 text-sm" value={formConfig.method ?? "GET"} onChange={(e) => setFormConfig((p) => ({ ...p, method: e.target.value }))}><option>GET</option><option>POST</option><option>PUT</option></select></div>
+                  <div className="space-y-1"><label className="text-xs font-medium">Method</label><select className="w-full h-9 rounded-lg border border-border bg-surface-secondary px-3 text-sm" value={formConfig.method ?? "GET"} onChange={(e) => setFormConfig((p) => ({ ...p, method: e.target.value }))}><option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option></select></div>
+                </div>
+
+                {/* Headers editor */}
+                <div className="border-t border-border pt-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-xs font-medium">Headers</p>
+                    <button type="button" onClick={() => setHeaderRows((r) => [...r, { key: "", value: "" }])} className="text-interactive-primary hover:text-interactive-primary/80">
+                      <PlusCircle className="h-4 w-4" />
+                    </button>
+                  </div>
+                  {headerRows.map((row, i) => (
+                    <div key={i} className="flex items-center gap-2 mb-1.5">
+                      <Input className="flex-1" value={row.key} placeholder="Header 名称" onChange={(e) => {
+                        const next = [...headerRows]; next[i] = { ...next[i], key: e.target.value }; setHeaderRows(next);
+                      }} />
+                      <Input className="flex-[2]" value={row.value} placeholder="值" onChange={(e) => {
+                        const next = [...headerRows]; next[i] = { ...next[i], value: e.target.value }; setHeaderRows(next);
+                      }} />
+                      {headerRows.length > 1 && (
+                        <button type="button" onClick={() => setHeaderRows((r) => r.filter((_, j) => j !== i))} className="text-muted-foreground hover:text-status-active shrink-0">
+                          <MinusCircle className="h-4 w-4" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                {/* Body editor */}
+                <div className="border-t border-border pt-3">
+                  <p className="text-xs font-medium mb-2">Body</p>
+                  <select className="w-full h-9 rounded-lg border border-border bg-surface-secondary px-3 text-sm mb-2"
+                    value={bodyType}
+                    onChange={(e) => { setBodyType(e.target.value); if (e.target.value === "none") setBodyContent(""); }}>
+                    <option value="none">无 Body</option>
+                    <option value="json">JSON (application/json)</option>
+                    <option value="form">Form (x-www-form-urlencoded)</option>
+                    <option value="raw">Raw Text</option>
+                  </select>
+                  {bodyType !== "none" && (
+                    <textarea
+                      className="w-full h-32 rounded-lg border border-border bg-surface-secondary px-3 py-2 text-sm font-mono resize-none focus:outline-none focus:ring-2 focus:ring-interactive-primary/25"
+                      value={bodyContent}
+                      onChange={(e) => setBodyContent(e.target.value)}
+                      placeholder={bodyType === "json" ? '{"key": "value"}' : bodyType === "form" ? "key1=value1&key2=value2" : "raw body content"}
+                    />
+                  )}
                 </div>
               </>
             )}
