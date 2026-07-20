@@ -33,7 +33,7 @@ router = APIRouter()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
-class ChatMessage(BaseModel):
+class ChatMessageIn(BaseModel):
     """A single message in the conversation history."""
 
     role: str = Field(..., pattern="^(system|user|assistant|tool)$")
@@ -43,7 +43,7 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     """Payload for the streaming chat endpoint."""
 
-    messages: list[ChatMessage] = Field(
+    messages: list[ChatMessageIn] = Field(
         ...,
         min_length=1,
         description="Conversation history in OpenAI-compatible format",
