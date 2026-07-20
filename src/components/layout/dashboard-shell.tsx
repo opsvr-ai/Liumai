@@ -1,4 +1,5 @@
 import { type ReactNode, useState, useCallback } from "react";
+import { LiumaiLogo } from "@/components/liumai-logo";
 import {
   ChevronLeft,
   ChevronRight,
@@ -105,6 +106,7 @@ export function DashboardShell({
           onClick={onHomeClick}
           className="flex items-center gap-2 shrink-0"
         >
+          <LiumaiLogo size={28} className="text-interactive-primary shrink-0" />
           <span className="text-base md:text-lg font-bold tracking-tight" style={{ fontFeatureSettings: "'ss01'" }}>
             六脉
           </span>
