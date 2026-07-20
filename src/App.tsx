@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Activity, History, Home, LogOut, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
+import { Activity, History, Home, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-context";
 import { DashboardShell, type SidebarItem } from "@/components/layout/dashboard-shell";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -24,7 +24,7 @@ function RequireAuth({ children }: { children: React.ReactNode }) {
 }
 
 function Shell({ children }: { children: React.ReactNode }) {
-  const { logout, isAdmin } = useAuth();
+  const { username, role, logout, isAdmin } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -43,13 +43,22 @@ function Shell({ children }: { children: React.ReactNode }) {
         { id: "settings", label: "系统设置", icon: <Settings className="h-4 w-4" />, isActive: location.pathname.startsWith("/settings"), onClick: () => navigate("/settings") },
       );
     }
-    items.push(
-      { id: "logout", label: "退出", icon: <LogOut className="h-4 w-4" />, onClick: () => { logout(); navigate("/login"); } },
-    );
     return items;
-  }, [location.pathname, logout, navigate, isAdmin]);
+  }, [location.pathname, navigate, isAdmin]);
 
-  return <DashboardShell sidebarItems={sidebarItems} onHomeClick={() => navigate("/")}>{children}</DashboardShell>;
+  return (
+    <DashboardShell
+      sidebarItems={sidebarItems}
+      onHomeClick={() => navigate("/")}
+      userInfo={{
+        username: username ?? "",
+        role: role ?? "",
+        onLogout: () => { logout(); navigate("/login"); },
+      }}
+    >
+      {children}
+    </DashboardShell>
+  );
 }
 
 export default function App() {

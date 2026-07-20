@@ -1,10 +1,11 @@
-import { type ReactNode, useState, useCallback } from "react";
+import { type ReactNode, useState, useCallback, useRef, useEffect } from "react";
 import { LiumaiBrand } from "@/components/liumai-brand";
 import {
   ChevronLeft,
   ChevronRight,
   Menu,
   Bell,
+  LogOut,
   User,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -43,13 +44,19 @@ export interface SidebarItem {
   badge?: string | number;
 }
 
+export interface UserInfo {
+  username: string;
+  role: string;
+  onLogout: () => void;
+}
+
 export interface DashboardShellProps {
   /** Main content rendered in the center area */
   children: ReactNode;
-  /** Content rendered in the fixed top header bar */
-  headerContent?: ReactNode;
   /** Navigation items for the sidebar */
   sidebarItems: SidebarItem[];
+  /** Current user info for the sidebar footer */
+  userInfo?: UserInfo;
   /** Content for the right detail drawer (uses Sheet) */
   drawerContent?: ReactNode;
   /** Whether the right detail drawer is open */
@@ -66,8 +73,8 @@ export interface DashboardShellProps {
 
 export function DashboardShell({
   children,
-  headerContent,
   sidebarItems,
+  userInfo,
   drawerContent,
   drawerOpen = false,
   onDrawerClose,
@@ -76,6 +83,21 @@ export function DashboardShell({
   activeIncidentCount = 0,
 }: DashboardShellProps) {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!userMenuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setUserMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [userMenuOpen]);
+
+  const roleLabel: Record<string, string> = { ADMIN: "管理员", OPERATOR: "运维", VIEWER: "只读" };
 
   const toggleSidebar = useCallback(() => {
     setSidebarCollapsed((prev) => !prev);
@@ -130,19 +152,6 @@ export function DashboardShell({
           </Tooltip>
         )}
 
-        {/* User menu area */}
-        {headerContent ?? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button variant="ghostMuted" size="icon-sm" aria-label="用户菜单">
-                <User className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>
-              <p>用户菜单</p>
-            </TooltipContent>
-          </Tooltip>
-        )}
       </header>
 
       {/* ================================================================ */}
@@ -220,12 +229,60 @@ export function DashboardShell({
           })}
         </div>
 
-        {/* Sidebar footer */}
-        {!sidebarCollapsed && (
-          <div className="mt-auto px-3 py-3 border-t border-border">
-            <p className="text-xs text-muted-foreground leading-tight">
-              六脉 v0.1
-            </p>
+        {/* Sidebar footer — user profile */}
+        {userInfo && (
+          <div className="mt-auto border-t border-border relative" ref={menuRef}>
+            {sidebarCollapsed ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => setUserMenuOpen(!userMenuOpen)}
+                    className="w-full flex items-center justify-center py-3 text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    <div className="h-7 w-7 rounded-full bg-interactive-primary text-white flex items-center justify-center text-[11px] font-bold">
+                      {userInfo.username.charAt(0).toUpperCase()}
+                    </div>
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right"><p>{userInfo.username}</p></TooltipContent>
+              </Tooltip>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setUserMenuOpen(!userMenuOpen)}
+                className="w-full flex items-center gap-3 px-3 py-3 hover:bg-white/60 transition-colors text-left"
+              >
+                <div className="h-8 w-8 rounded-full bg-interactive-primary text-white flex items-center justify-center text-xs font-bold shrink-0">
+                  {userInfo.username.charAt(0).toUpperCase()}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-[13px] font-medium text-text-primary truncate">{userInfo.username}</p>
+                  <p className="text-[11px] text-muted-foreground">{roleLabel[userInfo.role] ?? userInfo.role}</p>
+                </div>
+              </button>
+            )}
+
+            {/* Dropdown popover */}
+            {userMenuOpen && (
+              <div className={cn(
+                "absolute bg-white rounded-xl shadow-lg border border-border py-1.5 z-50 min-w-[180px]",
+                sidebarCollapsed ? "left-full bottom-0 ml-2 mb-1" : "left-3 right-3 bottom-full mb-1"
+              )}>
+                <div className="px-3 py-2 border-b border-border/50">
+                  <p className="text-[13px] font-medium text-text-primary">{userInfo.username}</p>
+                  <p className="text-[11px] text-muted-foreground">{roleLabel[userInfo.role] ?? userInfo.role}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => { userInfo.onLogout(); setUserMenuOpen(false); }}
+                  className="w-full flex items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-muted transition-colors"
+                >
+                  <LogOut className="h-3.5 w-3.5" />
+                  退出登录
+                </button>
+              </div>
+            )}
           </div>
         )}
       </nav>
