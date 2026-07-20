@@ -127,7 +127,7 @@ async def health_check() -> dict[str, str | int]:
 
 # ── Router registration ─────────────────────────────────────────────────────
 
-from app.routes import alerts, auth, chat, datasources, history, rca, rules, users  # noqa: E402
+from app.routes import alerts, auth, chat, datasources, history, jobs, rca, rules, users  # noqa: E402
 
 app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
 app.include_router(rca.router, prefix="/api/rca", tags=["rca"])
@@ -137,3 +137,14 @@ app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(users.router, prefix="/api/users", tags=["users"])
 app.include_router(datasources.router, prefix="/api/datasources", tags=["datasources"])
+app.include_router(jobs.router, prefix="/api/jobs", tags=["jobs"])
+
+
+# ── Static files (uploaded avatars) ─────────────────────────────────────────
+
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+
+_avatar_dir = Path("/app/data/avatars")
+_avatar_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/avatars", StaticFiles(directory=str(_avatar_dir)), name="avatars")

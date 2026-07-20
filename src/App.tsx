@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Activity, Database, History, Home, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
+import { Activity, Clock, Database, History, Home, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-context";
 import { DashboardShell, type SidebarItem } from "@/components/layout/dashboard-shell";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -17,6 +17,7 @@ import UsersPage from "@/pages/users";
 import SkillsPage from "@/pages/skills";
 import DataSourcesPage from "@/pages/datasources";
 import ProfilePage from "@/pages/profile";
+import JobsPage from "@/pages/jobs";
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth();
@@ -39,6 +40,7 @@ function Shell({ children }: { children: React.ReactNode }) {
       { id: "datasources", label: "数据源", icon: <Database className="h-4 w-4" />, isActive: location.pathname.startsWith("/datasources"), onClick: () => navigate("/datasources") },
       { id: "history", label: "历史记录", icon: <History className="h-4 w-4" />, isActive: location.pathname.startsWith("/history"), onClick: () => navigate("/history") },
       { id: "skills", label: "技能中心", icon: <Wrench className="h-4 w-4" />, isActive: location.pathname.startsWith("/skills"), onClick: () => navigate("/skills") },
+      { id: "jobs", label: "定时任务", icon: <Clock className="h-4 w-4" />, isActive: location.pathname.startsWith("/jobs"), onClick: () => navigate("/jobs") },
     ];
     if (isAdmin) {
       items.push(
@@ -85,6 +87,7 @@ export default function App() {
                     <Route path="/skills" element={<SkillsPage />} />
                     <Route path="/datasources" element={<DataSourcesPage />} />
                     <Route path="/profile" element={<ProfilePage />} />
+                    <Route path="/jobs" element={<JobsPage />} />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>
                 </Shell>

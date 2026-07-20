@@ -552,3 +552,33 @@ export const profileApi = {
     request<{ ok: boolean }>("DELETE", `/users/me/sessions/${id}`),
   getMyStats: () => request<UserStats>("GET", "/users/me/stats"),
 };
+
+/* ── Hermes Jobs ────────────────────────────────── */
+
+export interface JobItem {
+  id: string;
+  name: string;
+  prompt: string;
+  schedule: { kind: string; expr: string };
+  skills: string[];
+  deliver: string;
+  state: "scheduled" | "paused" | "running" | "completed";
+  enabled: boolean;
+  next_run_at: string | null;
+  last_run_at: string | null;
+  last_status: string | null;
+  repeat: { times: number | null; completed: number } | null;
+}
+
+export const jobsApi = {
+  list: (includeDisabled = false) =>
+    request<JobItem[]>("GET", `/jobs?include_disabled=${includeDisabled}`),
+  get: (id: string) => request<JobItem>("GET", `/jobs/${id}`),
+  create: (data: Partial<JobItem>) => request<JobItem>("POST", "/jobs", data),
+  update: (id: string, data: Partial<JobItem>) =>
+    request<JobItem>("PATCH", `/jobs/${id}`, data),
+  delete: (id: string) => request<void>("DELETE", `/jobs/${id}`),
+  pause: (id: string) => request<JobItem>("POST", `/jobs/${id}/pause`),
+  resume: (id: string) => request<JobItem>("POST", `/jobs/${id}/resume`),
+  run: (id: string) => request<JobItem>("POST", `/jobs/${id}/run`),
+};
