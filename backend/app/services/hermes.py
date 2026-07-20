@@ -27,11 +27,18 @@ _hermes_api_key: str | None = settings.HERMES_API_KEY
 
 
 def reload_hermes_config(db_entries: dict[str, str]) -> None:
-    """Reload Hermes config from DB values (called on admin save + startup)."""
+    """Reload Hermes config from DB values (called on admin save + startup).
+
+    Falls back to env vars only when DB has no value AND the caller is
+    the initial startup (not an admin save).
+    """
     global _hermes_url, _hermes_api_key
-    _hermes_url = db_entries.get("hermes_url", settings.HERMES_GATEWAY_URL)
-    _hermes_api_key = db_entries.get("hermes_api_key", settings.HERMES_API_KEY) or None
-    logger.info("Hermes config reloaded (url={})", _hermes_url)
+    _hermes_url = db_entries.get("hermes_url") or ""
+    _hermes_api_key = db_entries.get("hermes_api_key") or None
+    if _hermes_url:
+        logger.info("Hermes config reloaded (url={})", _hermes_url)
+    else:
+        logger.info("Hermes config empty — agent will not be reachable until configured")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

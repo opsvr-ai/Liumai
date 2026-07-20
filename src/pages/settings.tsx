@@ -88,7 +88,8 @@ export default function SettingsPage() {
     if (!hermesConfig) return;
     setHermesSaving(true);
     try {
-      await authApi.saveHermesConfig(hermesConfig);
+      const saved = await authApi.saveHermesConfig(hermesConfig);
+      setHermesConfig(saved);  // ensure UI shows what was actually persisted
       toast.success("Hermes 配置已保存");
     } catch (e: any) {
       toast.error(`保存失败: ${e.message}`);

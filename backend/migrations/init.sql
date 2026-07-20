@@ -183,8 +183,8 @@ INSERT INTO system_config (key, value) VALUES
     ('ldap_auto_create_user', 'true')
 ON CONFLICT (key) DO NOTHING;
 
--- Seed default Hermes config
+-- Seed empty Hermes config (admin must configure via UI)
 INSERT INTO system_config (key, value) VALUES
-    ('hermes_url', 'http://host.docker.internal:8642/v1'),
+    ('hermes_url', ''),
     ('hermes_api_key', '')
 ON CONFLICT (key) DO NOTHING;
