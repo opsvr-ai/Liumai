@@ -48,6 +48,10 @@ class ChatRequest(BaseModel):
         min_length=1,
         description="Conversation history in OpenAI-compatible format",
     )
+    mode: str | None = Field(
+        default=None,
+        description="Chat mode slug (rca, knowledge, etc.)",
+    )
     model: str = Field(
         default="hermes-agent",
         description="Hermes model to use",
@@ -58,6 +62,9 @@ class ChatRequest(BaseModel):
         le=2.0,
         description="Sampling temperature",
     )
+    # RCA mode extras
+    time_window_start: str | None = None
+    time_window_end: str | None = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -111,7 +118,10 @@ def _sse_event(event_type: str, data: str) -> str:
         "suitable for incremental rendering in the chat UI."
     ),
 )
-async def chat_stream_endpoint(body: ChatRequest) -> StreamingResponse:
+async def chat_stream_endpoint(
+    body: ChatRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> StreamingResponse:
     """Stream a chat completion from Hermes via SSE.
 
     The response is a ``text/event-stream`` with the following event types:
@@ -122,6 +132,37 @@ async def chat_stream_endpoint(body: ChatRequest) -> StreamingResponse:
     * ``error`` — an unrecoverable error; the stream is terminated
     """
     hermes = _get_hermes()
+
+    # ── Mode-aware system prompt injection ───────────────────────────────
+    messages: list[dict[str, Any]] = [
+        {"role": m.role, "content": m.content} for m in body.messages
+    ]
+
+    if body.mode:
+        from app.models import ChatMode as ChatModeModel
+        row = await db.execute(
+            select(ChatModeModel).where(
+                ChatModeModel.slug == body.mode,
+                ChatModeModel.enabled == True,  # noqa: E712
+            )
+        )
+        mode = row.scalar_one_or_none()
+        if mode and mode.system_prompt:
+            # Prepend system prompt only if not already present
+            if not messages or messages[0].get("role") != "system":
+                messages.insert(0, {"role": "system", "content": mode.system_prompt})
+            # RCA mode: inject time window into user message
+            if body.mode == "rca" and (body.time_window_start or body.time_window_end):
+                tw_info = f"\n[时间窗口: {body.time_window_start or '?'} → {body.time_window_end or '?'}]"
+                last_user = None
+                for m in reversed(messages):
+                    if m["role"] == "user":
+                        last_user = m
+                        break
+                if last_user:
+                    last_user["content"] += tw_info
+            # RCA mode: lower temperature for deterministic output
+            body.temperature = 0.3
 
     # Guard against empty URL (not yet configured by admin)
     if not hermes.base_url:
@@ -142,10 +183,6 @@ async def chat_stream_endpoint(body: ChatRequest) -> StreamingResponse:
                 "X-Accel-Buffering": "no",
             },
         )
-
-    messages: list[dict[str, Any]] = [
-        {"role": m.role, "content": m.content} for m in body.messages
-    ]
 
     logger.info(
         "Chat stream request: msg_count={} model={!r}",
@@ -379,3 +416,80 @@ async def delete_chat_session(
         raise HTTPException(status_code=404, detail="会话不存在")
     await db.delete(row)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Chat mode management
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class ChatModeOut(BaseModel):
+    slug: str
+    name: str
+    system_prompt: str = ""
+    config: dict = Field(default_factory=dict)
+    enabled: bool = True
+
+    model_config = {"from_attributes": True}
+
+
+class ChatModeUpdate(BaseModel):
+    system_prompt: str | None = None
+    enabled: bool | None = None
+
+
+@router.get("/modes", response_model=list[ChatModeOut])
+async def list_chat_modes(
+    db: AsyncSession = Depends(get_db_session),
+) -> list[ChatModeOut]:
+    """List all enabled chat modes."""
+    from app.models import ChatMode as ChatModeModel
+
+    rows = await db.execute(
+        select(ChatModeModel)
+        .where(ChatModeModel.enabled == True)  # noqa: E712
+        .order_by(ChatModeModel.id)
+    )
+    modes = rows.scalars().all()
+    return [
+        ChatModeOut(
+            slug=m.slug,
+            name=m.name,
+            system_prompt=m.system_prompt or "",
+            config=m.config or {},
+            enabled=m.enabled,
+        )
+        for m in modes
+    ]
+
+
+@router.put("/modes/{slug}", response_model=ChatModeOut)
+async def update_chat_mode(
+    slug: str,
+    body: ChatModeUpdate,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(get_current_user),
+) -> ChatModeOut:
+    """Update a chat mode's system prompt or enabled state (admin only)."""
+    from app.models import ChatMode as ChatModeModel
+
+    row = await db.execute(
+        select(ChatModeModel).where(ChatModeModel.slug == slug)
+    )
+    mode = row.scalar_one_or_none()
+    if not mode:
+        raise HTTPException(status_code=404, detail="模式不存在")
+
+    if body.system_prompt is not None:
+        mode.system_prompt = body.system_prompt
+    if body.enabled is not None:
+        mode.enabled = body.enabled
+    await db.flush()
+
+    return ChatModeOut(
+        slug=mode.slug,
+        name=mode.name,
+        system_prompt=mode.system_prompt or "",
+        config=mode.config or {},
+        enabled=mode.enabled,
+    )

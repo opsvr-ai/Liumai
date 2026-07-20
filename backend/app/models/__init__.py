@@ -272,6 +272,7 @@ class ChatSession(Base):
         nullable=False,
         index=True,
     )
+    mode_slug = Column(String(50), nullable=True, default=None)
     title = Column(String(255), nullable=False, default="新对话")
     created_at = Column(
         DateTime(timezone=True),
@@ -338,3 +339,34 @@ class SystemConfig(Base):
 
     def __repr__(self) -> str:
         return f"<SystemConfig key={self.key!r} value={self.value[:40]!r}>"
+
+
+class ChatMode(Base):
+    """A conversation mode with its own system prompt and config.
+
+    Pre-seeded with 'default', 'rca', and 'knowledge' modes.  Admins can
+    edit the system_prompt through the settings UI.
+    """
+
+    __tablename__ = "chat_modes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    slug = Column(String(50), unique=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    system_prompt = Column(Text, nullable=False, default="")
+    config = Column(JSONB, nullable=False, default=dict)
+    enabled = Column(Boolean, nullable=False, default=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<ChatMode slug={self.slug!r} name={self.name!r}>"
