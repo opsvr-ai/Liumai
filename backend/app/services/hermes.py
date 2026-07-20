@@ -441,12 +441,17 @@ class HermesClient:
         Returns each toolset's name, label, description, enabled/configured
         status, and the concrete ``tools`` list it expands to.  Requires
         ``API_SERVER_KEY`` on the Hermes side if authentication is enabled.
+
+        Handles both bare-list and envelope ``{object, data: [...]}`` responses.
         """
         url = f"{self.base_url}/toolsets"
         try:
             resp = await self._client.get(url)
             resp.raise_for_status()
-            return resp.json()  # list[Toolset]
+            data = resp.json()
+            if isinstance(data, dict) and "data" in data:
+                return data["data"]
+            return data  # bare list
         except httpx.HTTPStatusError as exc:
             logger.warning("Hermes /v1/toolsets returned {}", exc.response.status_code)
             return []
