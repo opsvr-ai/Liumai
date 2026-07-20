@@ -25,6 +25,51 @@ from app.config import settings
 _hermes_url: str = settings.HERMES_GATEWAY_URL
 _hermes_api_key: str | None = settings.HERMES_API_KEY
 
+# ── Skills / toolsets cache ─────────────────────────────────────────────────
+_cached_skills: list[dict[str, Any]] = []
+_cached_toolsets: list[dict[str, Any]] = []
+_cache_updated_at: float = 0.0
+_cache_refresh_secs: int = 300  # default 5 minutes
+
+
+def get_cache_age_secs() -> float:
+    """Seconds since the cache was last refreshed."""
+    import time
+    return time.time() - _cache_updated_at
+
+
+def get_cache_refresh_secs() -> int:
+    return _cache_refresh_secs
+
+
+def set_cache_refresh_secs(secs: int) -> None:
+    global _cache_refresh_secs
+    _cache_refresh_secs = max(30, min(secs, 86400))  # clamp 30s–24h
+
+
+async def refresh_skills_cache(client: "HermesClient | None" = None) -> None:
+    """Force-refresh the skills/toolsets cache from Hermes."""
+    global _cached_skills, _cached_toolsets, _cache_updated_at
+    import time
+    if client is None:
+        client = HermesClient()
+    try:
+        _cached_skills = await client.get_skills()
+        _cached_toolsets = await client.get_toolsets()
+        _cache_updated_at = time.time()
+        logger.info("Skills cache refreshed: {} skills, {} toolsets",
+                     len(_cached_skills), len(_cached_toolsets))
+    except Exception:
+        logger.exception("Failed to refresh skills cache")
+
+
+def get_cached_skills() -> list[dict[str, Any]]:
+    return _cached_skills
+
+
+def get_cached_toolsets() -> list[dict[str, Any]]:
+    return _cached_toolsets
+
 
 def reload_hermes_config(db_entries: dict[str, str]) -> None:
     """Reload Hermes config from DB values (called on admin save + startup).

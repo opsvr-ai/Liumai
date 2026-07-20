@@ -358,6 +358,24 @@ export const hermesDiscovery = {
   toolsets() {
     return request<HermesToolset[]>("GET", "/chat/hermes/toolsets");
   },
+  cacheStatus() {
+    return request<{ age_secs: number; refresh_secs: number; stale: boolean }>(
+      "GET",
+      "/chat/hermes/cache-status",
+    );
+  },
+  refresh() {
+    return request<{ skills_count: number; toolsets_count: number }>(
+      "POST",
+      "/chat/hermes/refresh",
+    );
+  },
+  getCacheInterval() {
+    return request<{ refresh_secs: number }>("GET", "/chat/hermes/cache-interval");
+  },
+  setCacheInterval(refresh_secs: number) {
+    return request<{ refresh_secs: number }>("PUT", "/chat/hermes/cache-interval", { refresh_secs });
+  },
 };
 
 /* ── Users ────────────────────────────────────────── */

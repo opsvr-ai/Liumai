@@ -12,13 +12,14 @@ import {
   ChevronRight,
   Zap,
   MessageSquare,
+  Clock,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { authApi, chatModes, type ChatModeOut, type HermesConfig, type LdapConfig, type LdapStatus } from "@/lib/api";
+import { authApi, chatModes, hermesDiscovery, type ChatModeOut, type HermesConfig, type LdapConfig, type LdapStatus } from "@/lib/api";
 import { useAuth } from "@/components/auth/auth-context";
 import { toast } from "sonner";
 
@@ -47,6 +48,27 @@ export default function SettingsPage() {
   const [modeEditor, setModeEditor] = useState<ChatModeOut | null>(null);
   const [modePrompt, setModePrompt] = useState("");
   const [modeSaving, setModeSaving] = useState(false);
+
+  /* ── Skills cache interval ──────────────────────────── */
+  const [cacheInterval, setCacheInterval] = useState(300);
+  const [cacheSaving, setCacheSaving] = useState(false);
+
+  useEffect(() => {
+    hermesDiscovery.getCacheInterval().then((r) => setCacheInterval(r.refresh_secs)).catch(() => {});
+  }, []);
+
+  async function handleSaveCacheInterval() {
+    setCacheSaving(true);
+    try {
+      const r = await hermesDiscovery.setCacheInterval(cacheInterval);
+      setCacheInterval(r.refresh_secs);
+      toast.success(`缓存刷新周期已设为 ${Math.round(r.refresh_secs / 60)} 分钟`);
+    } catch (e: any) {
+      toast.error(`保存失败: ${e.message}`);
+    } finally {
+      setCacheSaving(false);
+    }
+  }
 
   /* ── Change password ────────────────────────────────────── */
   const [pwOpen, setPwOpen] = useState(false);
@@ -468,6 +490,37 @@ export default function SettingsPage() {
             )}
           </CardContent>
         )}
+      </Card>
+
+      {/* ── Skills cache interval ──────────────────────── */}
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-sm font-medium flex items-center gap-2">
+            <Clock className="h-4 w-4" />
+            技能中心缓存
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            Hermes 技能列表自动刷新周期，避免频繁请求
+          </p>
+          <div className="flex items-center gap-2">
+            <select
+              value={cacheInterval}
+              onChange={(e) => setCacheInterval(Number(e.target.value))}
+              className="h-9 rounded-lg border border-border bg-surface-secondary px-3 text-sm text-text-primary"
+            >
+              {[60, 120, 300, 600, 1800, 3600].map((s) => (
+                <option key={s} value={s}>
+                  {s < 60 ? `${s} 秒` : s < 3600 ? `${Math.round(s / 60)} 分钟` : `${Math.round(s / 3600)} 小时`}
+                </option>
+              ))}
+            </select>
+            <Button size="sm" onClick={handleSaveCacheInterval} disabled={cacheSaving}>
+              {cacheSaving ? "保存中…" : "保存"}
+            </Button>
+          </div>
+        </CardContent>
       </Card>
 
       {/* ── Chat modes ──────────────────────────────────── */}

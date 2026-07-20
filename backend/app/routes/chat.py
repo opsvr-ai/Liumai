@@ -496,27 +496,85 @@ async def update_chat_mode(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Hermes skills & toolsets discovery
+# Hermes skills & toolsets discovery (with caching)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
 @router.get("/hermes/skills")
 async def list_hermes_skills() -> list[dict]:
-    """Proxy: list skills registered with the connected Hermes agent.
-
-    Calls ``GET /v1/skills`` on the Hermes API Server.  Returns an empty
-    list if the Hermes server is unreachable or does not support the endpoint.
-    """
-    hermes = _get_hermes()
-    return await hermes.get_skills()
+    """List skills from cache.  Auto-refreshed periodically."""
+    from app.services.hermes import get_cached_skills
+    return get_cached_skills()
 
 
 @router.get("/hermes/toolsets")
 async def list_hermes_toolsets() -> list[dict]:
-    """Proxy: list toolsets registered with the connected Hermes agent.
+    """List toolsets from cache.  Auto-refreshed periodically."""
+    from app.services.hermes import get_cached_toolsets
+    return get_cached_toolsets()
 
-    Calls ``GET /v1/toolsets`` on the Hermes API Server.  Returns an empty
-    list if the Hermes server is unreachable or does not support the endpoint.
-    """
+
+@router.get("/hermes/cache-status")
+async def hermes_cache_status() -> dict:
+    """Return cache age and refresh interval."""
+    from app.services.hermes import get_cache_age_secs, get_cache_refresh_secs
+    return {
+        "age_secs": round(get_cache_age_secs(), 1),
+        "refresh_secs": get_cache_refresh_secs(),
+        "stale": get_cache_age_secs() > get_cache_refresh_secs(),
+    }
+
+
+@router.post("/hermes/refresh")
+async def refresh_hermes_cache() -> dict:
+    """Force-refresh the skills/toolsets cache."""
+    from app.services.hermes import (
+        refresh_skills_cache,
+        get_cache_age_secs,
+        get_cached_skills,
+        get_cached_toolsets,
+    )
     hermes = _get_hermes()
-    return await hermes.get_toolsets()
+    await refresh_skills_cache(hermes)
+    return {
+        "skills_count": len(get_cached_skills()),
+        "toolsets_count": len(get_cached_toolsets()),
+        "age_secs": round(get_cache_age_secs(), 1),
+    }
+
+
+@router.put("/hermes/cache-interval")
+async def set_cache_interval(
+    body: dict,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(get_current_user),
+) -> dict:
+    """Set the cache refresh interval (seconds).  Persisted to system_config."""
+    from app.models import SystemConfig
+    from app.services.hermes import set_cache_refresh_secs, get_cache_refresh_secs
+
+    secs = int(body.get("refresh_secs", 300))
+    set_cache_refresh_secs(secs)
+
+    row = await db.get(SystemConfig, "skills_refresh_secs")
+    if row:
+        row.value = str(secs)
+        row.updated_at = func.now()
+    else:
+        db.add(SystemConfig(key="skills_refresh_secs", value=str(secs)))
+    await db.flush()
+
+    return {"refresh_secs": get_cache_refresh_secs()}
+
+
+@router.get("/hermes/cache-interval")
+async def get_cache_interval(
+    db: AsyncSession = Depends(get_db_session),
+) -> dict:
+    """Get the current cache refresh interval from DB or default."""
+    from app.models import SystemConfig
+    from app.services.hermes import get_cache_refresh_secs
+
+    row = await db.get(SystemConfig, "skills_refresh_secs")
+    db_secs = int(row.value) if row and row.value.isdigit() else None
+    return {"refresh_secs": db_secs or get_cache_refresh_secs()}

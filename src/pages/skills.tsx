@@ -24,24 +24,36 @@ import {
 } from "@/lib/api";
 import { toast } from "sonner";
 
+function formatAge(secs: number): string {
+  if (secs < 60) return `${Math.round(secs)}秒前`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}分钟前`;
+  return `${Math.round(mins / 60)}小时前`;
+}
+
 export default function SkillsPage() {
   const [skills, setSkills] = useState<HermesSkill[]>([]);
   const [toolsets, setToolsets] = useState<HermesToolset[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [tab, setTab] = useState<"toolsets" | "skills">("toolsets");
+  const [cacheAge, setCacheAge] = useState<string>("");
+  const [nextRefresh, setNextRefresh] = useState(300);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
-      const [t, s] = await Promise.all([
+      const [t, s, status] = await Promise.all([
         hermesDiscovery.toolsets(),
         hermesDiscovery.skills(),
+        hermesDiscovery.cacheStatus(),
       ]);
       setToolsets(t);
       setSkills(s);
+      setCacheAge(formatAge(status.age_secs));
+      setNextRefresh(status.refresh_secs);
     } catch {
-      toast.error("加载技能数据失败");
+      if (!silent) toast.error("加载技能数据失败");
     } finally {
       setLoading(false);
     }
@@ -49,6 +61,12 @@ export default function SkillsPage() {
 
   useEffect(() => {
     load();
+  }, [load]);
+
+  // Auto-refresh every 60s (check cache staleness)
+  useEffect(() => {
+    const timer = setInterval(() => { load(true); }, 60000);
+    return () => clearInterval(timer);
   }, [load]);
 
   const filteredToolsets = toolsets.filter(
@@ -72,10 +90,10 @@ export default function SkillsPage() {
         <div>
           <h2 className="text-lg font-semibold">技能中心</h2>
           <p className="text-sm text-muted-foreground mt-0.5">
-            Hermes Agent 能力清单 · {toolsets.length} 工具集 · {skills.length} 技能
+            Hermes Agent 能力清单 · {toolsets.length} 工具集 · {skills.length} 技能 · 更新于 {cacheAge} · 每 {Math.round(nextRefresh / 60)} 分钟自动刷新
           </p>
         </div>
-        <Button variant="ghostMuted" size="icon-sm" onClick={load}>
+        <Button variant="ghostMuted" size="icon-sm" onClick={() => load(false)}>
           <RefreshCw className="h-4 w-4" />
         </Button>
       </div>

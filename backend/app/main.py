@@ -33,6 +33,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     await init_db()
 
+    # Background task: refresh Hermes skills cache periodically
+    import asyncio
+    from app.services.hermes import (
+        refresh_skills_cache,
+        get_cache_refresh_secs,
+        get_cache_age_secs,
+    )
+
+    async def _skills_cache_loop():
+        # Initial load after a short delay (let the server start)
+        await asyncio.sleep(10)
+        await refresh_skills_cache()
+        while True:
+            interval = get_cache_refresh_secs()
+            await asyncio.sleep(interval)
+            if get_cache_age_secs() >= interval:
+                await refresh_skills_cache()
+
+    _cache_task = asyncio.create_task(_skills_cache_loop())
+
     # Load persisted config from DB (fall back to env vars)
     try:
         from app.models import SystemConfig
@@ -50,6 +70,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         from app.services.hermes import reload_hermes_config
         reload_hermes_config(db_cfg if db_cfg else {})
+
+        # Restore skills cache refresh interval from DB
+        if "skills_refresh_secs" in db_cfg:
+            from app.services.hermes import set_cache_refresh_secs
+            set_cache_refresh_secs(int(db_cfg["skills_refresh_secs"]))
     except Exception:
         logger.exception("Could not load config from DB — using env defaults")
 
