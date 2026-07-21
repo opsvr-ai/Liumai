@@ -7,6 +7,7 @@ values are reloaded into this module immediately — no restart required.
 
 from __future__ import annotations
 
+import ssl
 from dataclasses import dataclass
 
 from loguru import logger
@@ -25,6 +26,39 @@ _ldap_bind_dn: str = settings.LDAP_BIND_DN
 _ldap_bind_password: str = settings.LDAP_BIND_PASSWORD
 _ldap_username_attr: str = settings.LDAP_USERNAME_ATTR
 _ldap_auto_create_user: bool = settings.LDAP_AUTO_CREATE_USER
+
+# Constants
+_CONNECT_TIMEOUT = 5  # seconds
+_RECEIVE_TIMEOUT = 10  # seconds
+
+# RFC 4515 LDAP filter escaping — special characters must be replaced with
+# their \xx hex representation to prevent LDAP injection.
+_LDAP_ESCAPE_TABLE = str.maketrans({
+    "*": "\\2a",
+    "(": "\\28",
+    ")": "\\29",
+    "\\": "\\5c",
+    "\x00": "\\00",
+})
+
+
+def _escape_ldap_filter(value: str) -> str:
+    """Escape special characters in an LDAP filter value per RFC 4515.
+
+    Prevents LDAP injection attacks through username input.
+    """
+    return value.translate(_LDAP_ESCAPE_TABLE)
+
+
+def _make_server(uri: str) -> "ldap3.Server":
+    """Create an ldap3 Server with TLS verification and timeouts."""
+    import ldap3
+    tls_config = None
+    if uri.startswith("ldaps://"):
+        tls_config = ldap3.Tls(validate=ssl.CERT_REQUIRED)
+    return ldap3.Server(
+        uri, get_info=ldap3.ALL, connect_timeout=_CONNECT_TIMEOUT, tls=tls_config,
+    )
 
 
 def reload_ldap_config(db_entries: dict[str, str]) -> None:
@@ -59,50 +93,68 @@ async def authenticate_ldap(username: str, password: str) -> LdapUser | None:
     try:
         import ldap3
     except ImportError:
-        logger.warning("ldap3 not installed")
+        logger.warning("ldap3 not installed — LDAP auth disabled")
         return None
 
-    server = ldap3.Server(_ldap_server, get_info=ldap3.ALL)
+    # Escape username to prevent LDAP injection
+    safe_username = _escape_ldap_filter(username)
+    server = _make_server(_ldap_server)
 
     if _ldap_bind_dn:
-        # Search mode: bind with service account, search for user, rebind as user
+        # ── Search mode: bind with service account, search for user, rebind as user ──
+        conn = None
         try:
             conn = ldap3.Connection(
-                server, user=_ldap_bind_dn,
-                password=_ldap_bind_password, auto_bind=True,
+                server, user=_ldap_bind_dn, password=_ldap_bind_password,
+                auto_bind=True, receive_timeout=_RECEIVE_TIMEOUT,
             )
         except ldap3.core.exceptions.LDAPException as exc:
-            logger.error("LDAP bind failed: {}", exc)
+            logger.warning("LDAP service bind failed: {}", exc)
             return None
 
-        filt = _ldap_user_filter.format(username=username)
-        conn.search(
-            search_base=_ldap_base_dn, search_filter=filt,
-            attributes=[_ldap_username_attr, "displayName", "mail", "memberOf"],
-        )
-        if not conn.entries:
-            conn.unbind(); return None
-
-        entry = conn.entries[0]
-        user_dn = entry.entry_dn
-        dn = str(entry.displayName) if hasattr(entry, "displayName") else None
-        mail = str(entry.mail) if hasattr(entry, "mail") else None
-        groups = [str(g) for g in entry.memberOf] if hasattr(entry, "memberOf") else None
-        conn.unbind()
-
         try:
-            uc = ldap3.Connection(server, user=user_dn, password=password, auto_bind=True)
+            filt = _ldap_user_filter.format(username=safe_username)
+            conn.search(
+                search_base=_ldap_base_dn, search_filter=filt,
+                attributes=ldap3.ALL_ATTRIBUTES,
+            )
+            if not conn.entries:
+                return None
+
+            entry = conn.entries[0]
+            user_dn = str(entry.entry_dn)
+            dn = str(entry.displayName) if hasattr(entry, "displayName") else None
+            mail = str(entry.mail) if hasattr(entry, "mail") else None
+            groups = [str(g) for g in entry.memberOf] if hasattr(entry, "memberOf") else None
+        except ldap3.core.exceptions.LDAPException as exc:
+            logger.warning("LDAP search failed: {}", exc)
+            return None
+        finally:
+            if conn:
+                try:
+                    conn.unbind()
+                except Exception:
+                    pass
+
+        # Rebind as user to verify password
+        try:
+            uc = ldap3.Connection(
+                server, user=user_dn, password=password,
+                auto_bind=True, receive_timeout=_RECEIVE_TIMEOUT,
+            )
             uc.unbind()
         except ldap3.core.exceptions.LDAPException:
             return None
         return LdapUser(username=username, display_name=dn, email=mail, groups=groups)
 
-    # Direct bind mode
-    user_dn = _ldap_user_filter.format(username=username)
-    if not (user_dn.startswith("cn=") or user_dn.startswith("uid=")):
-        user_dn = f"uid={username},{_ldap_base_dn}"
+    # ── Direct bind mode (no service account; bind directly as the user) ──
+    # Construct user DN using the base DN and username attribute
+    user_dn = f"{_ldap_username_attr}={safe_username},{_ldap_base_dn}"
     try:
-        conn = ldap3.Connection(server, user=user_dn, password=password, auto_bind=True)
+        conn = ldap3.Connection(
+            server, user=user_dn, password=password,
+            auto_bind=True, receive_timeout=_RECEIVE_TIMEOUT,
+        )
         conn.unbind()
         return LdapUser(username=username)
     except ldap3.core.exceptions.LDAPException:
@@ -118,15 +170,25 @@ async def test_ldap_connection() -> tuple[bool, str]:
     except ImportError:
         return False, "ldap3 库未安装"
     try:
-        server = ldap3.Server(_ldap_server, get_info=ldap3.ALL)
+        server = _make_server(_ldap_server)
         if _ldap_bind_dn:
             conn = ldap3.Connection(
-                server, user=_ldap_bind_dn,
-                password=_ldap_bind_password, auto_bind=True,
+                server, user=_ldap_bind_dn, password=_ldap_bind_password,
+                auto_bind=True, receive_timeout=_RECEIVE_TIMEOUT,
             )
         else:
-            conn = ldap3.Connection(server, auto_bind=True)
+            conn = ldap3.Connection(
+                server, auto_bind=True, receive_timeout=_RECEIVE_TIMEOUT,
+            )
         conn.unbind()
         return True, "LDAP 连接成功"
     except ldap3.core.exceptions.LDAPException as exc:
-        return False, f"LDAP 连接失败: {exc}"
+        # Map known error codes to generic messages — don't leak LDAP internals
+        msg = str(exc)
+        if "invalidCredentials" in msg or "52e" in msg:
+            return False, "LDAP 认证失败 — 请检查 Bind DN 和密码"
+        if "unavailable" in msg.lower():
+            return False, "LDAP 服务器不可达 — 请检查地址和网络"
+        if "timeout" in msg.lower():
+            return False, "LDAP 连接超时 — 请检查网络延迟"
+        return False, "LDAP 连接失败 — 请检查配置"

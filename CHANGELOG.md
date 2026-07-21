@@ -1,5 +1,67 @@
 # Changelog
 
+## [0.4.0] — 2026-07-21
+
+### Added
+
+- **Knowledge Center (知识中心)** — full document ingestion pipeline into llm-wiki v2
+  - Document CRUD with batch file upload (MarkItDown conversion for 30+ formats)
+  - One-click ingest via Hermes with custom knowledge management prompts
+  - Q&A hit testing with feedback mechanism (thumbs up/down)
+  - Webhook auto-update: external systems push data → auto-refine → store in knowledge base
+  - Statistics dashboard: total docs, storage status, hit counts, webhook sources
+  - ExpandableText component for long content preview
+- **Chat mode restructuring**
+  - New `general` mode: direct LLM calls (bypass Hermes), configurable via system settings
+  - Renamed `default` → 智能助理 (Hermes-powered ops assistant with tool execution)
+  - Knowledge Q&A mode: llm-wiki v2 protocol prompt, document upload moved to general mode
+- **Model auto-discovery**: `GET /api/chat/llm-models` proxies LLM endpoint `/v1/models`
+- **Model selector**: Dropdown model picker in general chat mode, defaults to configured model
+- **Mode-aware placeholder text**: Each chat mode shows contextual hint in the input area
+- **Chat input redesign**: Bottom bar layout with file upload (+) button left, model selector + send right
+
+### Changed
+
+- **Security hardening** (55 issues from comprehensive platform audit)
+  - Added authentication to 25+ previously unprotected endpoints
+  - JWT_SECRET validation at startup (rejects insecure defaults)
+  - CORS tightened: specific methods/headers, removed credential wildcard
+  - Nginx security headers added (CSP, X-Content-Type-Options, X-Frame-Options, etc.)
+  - Redis password authentication enforced
+  - PostgreSQL port no longer exposed to host by default
+  - API keys (Hermes/LLM) masked in GET responses
+  - Image upload content validation (magic bytes check)
+  - Frontend route protection: RequireAdmin wrapper for admin-only pages
+  - 401 interceptor: auto-redirect to login on expired token
+- **Password policy overhaul**: Min 10 chars, complexity requirements (upper/lower/digit/special), random password generator
+- **Admin initialization redesign**: Removed hardcoded admin seed, dynamic first-time setup with strength validation
+- **Database optimization**: 10 new indexes added (composite, trigram GIN for full-text search, etc.)
+- **init.sql comprehensive sync**: All columns, constraints, indexes, seed data aligned with running schema
+
+### Fixed
+
+- SSRF vulnerability in data source query endpoint (URL override removed)
+- LDAP injection escape updated to RFC 4515 hex format
+- Setup endpoint race condition (PostgreSQL advisory lock)
+- HermesClient HTTP connection leak on config reload
+- Background cache task cancellation on shutdown
+- Typewriter interval memory leak + unmount cleanup
+- TooltipProvider missing from component tree
+- 401 interceptor for expired JWT tokens
+- Datasource auth config serialization bug (type cast issue)
+- Alembic env.py missing model imports (ChatMessage, ChatSession, etc.)
+- `int(user_id)` 500 error moved inside try/except
+- Login timing side-channel mitigated with dummy bcrypt verify
+- `generate_welcome` now uses authenticated user identity
+- Frontend dark mode color breakage in sidebars and chat bubbles
+- MarkItDown content truncation raised from 8K → 30K chars
+- Hit test dialog retains previous question (now resets on open)
+- Ingest status now shows processing spinner with auto-refresh
+- `.env` cleaned: internal IP and potential API key removed
+- Version consistency: all components report v0.3.0 → v0.4.0
+
+---
+
 ## [0.3.0] — 2026-07-21
 
 ### Added

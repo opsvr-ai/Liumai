@@ -281,6 +281,25 @@ async def get_my_stats(
 AVATAR_DIR = Path("/app/data/avatars")
 AVATAR_MAX_BYTES = 2 * 1024 * 1024  # 2 MB
 
+# Allowed image magic bytes (first bytes of common image formats)
+_IMAGE_MAGIC = {
+    b"\x89PNG\r\n\x1a\n":    ".png",
+    b"\xff\xd8\xff":          ".jpg",
+    b"GIF87a":               ".gif",
+    b"GIF89a":               ".gif",
+    b"RIFF":                 ".webp",  # RIFF....WEBP
+    b"<?xml":                ".svg",   # SVG starts with XML declaration
+    b"<svg":                 ".svg",
+}
+
+
+def _validate_image_bytes(data: bytes) -> None:
+    """Verify that *data* starts with a known image magic-byte sequence."""
+    for magic, _ext in _IMAGE_MAGIC.items():
+        if data[:len(magic)] == magic:
+            return
+    raise HTTPException(status_code=400, detail="文件内容不是有效的图片格式")
+
 
 @router.post("/me/avatar")
 async def upload_avatar(
@@ -294,6 +313,10 @@ async def upload_avatar(
     body = await file.read()
     if len(body) > AVATAR_MAX_BYTES:
         raise HTTPException(status_code=400, detail="图片不能超过 2MB")
+
+    # Validate file magic bytes (not just Content-Type header)
+    _validate_image_bytes(body)
+
     # Generate unique filename preserving extension
     ext = os.path.splitext(file.filename or "avatar.png")[1] or ".png"
     safe_ext = ext if ext.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"} else ".png"

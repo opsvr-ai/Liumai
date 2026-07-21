@@ -78,10 +78,13 @@ async def get_current_user(
         user_id: str | None = payload.get("sub")
         if user_id is None:
             raise HTTPException(status_code=401, detail="无效令牌")
+        user_id_int = int(user_id)
     except JWTError:
         raise HTTPException(status_code=401, detail="令牌验证失败")
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="无效令牌")
 
-    row = await db.get(User, int(user_id))
+    row = await db.get(User, user_id_int)
     if row is None:
         raise HTTPException(status_code=401, detail="用户不存在")
     # Touch last_active_at (throttled: max once per 60s to reduce writes)

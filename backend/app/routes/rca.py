@@ -15,12 +15,14 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import get_current_user
 from app.config import settings
 from app.models import (
     CollaborationEvent,
     RcaSession,
     RcaStatus,
     RcaTriggerType,
+    User,
 )
 from app.models.database import get_db_session
 from app.services.hermes import HermesClient
@@ -119,6 +121,7 @@ class PaginatedResponse(BaseModel):
 async def trigger_rca(
     req: TriggerRcaRequest,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> TriggerRcaResponse:
     """Manually trigger an RCA session (active mode).
 
@@ -188,6 +191,7 @@ async def list_rca_sessions(
     status_filter: str | None = Query(None, alias="status"),
     team_id: int | None = Query(None),
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> PaginatedResponse:
     """List RCA sessions with pagination and optional filters."""
     query = select(RcaSession).order_by(RcaSession.created_at.desc())
@@ -231,6 +235,7 @@ async def list_rca_sessions(
 async def get_rca_session(
     session_id: int,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> RcaSessionDetail:
     """Get full detail for a single RCA session, including timeline."""
     result = await db.execute(
@@ -283,6 +288,7 @@ async def get_rca_session(
 @router.get("/queue", response_model=QueueStatus)
 async def get_queue_status(
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> QueueStatus:
     """Get the current RCA queue state (D-11)."""
     active = await _count_by_status(db, RcaStatus.RUNNING)

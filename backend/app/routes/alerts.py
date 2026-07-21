@@ -19,7 +19,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import AlertRule, RcaSession, RcaStatus, RcaTriggerType
+from app.auth import get_current_user
+from app.models import AlertRule, RcaSession, RcaStatus, RcaTriggerType, User
 from app.models.database import get_db_session
 from app.services.hermes import HermesClient
 
@@ -193,6 +194,7 @@ def _resolve_field(data: dict[str, Any], dotted: str) -> Any:
 async def ingest_alert(
     payload: RawAlert,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> IngestResponse:
     """Ingest an alert from an external monitoring system.
 

@@ -1,9 +1,10 @@
 import { useMemo } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Activity, Clock, Database, HelpCircle, History, Home, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
+import { Activity, BookOpen, Clock, Database, HelpCircle, History, Home, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-context";
 import { DashboardShell, type SidebarItem } from "@/components/layout/dashboard-shell";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "sonner";
 
 import LoginPage from "@/pages/login";
@@ -18,12 +19,19 @@ import SkillsPage from "@/pages/skills";
 import DataSourcesPage from "@/pages/datasources";
 import ProfilePage from "@/pages/profile";
 import JobsPage from "@/pages/jobs";
+import KnowledgePage from "@/pages/knowledge";
 import HelpPage from "@/pages/help";
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth();
   const location = useLocation();
   if (!isAuthenticated) return <Navigate to="/login" state={{ from: location }} replace />;
+  return <>{children}</>;
+}
+
+function RequireAdmin({ children }: { children: React.ReactNode }) {
+  const { isAdmin } = useAuth();
+  if (!isAdmin) return <Navigate to="/" replace />;
   return <>{children}</>;
 }
 
@@ -40,9 +48,9 @@ function Shell({ children }: { children: React.ReactNode }) {
       { id: "rules", label: "告警规则", icon: <Shield className="h-4 w-4" />, isActive: location.pathname.startsWith("/rules"), onClick: () => navigate("/rules") },
       { id: "datasources", label: "数据源", icon: <Database className="h-4 w-4" />, isActive: location.pathname.startsWith("/datasources"), onClick: () => navigate("/datasources") },
       { id: "history", label: "历史记录", icon: <History className="h-4 w-4" />, isActive: location.pathname.startsWith("/history"), onClick: () => navigate("/history") },
+      { id: "knowledge", label: "知识中心", icon: <BookOpen className="h-4 w-4" />, isActive: location.pathname.startsWith("/knowledge"), onClick: () => navigate("/knowledge") },
       { id: "skills", label: "技能中心", icon: <Wrench className="h-4 w-4" />, isActive: location.pathname.startsWith("/skills"), onClick: () => navigate("/skills") },
       { id: "jobs", label: "定时任务", icon: <Clock className="h-4 w-4" />, isActive: location.pathname.startsWith("/jobs"), onClick: () => navigate("/jobs") },
-      { id: "help", label: "帮助中心", icon: <HelpCircle className="h-4 w-4" />, isActive: location.pathname.startsWith("/help"), onClick: () => navigate("/help") },
     ];
     if (isAdmin) {
       items.push(
@@ -71,8 +79,9 @@ function Shell({ children }: { children: React.ReactNode }) {
 export default function App() {
   return (
     <ErrorBoundary>
-      <AuthProvider>
-        <BrowserRouter>
+      <TooltipProvider>
+        <AuthProvider>
+          <BrowserRouter>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route path="*" element={
@@ -84,12 +93,13 @@ export default function App() {
                     <Route path="/rca" element={<RcaPage />} />
                     <Route path="/rules" element={<RulesPage />} />
                     <Route path="/history" element={<HistoryPage />} />
-                    <Route path="/settings" element={<SettingsPage />} />
-                    <Route path="/users" element={<UsersPage />} />
+                    <Route path="/settings" element={<RequireAdmin><SettingsPage /></RequireAdmin>} />
+                    <Route path="/users" element={<RequireAdmin><UsersPage /></RequireAdmin>} />
                     <Route path="/skills" element={<SkillsPage />} />
                     <Route path="/datasources" element={<DataSourcesPage />} />
                     <Route path="/profile" element={<ProfilePage />} />
-                    <Route path="/jobs" element={<JobsPage />} />
+                    <Route path="/knowledge" element={<KnowledgePage />} />
+                    <Route path="/jobs" element={<RequireAdmin><JobsPage /></RequireAdmin>} />
                     <Route path="/help" element={<HelpPage />} />
                     <Route path="*" element={<Navigate to="/" replace />} />
                   </Routes>
@@ -99,7 +109,8 @@ export default function App() {
           </Routes>
           <Toaster position="top-right" richColors />
         </BrowserRouter>
-      </AuthProvider>
+        </AuthProvider>
+      </TooltipProvider>
     </ErrorBoundary>
   );
 }

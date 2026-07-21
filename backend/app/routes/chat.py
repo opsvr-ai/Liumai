@@ -20,10 +20,29 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user
+from app.auth import get_current_user, require_admin
 from app.models import ChatMessage, ChatSession, User
 from app.models.database import get_db_session
 from app.services.hermes import HermesClient
+
+
+# ── LLM config helper ──────────────────────────────────────────────────────────
+
+
+async def _load_llm_config(db: AsyncSession) -> dict[str, str]:
+    """Load LLM configuration from database (fall back to env defaults)."""
+    from app.models import SystemConfig
+    rows = await db.execute(
+        select(SystemConfig).where(
+            SystemConfig.key.in_(["llm_base_url", "llm_api_key", "llm_model"])
+        )
+    )
+    return {r.key: r.value for r in rows.scalars()}
+
+
+def _llm_sse_event(event_type: str, data: str) -> str:
+    """Like _sse_event but imported at module scope."""
+    return f"event: {event_type}\ndata: {data}\n\n"
 
 router = APIRouter()
 
@@ -85,6 +104,14 @@ def _get_hermes() -> HermesClient:
     if _hermes is not None and (
         _hermes.base_url != current_url or _hermes.api_key != current_key
     ):
+        # Close old client before replacing (prevents connection leak)
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(_hermes.close())
+        except RuntimeError:
+            pass
         _hermes = None  # force recreation with new config
     if _hermes is None:
         _hermes = HermesClient()
@@ -121,6 +148,7 @@ def _sse_event(event_type: str, data: str) -> str:
 async def chat_stream_endpoint(
     body: ChatRequest,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     """Stream a chat completion from Hermes via SSE.
 
@@ -163,6 +191,10 @@ async def chat_stream_endpoint(
                     last_user["content"] += tw_info
             # RCA mode: lower temperature for deterministic output
             body.temperature = 0.3
+
+    # ── LLM direct path (mode with provider=llm) ─────────────────────────
+    if mode and (mode.config or {}).get("provider") == "llm":
+        return await _llm_direct_stream(messages, body, mode, db)
 
     # Guard against empty URL (not yet configured by admin)
     if not hermes.base_url:
@@ -237,6 +269,124 @@ async def chat_stream_endpoint(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # disable nginx buffering
         },
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LLM direct streaming (for modes with provider=llm)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _llm_direct_stream(
+    messages: list[dict[str, Any]],
+    body: ChatRequest,
+    mode: Any,
+    db: AsyncSession,
+) -> StreamingResponse:
+    """Stream directly from the configured LLM (not Hermes).
+
+    Used when a chat mode has ``config.provider == "llm"``.
+    """
+    import httpx
+
+    cfg = await _load_llm_config(db)
+    base_url = cfg.get("llm_base_url", "").strip()
+    api_key = cfg.get("llm_api_key", "").strip()
+    config_model = cfg.get("llm_model", "").strip()
+
+    if not base_url:
+        async def _no_llm():
+            yield _sse_event(
+                "error",
+                json.dumps(
+                    {"type": "error", "error": "智能引擎未配置 — 请在系统设置中配置通用模型"},
+                    ensure_ascii=False,
+                ),
+            )
+        return StreamingResponse(_no_llm(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    model = body.model or config_model or "gpt-4o"
+    url = base_url.rstrip("/")
+    # Append /v1/chat/completions if not already in the URL
+    if not url.endswith("/chat/completions"):
+        url = f"{url}/chat/completions" if "/v1" in url else f"{url}/v1/chat/completions"
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": body.temperature,
+        "stream": True,
+    }
+
+    logger.info("LLM direct stream: model={} url={} msg_count={}", model, url, len(messages))
+
+    async def _llm_event_generator():
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as client:
+                async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                    if resp.status_code >= 400:
+                        body_text = await resp.aread()
+                        logger.error("LLM HTTP {}: {}", resp.status_code, body_text[:500])
+                        yield _sse_event(
+                            "error",
+                            json.dumps({"type": "error", "error": f"模型服务错误 (HTTP {resp.status_code})"}, ensure_ascii=False),
+                        )
+                        yield _sse_event("done", json.dumps({"type": "done", "finish_reason": "error"}, ensure_ascii=False))
+                        return
+
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
+
+                        choice = choices[0]
+                        delta = choice.get("delta", {})
+                        finish = choice.get("finish_reason")
+
+                        content = delta.get("content", "")
+                        if isinstance(content, str) and content:
+                            yield _sse_event(
+                                "delta",
+                                json.dumps({"type": "delta", "content": content}, ensure_ascii=False),
+                            )
+
+                        if finish is not None:
+                            usage = chunk.get("usage")
+                            done_payload: dict[str, Any] = {"type": "done", "finish_reason": finish}
+                            if usage:
+                                done_payload["usage"] = usage
+                            yield _sse_event("done", json.dumps(done_payload, ensure_ascii=False))
+
+        except httpx.ConnectError:
+            yield _sse_event("error", json.dumps({"type": "error", "error": "无法连接到模型服务"}, ensure_ascii=False))
+            yield _sse_event("done", json.dumps({"type": "done", "finish_reason": "error"}, ensure_ascii=False))
+        except httpx.TimeoutException:
+            yield _sse_event("error", json.dumps({"type": "error", "error": "模型服务超时"}, ensure_ascii=False))
+            yield _sse_event("done", json.dumps({"type": "done", "finish_reason": "error"}, ensure_ascii=False))
+        except Exception as exc:
+            logger.exception("LLM direct stream error")
+            yield _sse_event("error", json.dumps({"type": "error", "error": f"流中断: {exc}"}, ensure_ascii=False))
+            yield _sse_event("done", json.dumps({"type": "done", "finish_reason": "error"}, ensure_ascii=False))
+
+    return StreamingResponse(
+        _llm_event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
     )
 
 
@@ -441,14 +591,24 @@ class ChatModeUpdate(BaseModel):
 @router.get("/modes", response_model=list[ChatModeOut])
 async def list_chat_modes(
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> list[ChatModeOut]:
     """List all enabled chat modes."""
     from app.models import ChatMode as ChatModeModel
 
+    from sqlalchemy import case as _sql_case
     rows = await db.execute(
         select(ChatModeModel)
         .where(ChatModeModel.enabled == True)  # noqa: E712
-        .order_by(ChatModeModel.id)
+        .order_by(
+            # Put 'general' first, then 智能助理, then the rest
+            _sql_case(
+                (ChatModeModel.slug == "general", 0),
+                (ChatModeModel.slug == "default", 1),
+                else_=2,
+            ),
+            ChatModeModel.id,
+        )
     )
     modes = rows.scalars().all()
     return [
@@ -468,7 +628,7 @@ async def update_chat_mode(
     slug: str,
     body: ChatModeUpdate,
     db: AsyncSession = Depends(get_db_session),
-    _admin: User = Depends(get_current_user),
+    _admin: User = Depends(require_admin),
 ) -> ChatModeOut:
     """Update a chat mode's system prompt or enabled state (admin only)."""
     from app.models import ChatMode as ChatModeModel
@@ -501,21 +661,27 @@ async def update_chat_mode(
 
 
 @router.get("/hermes/skills")
-async def list_hermes_skills() -> list[dict]:
+async def list_hermes_skills(
+    user: User = Depends(get_current_user),
+) -> list[dict]:
     """List skills from cache.  Auto-refreshed periodically."""
     from app.services.hermes import get_cached_skills
     return get_cached_skills()
 
 
 @router.get("/hermes/toolsets")
-async def list_hermes_toolsets() -> list[dict]:
+async def list_hermes_toolsets(
+    user: User = Depends(get_current_user),
+) -> list[dict]:
     """List toolsets from cache.  Auto-refreshed periodically."""
     from app.services.hermes import get_cached_toolsets
     return get_cached_toolsets()
 
 
 @router.get("/hermes/cache-status")
-async def hermes_cache_status() -> dict:
+async def hermes_cache_status(
+    user: User = Depends(get_current_user),
+) -> dict:
     """Return cache age and refresh interval."""
     from app.services.hermes import get_cache_age_secs, get_cache_refresh_secs
     return {
@@ -526,7 +692,9 @@ async def hermes_cache_status() -> dict:
 
 
 @router.post("/hermes/refresh")
-async def refresh_hermes_cache() -> dict:
+async def refresh_hermes_cache(
+    _admin: User = Depends(require_admin),
+) -> dict:
     """Force-refresh the skills/toolsets cache."""
     from app.services.hermes import (
         refresh_skills_cache,
@@ -547,7 +715,7 @@ async def refresh_hermes_cache() -> dict:
 async def set_cache_interval(
     body: dict,
     db: AsyncSession = Depends(get_db_session),
-    _admin: User = Depends(get_current_user),
+    _admin: User = Depends(require_admin),
 ) -> dict:
     """Set the cache refresh interval (seconds).  Persisted to system_config."""
     from app.models import SystemConfig
@@ -570,6 +738,7 @@ async def set_cache_interval(
 @router.get("/hermes/cache-interval")
 async def get_cache_interval(
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Get the current cache refresh interval from DB or default."""
     from app.models import SystemConfig
@@ -603,6 +772,7 @@ ALLOWED_EXTENSIONS = {
 @router.post("/convert-file")
 async def convert_file(
     file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Convert an uploaded file to Markdown using Microsoft MarkItDown.
 
@@ -658,11 +828,74 @@ async def convert_file(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# LLM model discovery
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/llm-models")
+async def list_llm_models(
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    """List available models from the configured LLM endpoint.
+
+    Proxies ``GET /v1/models`` on the configured LLM base URL.  Falls back
+    to returning the single configured model if the endpoint is unreachable
+    or does not support model listing.
+    """
+    import httpx
+
+    cfg = await _load_llm_config(db)
+    base_url = cfg.get("llm_base_url", "").strip()
+    api_key = cfg.get("llm_api_key", "").strip()
+    config_model = cfg.get("llm_model", "").strip()
+
+    models: list[dict] = []
+
+    # Try to discover models from the configured LLM endpoint
+    if base_url:
+        url = base_url.rstrip("/")
+        # Build models URL
+        if url.endswith("/v1"):
+            models_url = f"{url}/models"
+        elif "/v1/" in url:
+            models_url = f"{url.split('/v1/')[0]}/v1/models"
+        else:
+            models_url = f"{url}/v1/models"
+
+        headers: dict[str, str] = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=5.0)) as client:
+                resp = await client.get(models_url, headers=headers)
+                if resp.status_code < 400:
+                    data = resp.json()
+                    raw_list: list[dict] = data.get("data", data if isinstance(data, list) else [])
+                    models = [{"id": m.get("id", "unknown"), "owned_by": m.get("owned_by", "")} for m in raw_list]
+        except Exception:
+            logger.info("LLM model discovery failed — falling back to configured model")
+
+    # Fallback: use the single configured model
+    if not models and config_model:
+        models = [{"id": config_model, "owned_by": ""}]
+
+    # Ultimate fallback
+    if not models:
+        models = [{"id": "gpt-4o", "owned_by": ""}]
+
+    return models
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Hermes health
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @router.get("/hermes-health")
-async def hermes_health() -> dict:
+async def hermes_health(
+    user: User = Depends(get_current_user),
+) -> dict:
     """Lightweight Hermes health check — returns ok + latency."""
     from app.services.hermes import _hermes_url, _hermes_api_key
     import time, httpx

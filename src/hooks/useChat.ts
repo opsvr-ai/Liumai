@@ -142,7 +142,7 @@ export function useChat() {
   const sendMessage = useCallback(
     async (
       content: string,
-      opts?: { mode?: string; timeWindowStart?: string; timeWindowEnd?: string },
+      opts?: { mode?: string; model?: string; timeWindowStart?: string; timeWindowEnd?: string },
     ) => {
       if (!content.trim() || isStreaming) return;
 
@@ -174,6 +174,7 @@ export function useChat() {
         for await (const event of chatStream(apiMessages, {
           signal: controller.signal,
           mode: opts?.mode,
+          model: opts?.model,
           timeWindowStart: opts?.timeWindowStart,
           timeWindowEnd: opts?.timeWindowEnd,
         })) {

@@ -28,6 +28,22 @@ def _coerce_int_placeholder(v: Any) -> int:
     return 0
 
 
+def _check_jwt_secret(v: Any) -> str:
+    """Reject well-known default / empty JWT secrets."""
+    if not isinstance(v, str) or v.strip() == "":
+        raise ValueError(
+            "JWT_SECRET must be set to a strong random value. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+        )
+    forbidden = {"change-me-in-production", "change-me", "your-secret-key"}
+    if v.strip().lower() in forbidden:
+        raise ValueError(
+            "JWT_SECRET is set to an insecure default. "
+            "Generate a strong random secret."
+        )
+    return v
+
+
 class Settings(BaseSettings):
     """Pydantic-v2 settings model, loaded from environment / .env file."""
 
@@ -36,6 +52,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        validate_default=True,
     )
 
     # ── Database ──────────────────────────────────────────────────────────
@@ -99,9 +116,10 @@ class Settings(BaseSettings):
     )
 
     # ── Auth ──────────────────────────────────────────────────────────────
-    JWT_SECRET: str = Field(
-        default="change-me-in-production",
-        description="HMAC secret for signing JWT tokens.",
+    JWT_SECRET: Annotated[str, BeforeValidator(_check_jwt_secret)] = Field(
+        default="",
+        description="HMAC secret for signing JWT tokens.  Must be set to a "
+                    "strong random value in production.",
     )
     JWT_ALGORITHM: str = Field(
         default="HS256",

@@ -169,30 +169,46 @@ function ArchitectureTab() {
     <div className="space-y-6">
       <Card><CardContent className="p-6 space-y-3">
         <h3 className="text-base font-semibold">系统拓扑</h3>
-        <pre className="text-xs font-mono bg-surface-secondary rounded-lg p-4 overflow-x-auto text-text-secondary leading-relaxed">
-{`Browser (:3000)
-    │
-    ▼
-Nginx (反向代理 + 静态资源)
-    │
-    ├─ /api/* ────────── FastAPI Backend (:8000)
-    │                        │
-    │    ┌───────────────────┼───────────────────┐
-    │    │                   │                   │
-    │    ▼                   ▼                   ▼
-    │  Auth (JWT)        Chat (SSE)          RCA (Analysis)
-    │  Users CRUD        Jobs Proxy          Rules Engine
-    │  DataSources       History             Skills Cache
-    │
-    ├─ /api/* ────────── Hermes Agent (AI Engine)
-    │                        │
-    │    ┌───────────────────┼───────────────────┐
-    │    ▼                   ▼                   ▼
-    │  Chat Completions   Skills API        Jobs API
-    │  (stream/non)       Toolsets API      Cron Scheduler
-    │
-    ├─ PostgreSQL 16 ──── Primary Data Store
-    └─ Redis 7 ────────── Cache / Session Store`}
+        <pre className="text-[10px] font-mono bg-surface-secondary rounded-lg p-4 overflow-x-auto text-text-secondary leading-relaxed">
+{`                     ┌──────────────────────────────┐
+                     │      Browser / Mobile        │
+                     │   React 19 · Tailwind CSS 4  │
+                     └─────────────┬────────────────┘
+                                   │ HTTP (:3000)
+                                   ▼
+                     ┌──────────────────────────────┐
+                     │         Nginx (:3000)        │
+                     │   静态资源 + API 反向代理     │
+                     └─────────────┬────────────────┘
+                                   │ /api/*
+                                   ▼
+              ┌──────────────────────────────────────┐
+              │       FastAPI Backend (:8000)        │
+              │         Python 3.12 · async          │
+              ├──────┬──────┬───────┬───────┬───────┤
+              │ Auth │ Chat │  RCA  │ Rules │ Users │
+              │ JWT  │ SSE  │Engine │ Alert │  RBAC │
+              │LDAP  │Modes │Queue  │ CRUD  │ CRUD  │
+              ├──────┼──────┼───────┼───────┼───────┤
+              │ Jobs │History│ DS   │Skills │Config │
+              │Proxy │ Audit │Adapt. │ Cache │System │
+              └──┬───┴──┬───┴───────┴───────┴───────┘
+                 │      │
+       ┌─────────┘      └──────────┐
+       ▼                           ▼
+┌──────────────┐         ┌──────────────────┐
+│ PostgreSQL   │         │     Redis 7      │
+│   (主数据库)  │         │  (缓存/Session)  │
+└──────────────┘         └──────────────────┘
+                 │
+                 │ HTTP API
+                 ▼
+┌──────────────────────────────────────────────┐
+│           Hermes Agent (AI 引擎)              │
+│  Chat Completions · Skills · Toolsets        │
+│  Cron Jobs · SSE Streaming                  │
+│  Health: GET /health                        │
+└──────────────────────────────────────────────┘`}
         </pre>
       </CardContent></Card>
 

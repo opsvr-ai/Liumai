@@ -15,7 +15,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import AlertRule
+from app.auth import get_current_user, require_admin
+from app.models import AlertRule, User
 from app.models.database import get_db_session
 
 router = APIRouter()
@@ -92,6 +93,7 @@ async def list_rules(
     team_id: int | None = Query(None),
     enabled: bool | None = Query(None),
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> PaginatedRules:
     """List alert rules with pagination and optional filters."""
     query = select(AlertRule).order_by(AlertRule.created_at.desc())
@@ -137,6 +139,7 @@ async def list_rules(
 async def create_rule(
     payload: RuleCreate,
     db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
 ) -> RuleResponse:
     """Create a new alert-rule configuration."""
     rule = AlertRule(
@@ -170,6 +173,7 @@ async def create_rule(
 async def get_rule(
     rule_id: int,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> RuleResponse:
     """Get a single alert rule by ID."""
     result = await db.execute(select(AlertRule).where(AlertRule.id == rule_id))
@@ -199,6 +203,7 @@ async def update_rule(
     rule_id: int,
     payload: RuleUpdate,
     db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
 ) -> RuleResponse:
     """Update an existing alert rule (partial update)."""
     result = await db.execute(select(AlertRule).where(AlertRule.id == rule_id))
@@ -248,6 +253,7 @@ async def update_rule(
 async def delete_rule(
     rule_id: int,
     db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
 ) -> Response:
     """Delete an alert rule."""
     result = await db.execute(select(AlertRule).where(AlertRule.id == rule_id))
@@ -268,6 +274,7 @@ async def delete_rule(
 async def toggle_rule(
     rule_id: int,
     db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
 ) -> RuleResponse:
     """Toggle the enabled/disabled state of an alert rule."""
     result = await db.execute(select(AlertRule).where(AlertRule.id == rule_id))

@@ -81,6 +81,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     logger.info("Shutting down 六脉 backend ...")
+    # Cancel background cache refresh task
+    _cache_task.cancel()
+    try:
+        await _cache_task
+    except asyncio.CancelledError:
+        pass
     await dispose_db()
 
 
@@ -93,7 +99,7 @@ app = FastAPI(
         "Provides alert ingestion, RCA orchestration, rule management, "
         "and audit-trail history."
     ),
-    version="0.1.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -103,9 +109,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,  # JWT via Authorization header — credentials not needed
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
 
@@ -121,13 +127,13 @@ async def health_check() -> dict[str, str | int]:
     return {
         "status": "ok",
         "service": "liumai-backend",
-        "version": "0.1.0",
+        "version": "0.3.0",
     }
 
 
 # ── Router registration ─────────────────────────────────────────────────────
 
-from app.routes import alerts, auth, chat, datasources, history, jobs, rca, rules, users  # noqa: E402
+from app.routes import alerts, auth, chat, datasources, history, jobs, knowledge, rca, rules, users  # noqa: E402
 
 app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
 app.include_router(rca.router, prefix="/api/rca", tags=["rca"])
@@ -138,6 +144,7 @@ app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(users.router, prefix="/api/users", tags=["users"])
 app.include_router(datasources.router, prefix="/api/datasources", tags=["datasources"])
 app.include_router(jobs.router, prefix="/api/jobs", tags=["jobs"])
+app.include_router(knowledge.router, prefix="/api/knowledge", tags=["knowledge"])
 
 
 # ── Static files (uploaded avatars) ─────────────────────────────────────────

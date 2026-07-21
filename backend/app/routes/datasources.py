@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import DataSource
+from app.auth import get_current_user, require_admin
+from app.models import DataSource, User
 from app.models.database import get_db_session
 
 router = APIRouter()
@@ -57,6 +58,7 @@ class DataSourceOut(BaseModel):
 async def list_sources(
     type_filter: str | None = Query(None, alias="type"),
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> list[DataSourceOut]:
     """List all configured data sources."""
     q = select(DataSource).order_by(DataSource.name)
@@ -70,6 +72,7 @@ async def list_sources(
 async def create_source(
     body: DataSourceCreate,
     db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
 ) -> DataSourceOut:
     """Register a new data source."""
     ds = DataSource(name=body.name, type=body.type, config=body.config)
@@ -84,6 +87,7 @@ async def create_source(
 async def get_source(
     source_id: int,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> DataSourceOut:
     """Get a single data source."""
     ds = await db.get(DataSource, source_id)
@@ -97,6 +101,7 @@ async def update_source(
     source_id: int,
     body: DataSourceUpdate,
     db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
 ) -> DataSourceOut:
     """Update a data source."""
     ds = await db.get(DataSource, source_id)
@@ -117,6 +122,7 @@ async def update_source(
 async def delete_source(
     source_id: int,
     db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
 ) -> Response:
     """Delete a data source."""
     ds = await db.get(DataSource, source_id)
@@ -131,6 +137,7 @@ async def delete_source(
 async def test_source(
     source_id: int,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Test connectivity to a data source using its type-specific adapter."""
     ds = await db.get(DataSource, source_id)
@@ -152,6 +159,7 @@ async def query_source(
     source_id: int,
     body: dict,
     db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
 ) -> dict:
     """Execute a query against a data source and return results.
 

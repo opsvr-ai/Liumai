@@ -13,7 +13,7 @@ interface AuthState {
   role: string | null;
   authType: string | null;
   login: (username: string, password: string) => Promise<void>;
-  setup: (username: string, password: string) => Promise<void>;
+  setup: (username: string, password: string, passwordConfirm: string) => Promise<void>;
   checkSetup: () => Promise<boolean>;
   logout: () => void;
   isAuthenticated: boolean;
@@ -22,7 +22,7 @@ interface AuthState {
 
 const AuthContext = createContext<AuthState>({
   token: null, username: null, role: null, authType: null,
-  login: async () => {}, setup: async () => {}, checkSetup: async () => false,
+  login: async () => {}, setup: async (_u, _p, _c) => {}, checkSetup: async () => false,
   logout: () => {},
   isAuthenticated: false, isAdmin: false,
 });
@@ -61,11 +61,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setAuthType(data.auth_type || null);
   }, []);
 
-  const setup = useCallback(async (user: string, password: string) => {
+  const setup = useCallback(async (user: string, password: string, passwordConfirm: string) => {
     const res = await fetch("/api/auth/setup", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: user, password }),
+      body: JSON.stringify({ username: user, password, password_confirm: passwordConfirm }),
     });
     if (!res.ok) {
       const msg = await res.text().catch(() => "初始化失败");

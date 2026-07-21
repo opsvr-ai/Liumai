@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Menu,
   Bell,
+  HelpCircle,
   LogOut,
   User,
 } from "lucide-react";
@@ -131,6 +132,21 @@ export function DashboardShell({
 
         {/* Spacer */}
         <div className="flex-1" />
+
+        {/* Help Center */}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghostMuted"
+              size="icon-sm"
+              onClick={() => navigate("/help")}
+              aria-label="帮助中心"
+            >
+              <HelpCircle className="h-4 w-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent><p>帮助中心</p></TooltipContent>
+        </Tooltip>
 
         {/* Active incident indicator */}
         {activeIncidentCount > 0 && (

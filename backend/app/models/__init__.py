@@ -377,11 +377,42 @@ class SystemConfig(Base):
         return f"<SystemConfig key={self.key!r} value={self.value[:40]!r}>"
 
 
+class KnowledgeDocument(Base):
+    """A document ingested into the llm-wiki v2 knowledge base.
+
+    Supports upload (user-provided files) and webhook (auto-ingested) sources.
+    Status flows: pending → processing → stored | failed.
+    """
+
+    __tablename__ = "knowledge_documents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(255), nullable=False)
+    source_type = Column(String(20), nullable=False, default="upload")
+    source_name = Column(String(100), nullable=True)
+    content = Column(Text, nullable=False, default="")
+    processed_content = Column(Text, nullable=True)
+    status = Column(String(20), nullable=False, default="pending")
+    hermes_session_id = Column(String(255), nullable=True)
+    knowledge_id = Column(String(255), nullable=True)
+    hit_count = Column(Integer, nullable=False, default=0)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<KnowledgeDocument id={self.id} title={self.title!r} status={self.status}>"
+
+
 class ChatMode(Base):
     """A conversation mode with its own system prompt and config.
 
-    Pre-seeded with 'default', 'rca', and 'knowledge' modes.  Admins can
-    edit the system_prompt through the settings UI.
+    Pre-seeded with 'general', 'default', 'rca', and 'knowledge' modes.
+    Admins can edit the system_prompt through the settings UI.
     """
 
     __tablename__ = "chat_modes"

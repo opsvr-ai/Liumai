@@ -29,8 +29,13 @@ if config.config_file_name is not None:
 from app.models import (  # noqa: F401
     AlertRule,
     Base,
+    ChatMessage,
+    ChatSession,
+    ChatMode,
     CollaborationEvent,
+    DataSource,
     RcaSession,
+    SystemConfig,
     Team,
     User,
 )

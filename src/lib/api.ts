@@ -27,6 +27,19 @@ async function request<T>(
 
   const res = await fetch(`${BASE}${path}`, { method, headers, body: bodyStr });
 
+  // Auto-redirect to login on 401 (expired / invalid token)
+  if (res.status === 401) {
+    localStorage.removeItem("liumai_token");
+    localStorage.removeItem("liumai_user");
+    localStorage.removeItem("liumai_role");
+    localStorage.removeItem("liumai_auth_type");
+    // Don't redirect if already on the login page
+    if (window.location.pathname !== "/login") {
+      window.location.href = "/login";
+    }
+    throw new Error("登录已过期，请重新登录");
+  }
+
   if (!res.ok) {
     const msg = await res.text().catch(() => res.statusText);
     throw new Error(msg || `${method} ${path} → ${res.status}`);
@@ -348,6 +361,12 @@ export const authApi = {
   generateWelcome(username: string) {
     return request<{ text: string }>("POST", "/auth/generate-welcome", { username });
   },
+  generateSetupPassword() {
+    return request<{ password: string; length: number }>("GET", "/auth/setup/generate-password");
+  },
+  getLlmConfig() {
+    return request<LlmConfig>("GET", "/auth/llm-config");
+  },
 };
 
 /* ── Data Sources ──────────────────────────────────── */
@@ -440,6 +459,94 @@ export const hermesDiscovery = {
   },
   health() {
     return request<{ ok: boolean; status_code: number; latency_ms: number }>("GET", "/chat/hermes-health");
+  },
+  listLlmModels() {
+    return request<Array<{ id: string; owned_by: string }>>("GET", "/chat/llm-models");
+  },
+};
+
+/* ── Knowledge Center ─────────────────────────────── */
+
+export interface KnowledgeDoc {
+  id: number;
+  title: string;
+  source_type: string;
+  source_name: string | null;
+  content: string;
+  processed_content: string | null;
+  status: string;
+  hermes_session_id: string | null;
+  knowledge_id: string | null;
+  hit_count: number;
+  error_message: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export interface KnowledgeStats {
+  total_docs: number;
+  stored_count: number;
+  failed_count: number;
+  total_hits: number;
+  webhook_sources: string[];
+}
+
+export interface KnowledgeTestResult {
+  hit: boolean;
+  question: string;
+  answer: string;
+  sources: string[];
+  confidence: number;
+}
+
+export const knowledgeApi = {
+  list(params?: { search?: string; status?: string; source_type?: string; page?: number; page_size?: number }) {
+    const qs = new URLSearchParams();
+    if (params?.search) qs.set("search", params.search);
+    if (params?.status) qs.set("status", params.status);
+    if (params?.source_type) qs.set("source_type", params.source_type);
+    if (params?.page) qs.set("page", String(params.page));
+    if (params?.page_size) qs.set("page_size", String(params.page_size));
+    const query = qs.toString();
+    return request<KnowledgeDoc[]>("GET", `/knowledge/documents${query ? `?${query}` : ""}`);
+  },
+  get(id: number) {
+    return request<KnowledgeDoc>("GET", `/knowledge/documents/${id}`);
+  },
+  uploadText(title: string, content: string) {
+    return request<KnowledgeDoc>("POST", "/knowledge/documents", { title, content });
+  },
+  uploadFile(file: File) {
+    const form = new FormData();
+    form.append("file", file);
+    const tok = localStorage.getItem("liumai_token");
+    const headers: Record<string, string> = {};
+    if (tok) headers["Authorization"] = `Bearer ${tok}`;
+    return fetch("/api/knowledge/documents", { method: "POST", headers, body: form }).then((r) => {
+      if (!r.ok) return r.text().then((msg) => { throw new Error(msg); });
+      return r.json() as Promise<KnowledgeDoc>;
+    });
+  },
+  delete(id: number) {
+    return request<void>("DELETE", `/knowledge/documents/${id}`);
+  },
+  ingest(id: number) {
+    return request<{ ok: boolean; status: string; hermes_session_id?: string; message: string }>("POST", `/knowledge/documents/${id}/ingest`);
+  },
+  test(question: string) {
+    return request<KnowledgeTestResult>("POST", "/knowledge/test", { question });
+  },
+  feedback(question: string, hit: boolean) {
+    return request<{ ok: boolean }>("POST", "/knowledge/feedback", { question, hit });
+  },
+  stats() {
+    return request<KnowledgeStats>("GET", "/knowledge/stats");
+  },
+  webhooks() {
+    return request<Array<{ source: string; doc_count: number }>>("GET", "/knowledge/webhooks");
+  },
+  deleteWebhook(source: string) {
+    return request<void>("DELETE", `/knowledge/webhooks/${source}`);
   },
 };
 

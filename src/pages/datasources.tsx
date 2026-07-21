@@ -57,7 +57,7 @@ export default function DataSourcesPage() {
   const [editing, setEditing] = useState<DataSourceOut | null>(null);
   const [formType, setFormType] = useState("prometheus");
   const [formName, setFormName] = useState("");
-  const [formConfig, setFormConfig] = useState<Record<string, string>>({});
+  const [formConfig, setFormConfig] = useState<Record<string, unknown>>({});
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState<number | null>(null);
 
@@ -116,7 +116,7 @@ export default function DataSourcesPage() {
         }
       }
     }
-    setFormConfig(cfg as Record<string, string>);
+    setFormConfig(cfg);
     setHeaderRows(hdrs.length > 0 ? hdrs : [{ key: "", value: "" }]);
     setBodyType(bt);
     setBodyContent(bc);
@@ -373,9 +373,10 @@ export default function DataSourcesPage() {
               {(["prometheus", "zabbix", "kafka", "api"] as const).includes(formType as any) && (
                 <>
                   <select className="w-full h-9 rounded-lg border border-border bg-surface-secondary px-3 text-sm mb-2"
-                    value={(formConfig as any).auth?.type ?? "none"}
+                    value={(formConfig.auth as Record<string, unknown> | undefined)?.type as string ?? "none"}
                     onChange={(e) => {
-                      setFormConfig((p) => ({ ...p, auth: { ...(p as any).auth, type: e.target.value } }));
+                      const prev = (formConfig.auth as Record<string, unknown>) || {};
+                      setFormConfig((p) => ({ ...p, auth: { ...prev, type: e.target.value } }));
                     }}>
                     <option value="none">无认证</option>
                     {formType !== "zabbix" && <option value="basic">Basic Auth</option>}

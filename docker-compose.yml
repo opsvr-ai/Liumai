@@ -26,10 +26,16 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./backend/migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-    ports:
-      - "${DB_PORT:-5432}:5432"
+    # DB port is NOT exposed to host by default — access via internal Docker network only.
+    # To expose for debugging, set DB_PORT=5432 in .env and uncomment the line below:
+    # ports:
+    #   - "${DB_PORT:-5432}:5432"
     networks:
       - liumai-net
+    deploy:
+      resources:
+        limits:
+          memory: 512M
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U liumai"]
       interval: 10s
@@ -43,12 +49,17 @@ services:
     image: redis:7-alpine
     container_name: liumai-redis
     restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-liumai_redis_secret}
     volumes:
       - redis_data:/data
     networks:
       - liumai-net
+    deploy:
+      resources:
+        limits:
+          memory: 256M
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-liumai_redis_secret}", "ping"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -64,11 +75,12 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql+asyncpg://liumai:${DB_PASSWORD:-liumai_dev}@postgres:5432/liumai
+      JWT_SECRET: ${JWT_SECRET:-liumai-dev-jwt-secret-change-in-production}
       # Hermes URL / API Key are configured via admin UI → 系统设置
       WECOM_CORP_ID: ${WECOM_CORP_ID:-}
       WECOM_CORP_SECRET: ${WECOM_CORP_SECRET:-}
       WECOM_AGENT_ID: ${WECOM_AGENT_ID:-}
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD:-liumai_redis_secret}@redis:6379/0
       RCA_MAX_CONCURRENCY: ${RCA_MAX_CONCURRENCY:-5}
     volumes:
       - ./hermes-skills:/opt/hermes-skills:ro
@@ -80,7 +92,11 @@ services:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
     extra_hosts:
       # host.docker.internal → host gateway (Linux Docker 20.10+)
       # Allows the backend to reach Hermes Gateway running on the host
@@ -101,6 +117,10 @@ services:
       - liumai-net
     depends_on:
       - backend
+    deploy:
+      resources:
+        limits:
+          memory: 128M
 
   # Hermes Gateway — install on host:
   #   curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash

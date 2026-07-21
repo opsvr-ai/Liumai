@@ -71,8 +71,15 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """Create all tables (for development / testing).
 
-    In production, use Alembic migrations instead.
+    In production, use Alembic migrations instead.  Set DEV_MODE=true in
+    the environment to enable this path; otherwise it is a no-op.
     """
+    import os
+
+    if os.environ.get("DEV_MODE", "").lower() not in ("1", "true", "yes"):
+        logger.info("DEV_MODE not set — skipping create_all (use Alembic migrations)")
+        return
+
     from app.models import (  # noqa: F401 — ensure models are registered
         AlertRule,
         ChatMessage,

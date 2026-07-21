@@ -23,16 +23,20 @@ import {
   PanelLeft,
   Clock,
   Upload,
+  FileText,
+  X,
   MessageCircle,
   Activity,
   BookOpen,
+  Sparkles,
+  ChevronDown,
 } from "lucide-react";
 import { useChat } from "@/hooks/useChat";
 import { ChatMessage } from "@/components/chat/ChatMessage";
 import { LiumaiLogo } from "@/components/liumai-logo";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import { chatHistory, chatModes, authApi, type ChatModeOut, type ChatSessionSummary } from "@/lib/api";
+import { chatHistory, chatModes, authApi, hermesDiscovery, type ChatModeOut, type ChatSessionSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 /* ── Relative time formatter ─────────────────────────────── */
@@ -67,11 +71,24 @@ export const ChatPanel: FC = () => {
   const [input, setInput] = useState("");
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const defaultWelcome = "可以问我关于系统状态、故障排查、指标分析等问题";
-  const [welcomeText, setWelcomeText] = useState(defaultWelcome);
+  const defaultWelcome = "你好！我是六脉智能运维助手。我可以帮你实时监控、追踪故障根因、分析历史数据、协调应急响应。随时向我提问，一起保障系统稳定运行。";
+  const [welcomeText, setWelcomeText] = useState("");       // start empty — no flash
+  const [welcomeLoading, setWelcomeLoading] = useState(true); // shimmer while waiting
   const [welcomeTyping, setWelcomeTyping] = useState(false);
   const welcomeIndexRef = useRef(0);
   const welcomeTargetRef = useRef(defaultWelcome);
+
+  const typewriterTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Clean up typewriter interval on unmount
+  useEffect(() => {
+    return () => {
+      if (typewriterTimerRef.current) {
+        clearInterval(typewriterTimerRef.current);
+        typewriterTimerRef.current = null;
+      }
+    };
+  }, []);
 
   // Typewriter — exposed as a stable callback
   const startTypewriter = useCallback((text: string) => {
@@ -81,12 +98,19 @@ export const ChatPanel: FC = () => {
     setWelcomeText("");
     setWelcomeTyping(true);
     const chars = [...text];
-    const timer = setInterval(() => {
+    // Clear any running timer before starting a new one
+    if (typewriterTimerRef.current) {
+      clearInterval(typewriterTimerRef.current);
+    }
+    typewriterTimerRef.current = setInterval(() => {
       welcomeIndexRef.current++;
       if (welcomeIndexRef.current <= chars.length) {
         setWelcomeText(chars.slice(0, welcomeIndexRef.current).join(""));
       } else {
-        clearInterval(timer);
+        if (typewriterTimerRef.current) {
+          clearInterval(typewriterTimerRef.current);
+          typewriterTimerRef.current = null;
+        }
         setWelcomeTyping(false);
       }
     }, 40);
@@ -95,13 +119,16 @@ export const ChatPanel: FC = () => {
   /* ── Mode icon map ────────────────────────────────── */
   const modeIcons: Record<string, typeof MessageCircle> = {
     default: MessageCircle,
+    general: Sparkles,
     rca: Activity,
     knowledge: BookOpen,
   };
 
   /* ── Mode state ───────────────────────────────────── */
   const [modes, setModes] = useState<ChatModeOut[]>([]);
-  const [activeMode, setActiveMode] = useState<string | null>(null);
+  const [activeMode, setActiveMode] = useState<string | null>("general");
+  const [availableModels, setAvailableModels] = useState<Array<{ id: string }>>([]);
+  const [selectedModel, setSelectedModel] = useState<string>("");
   const [rcaTimeStart, setRcaTimeStart] = useState("");
   const [rcaTimeEnd, setRcaTimeEnd] = useState("");
   const [rcaPreset, setRcaPreset] = useState("none");
@@ -162,14 +189,34 @@ export const ChatPanel: FC = () => {
   useEffect(() => { reloadSessions(); }, [reloadSessions]);
 
   // Fetch personalised welcome text (re-fetch on new session)
-  useEffect(() => {
+  const fetchWelcome = useCallback(() => {
+    setWelcomeLoading(true);
+    setWelcomeText("");
     const username = localStorage.getItem("liumai_user") || "用户";
-    authApi.generateWelcome(username).then((r) => startTypewriter(r.text)).catch(() => {});
-  }, [startTypewriter]);
+    authApi.generateWelcome(username)
+      .then((r) => { startTypewriter(r.text); })
+      .catch(() => {
+        // AI unavailable — use the (richer) default text directly, no typewriter
+        setWelcomeText(defaultWelcome);
+      })
+      .finally(() => setWelcomeLoading(false));
+  }, [startTypewriter, defaultWelcome]);
+
+  useEffect(() => { fetchWelcome(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Load modes
   useEffect(() => {
     chatModes.list().then(setModes).catch(() => {});
+  }, []);
+
+  // Load available LLM models + default model
+  useEffect(() => {
+    hermesDiscovery.listLlmModels().then((models) => {
+      setAvailableModels(models);
+    }).catch(() => {});
+    authApi.getLlmConfig().then((cfg) => {
+      if (cfg.model) setSelectedModel(cfg.model);
+    }).catch(() => {});
   }, []);
 
   // Auto-scroll to bottom
@@ -190,8 +237,8 @@ export const ChatPanel: FC = () => {
     if (!input.trim() || isStreaming) return;
     let text = input;
     setInput("");
-    // Knowledge QA: inline attached document content
-    if (activeMode === "knowledge" && attachedContent) {
+    // General mode: inline attached document content
+    if (activeMode === "general" && attachedContent) {
       const fileName = attachedFile?.name ?? "文档";
       text = `[上传文档: ${fileName}]\n\n${attachedContent}\n\n[用户问题]\n${text}`;
       clearAttachment();
@@ -202,6 +249,7 @@ export const ChatPanel: FC = () => {
       mode: activeMode ?? undefined,
       timeWindowStart: twStart,
       timeWindowEnd: twEnd,
+      model: activeMode === "general" ? (selectedModel || undefined) : undefined,
     });
   }, [input, isStreaming, sendMessage, activeMode, rcaTimeStart, rcaTimeEnd, attachedContent, attachedFile, clearAttachment]);
 
@@ -246,9 +294,8 @@ export const ChatPanel: FC = () => {
   const handleNewSession = useCallback(() => {
     clearMessages();
     setActiveMode(null);
-    const username = localStorage.getItem("liumai_user") || "用户";
-    authApi.generateWelcome(username).then((r) => startTypewriter(r.text)).catch(() => {});
-  }, [clearMessages, startTypewriter]);
+    fetchWelcome();
+  }, [clearMessages, fetchWelcome]);
 
   const handleLoadSession = useCallback(
     async (id: number) => {
@@ -398,14 +445,54 @@ export const ChatPanel: FC = () => {
             {/* Welcome — logo + tagline centered above input */}
             {messages.length === 0 && (
               <div className="flex flex-col items-center text-center pb-1">
-                <LiumaiLogo size={48} className="text-interactive-primary mb-4" />
-                <h2 className="text-lg font-semibold text-text-primary mb-1">运维智能助手</h2>
-                <p className="text-sm text-muted-foreground min-h-[20px]">
-                  {welcomeText}
-                  {welcomeTyping && (
-                    <span className="inline-block w-0.5 h-4 bg-interactive-primary ml-0.5 align-middle animate-pulse" />
+                {/* Logo with pulsing glow ring */}
+                <div className="relative mb-5">
+                  <div className="absolute inset-0 rounded-full bg-interactive-primary/20 blur-2xl scale-150 animate-pulse" />
+                  <div className="absolute -inset-2 rounded-full border border-interactive-primary/20 animate-ping [animation-duration:3s]" />
+                  <LiumaiLogo size={48} className="text-interactive-primary relative" />
+                </div>
+
+                {/* Gradient title */}
+                <h2 className="text-[22px] font-bold bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 bg-clip-text text-transparent mb-2">
+                  运维智能助手
+                </h2>
+
+                {/* Welcome text area */}
+                <div className="min-h-[60px] max-w-[420px] mb-3">
+                  {welcomeLoading ? (
+                    /* ── Shimmer loading ──────────────────── */
+                    <div className="space-y-2">
+                      <div className="h-3.5 bg-gradient-to-r from-muted-foreground/10 via-muted-foreground/20 to-muted-foreground/10 rounded-full w-64 mx-auto animate-pulse bg-[length:200%_100%]" />
+                      <div className="h-3.5 bg-gradient-to-r from-muted-foreground/10 via-muted-foreground/20 to-muted-foreground/10 rounded-full w-48 mx-auto animate-pulse bg-[length:200%_100%]" />
+                      <p className="text-[11px] text-muted-foreground/50 mt-1">
+                        <span className="inline-block animate-bounce [animation-delay:0ms]">●</span>
+                        <span className="inline-block animate-bounce [animation-delay:150ms] ml-1">●</span>
+                        <span className="inline-block animate-bounce [animation-delay:300ms] ml-1">●</span>
+                      </p>
+                    </div>
+                  ) : (
+                    /* ── Welcome text (typewriter or fallback) ── */
+                    <p className="text-[13px] leading-relaxed text-muted-foreground">
+                      {welcomeText}
+                      {welcomeTyping && (
+                        <span className="inline-block w-0.5 h-4 bg-interactive-primary ml-0.5 align-middle animate-pulse" />
+                      )}
+                    </p>
                   )}
-                </p>
+                </div>
+
+                {/* Quick suggestion hints */}
+                {!welcomeLoading && (
+                  <div className="flex flex-wrap justify-center gap-1.5">
+                    {["系统健康检查", "最近告警分析", "帮我排查故障"].map((hint) => (
+                      <button key={hint} type="button"
+                        onClick={() => { setInput(hint); }}
+                        className="text-[11px] px-2.5 py-1 rounded-full border border-border/60 text-muted-foreground hover:text-text-primary hover:border-interactive-primary/30 hover:bg-interactive-primary/5 transition-all duration-200">
+                        {hint}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 
@@ -416,7 +503,7 @@ export const ChatPanel: FC = () => {
                 <div className="flex items-center gap-1 px-2.5 py-2">
                   {modes.map((m) => {
                     const Icon = modeIcons[m.slug] || MessageCircle;
-                    const isActive = activeMode === m.slug || (!activeMode && m.slug === "default");
+                    const isActive = activeMode === m.slug || (!activeMode && m.slug === "general");
                     return (
                       <button
                         key={m.slug}
@@ -440,19 +527,7 @@ export const ChatPanel: FC = () => {
                 </div>
               )}
 
-              {/* Mode extensions */}
-              {activeMode === "knowledge" && (
-                <div className="px-4 py-2 flex items-center gap-2 border-t border-border/30">
-                  <input ref={fileInputRef} type="file" onChange={handleFileSelect} className="hidden" accept=".pdf,.docx,.pptx,.xlsx,.xls,.epub,.html,.csv,.json,.xml,.ipynb,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.zip,.txt,.md,.py,.js,.ts,.log,.sql,.yaml,.yml,.ini,.cfg,.css,.rss" />
-                  <Button variant={attachedFile ? "default" : "outline"} size="sm" onClick={() => fileInputRef.current?.click()} disabled={converting}>
-                    {converting ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Upload className="h-3.5 w-3.5 mr-1" />}
-                    {converting ? "转换中…" : attachedFile ? attachedFile.name : "上传文档"}
-                  </Button>
-                  {attachedFile && !converting && <button type="button" onClick={clearAttachment} className="text-xs text-muted-foreground hover:text-status-active">移除</button>}
-                  <span className="text-[11px] text-muted-foreground">支持 PDF/Word/Excel/PPT/图片/代码 等</span>
-                </div>
-              )}
-              {activeMode === "rca" && (
+{activeMode === "rca" && (
                 <div className="px-4 py-2 flex flex-wrap items-center gap-2 border-t border-border/30">
                   <Clock className="h-3.5 w-3.5 text-muted-foreground" />
                   {[["none","自定义"],["15m","15分钟"],["1h","1小时"],["4h","4小时"],["24h","24小时"]].map(([val, label]) => (
@@ -462,29 +537,71 @@ export const ChatPanel: FC = () => {
                 </div>
               )}
 
-              {/* Textarea */}
-              <div className={cn("relative flex items-end", (activeMode === "knowledge" || activeMode === "rca") && "border-t border-border/30")}>
+              {/* Textarea with bottom bar */}
+              <div className={cn("relative flex flex-col", (activeMode === "knowledge" || activeMode === "rca") && "border-t border-border/30")}>
                 <textarea
                   ref={textareaRef}
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder={isStreaming ? "等待回复中…" : "输入消息，Enter 发送，Shift+Enter 换行"}
+                  placeholder={
+                    isStreaming ? "等待回复中…"
+                    : activeMode === "general" ? "通用模型智能问答，支持多格式文档上传… Enter 发送，Shift+Enter 换行"
+                    : activeMode === "default" ? "智能运维助理，具备工具调用与自主执行能力… Enter 发送，Shift+Enter 换行"
+                    : activeMode === "knowledge" ? "遵循 LLM-WIKI V2 协议，从知识库进行知识检索与问答… Enter 发送，Shift+Enter 换行"
+                    : activeMode === "rca" ? "故障根因分析，输入服务名称和时间窗口… Enter 发送，Shift+Enter 换行"
+                    : "输入消息，Enter 发送，Shift+Enter 换行"
+                  }
                   disabled={isStreaming}
                   rows={1}
                   className="w-full bg-transparent pl-5 pr-12 py-3 text-sm text-text-primary placeholder:text-muted-foreground/50 disabled:opacity-50 resize-none leading-relaxed outline-none"
-                  style={{ minHeight: "56px" }}
+                  style={{ minHeight: "48px" }}
                   aria-label="聊天输入"
                 />
-                <Button
-                  size="icon"
-                  onClick={handleSend}
-                  disabled={!input.trim() || isStreaming}
-                  className="absolute right-2 bottom-2 rounded-xl h-8 w-8 shrink-0"
-                  aria-label={isStreaming ? "发送中…" : "发送"}
-                >
-                  {isStreaming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                </Button>
+
+                {/* Bottom bar: file upload (left) + attached file name + model dropdown (right) + send */}
+                <div className="flex items-center justify-between px-3 pb-2.5 gap-2">
+                  {/* Left: file upload (general mode only) */}
+                  <div className="flex items-center gap-1.5">
+                    {activeMode === "general" && (
+                      <>
+                        <input ref={fileInputRef} type="file" onChange={handleFileSelect} className="hidden"
+                          accept=".pdf,.docx,.pptx,.xlsx,.xls,.epub,.html,.csv,.json,.xml,.ipynb,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.zip,.txt,.md,.py,.js,.ts,.log,.sql,.yaml,.yml,.ini,.cfg,.css,.rss" />
+                        <button type="button" onClick={() => fileInputRef.current?.click()} disabled={converting}
+                          className="flex items-center justify-center h-7 w-7 rounded-lg border border-border/60 text-muted-foreground hover:text-text-primary hover:border-interactive-primary/30 hover:bg-interactive-primary/5 transition-all disabled:opacity-50"
+                          title="上传文档">
+                          {converting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-4 w-4" />}
+                        </button>
+                        {attachedFile && !converting && (
+                          <span className="text-[11px] text-muted-foreground truncate max-w-[140px] flex items-center gap-1">
+                            <FileText className="h-3 w-3 shrink-0" />
+                            {attachedFile.name}
+                            <button type="button" onClick={clearAttachment} className="text-muted-foreground hover:text-status-active"><X className="h-3 w-3" /></button>
+                          </span>
+                        )}
+                      </>
+                    )}
+                  </div>
+
+                  {/* Right: model dropdown + send */}
+                  <div className="flex items-center gap-1.5">
+                    {activeMode === "general" && availableModels.length > 0 && (
+                      <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)}
+                        className="h-7 rounded-lg border border-border/60 bg-surface-primary/60 px-2 text-[11px] text-text-secondary focus:outline-none focus:ring-2 focus:ring-interactive-primary/25 cursor-pointer max-w-[140px] truncate">
+                        {availableModels.map((m) => (
+                          <option key={m.id} value={m.id}>{m.id}</option>
+                        ))}
+                      </select>
+                    )}
+                    <Button size="icon" onClick={handleSend}
+                      disabled={!input.trim() || isStreaming}
+                      className="rounded-xl h-8 w-8 shrink-0"
+                      aria-label={isStreaming ? "发送中…" : "发送"}
+                    >
+                      {isStreaming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
+                    </Button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>

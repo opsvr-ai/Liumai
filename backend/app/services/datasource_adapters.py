@@ -328,7 +328,12 @@ class APIAdapter(BaseAdapter):
             return False, f"连接失败: {exc}"
 
     async def execute_query(self, query: str, params: dict | None = None) -> QueryResult:
-        url = query or self._url()  # query override or default
+        # NEVER allow query string to override the configured URL (SSRF prevention).
+        # The query param is used as a JSONPath expression for data extraction,
+        # NOT as a URL override.
+        url = self._url()
+        if not url:
+            raise ValueError("API data source URL is not configured")
         async with self._http_client() as c:
             r = await c.request(
                 self._method(),
