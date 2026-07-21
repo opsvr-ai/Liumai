@@ -543,12 +543,60 @@ export const knowledgeApi = {
     return request<KnowledgeStats>("GET", "/knowledge/stats");
   },
   webhooks() {
-    return request<Array<{ source: string; doc_count: number }>>("GET", "/knowledge/webhooks");
+    return request<Array<{ source: string; registered: boolean; doc_count: number; total_requests: number; last_request: string | null }>>("GET", "/knowledge/webhooks");
+  },
+  registerWebhook(source: string) {
+    return request<{ ok: boolean; source: string }>("POST", "/knowledge/webhooks/register", { source });
   },
   deleteWebhook(source: string) {
     return request<void>("DELETE", `/knowledge/webhooks/${source}`);
   },
+  /* Distillation */
+  triggerDistill(params?: { session_ids?: number[]; limit?: number; min_score?: number }) {
+    return request<{ sessions_scanned: number; knowledge_extracted: number }>("POST", "/knowledge/distill/trigger", params || {});
+  },
+  listDistilled(params?: { status?: string; category?: string; min_score?: number }) {
+    const qs = new URLSearchParams();
+    if (params?.status) qs.set("status", params.status);
+    if (params?.category) qs.set("category", params.category);
+    if (params?.min_score !== undefined) qs.set("min_score", String(params.min_score));
+    const query = qs.toString();
+    return request<KnowledgeDoc[]>("GET", `/knowledge/distill/candidates${query ? `?${query}` : ""}`)
+      .then(r => r as unknown as DistilledKnowledgeOut[]);
+  },
+  reviewDistilled(id: number, action: "approve" | "reject", edits?: { title?: string; content?: string; score?: number }) {
+    return request<DistilledKnowledgeOut>("POST", `/knowledge/distill/${id}/review`, { action, ...edits });
+  },
+  distillStats() {
+    return request<{ total_candidates: number; approved_count: number; rejected_count: number; avg_score: number; top_categories: Array<{ category: string; count: number }> }>("GET", "/knowledge/distill/stats");
+  },
+  distillConfig() {
+    return request<{ auto_enabled: boolean; interval_secs: number }>("GET", "/knowledge/distill/config");
+  },
+  setDistillConfig(data: { auto_enabled: boolean; interval_secs: number }) {
+    return request<{ auto_enabled: boolean; interval_secs: number }>("PUT", "/knowledge/distill/config", data);
+  },
+  distillQueue() {
+    return request<{ queue_count: number; total_sessions: number; processed: number }>("GET", "/knowledge/distill/queue");
+  },
 };
+
+export interface DistilledKnowledgeOut {
+  id: number;
+  title: string;
+  content: string;
+  category: string | null;
+  tags: string[];
+  source_type: string;
+  source_ids: number[];
+  score: number;
+  score_details: Record<string, number>;
+  status: string;
+  reviewer_id: number | null;
+  knowledge_id: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
 
 /* ── Users ────────────────────────────────────────── */
 

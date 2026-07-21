@@ -9,10 +9,12 @@ from __future__ import annotations
 import enum
 
 from sqlalchemy import (
+    ARRAY,
     Boolean,
     Column,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -309,6 +311,7 @@ class ChatSession(Base):
         index=True,
     )
     mode_slug = Column(String(50), nullable=True, default=None)
+    distillation_status = Column(String(20), nullable=True, default=None)
     title = Column(String(255), nullable=False, default="新对话")
     created_at = Column(
         DateTime(timezone=True),
@@ -406,6 +409,41 @@ class KnowledgeDocument(Base):
 
     def __repr__(self) -> str:
         return f"<KnowledgeDocument id={self.id} title={self.title!r} status={self.status}>"
+
+
+class DistilledKnowledge(Base):
+    """Knowledge extracted from conversations via LLM distillation.
+
+    Scored on 5 dimensions: source quality, utility, freshness, feedback hits,
+    and structural quality.  High-scoring items are auto-ingested into the
+    llm-wiki v2 knowledge base.
+    """
+
+    __tablename__ = "distilled_knowledge"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(255), nullable=False)
+    content = Column(Text, nullable=False, default="")
+    category = Column(String(50), nullable=True)
+    tags = Column(ARRAY(String), nullable=True)
+    source_type = Column(String(20), nullable=False, default="chat")
+    source_ids = Column(ARRAY(Integer), nullable=True)
+    score = Column(Float, nullable=False, default=0.0)
+    score_details = Column(JSONB, nullable=True, default=dict)
+    status = Column(String(20), nullable=False, default="candidate")
+    reviewer_id = Column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True,
+    )
+    knowledge_id = Column(String(255), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<DistilledKnowledge id={self.id} title={self.title!r} score={self.score}>"
 
 
 class ChatMode(Base):

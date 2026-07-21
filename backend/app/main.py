@@ -53,6 +53,46 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     _cache_task = asyncio.create_task(_skills_cache_loop())
 
+    # Background task: auto-distill knowledge from chat history periodically
+    from app.services.distiller import Distiller
+
+    async def _auto_distill_loop():
+        await asyncio.sleep(60)  # initial delay after startup
+        while True:
+            try:
+                from app.models.database import async_session_factory
+                from sqlalchemy import select
+
+                async with async_session_factory() as sess:
+                    # Check if auto-distill is enabled
+                    row = await sess.execute(
+                        select(SystemConfig).where(SystemConfig.key == "distill_auto_enabled")
+                    )
+                    enabled = row.scalar_one_or_none()
+                    if enabled and enabled.value == "true":
+                        distiller = Distiller(sess)
+                        result = await distiller.run(limit=10, min_score=70, auto_store=True)
+                        if result["knowledge_extracted"] > 0:
+                            logger.info("Auto-distill: {} new knowledge", result["knowledge_extracted"])
+            except Exception:
+                logger.exception("Auto-distill loop error")
+
+            # Read interval from config (default: 3600s = 1 hour)
+            interval = 3600
+            try:
+                async with async_session_factory() as sess:
+                    row = await sess.execute(
+                        select(SystemConfig).where(SystemConfig.key == "distill_interval_secs")
+                    )
+                    r = row.scalar_one_or_none()
+                    if r and r.value.isdigit():
+                        interval = max(300, int(r.value))  # min 5 minutes
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+
+    _distill_task = asyncio.create_task(_auto_distill_loop())
+
     # Load persisted config from DB (fall back to env vars)
     try:
         from app.models import SystemConfig
@@ -81,12 +121,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     logger.info("Shutting down 六脉 backend ...")
-    # Cancel background cache refresh task
-    _cache_task.cancel()
-    try:
-        await _cache_task
-    except asyncio.CancelledError:
-        pass
+    # Cancel background tasks
+    for _task in (_cache_task, _distill_task):
+        _task.cancel()
+        try:
+            await _task
+        except asyncio.CancelledError:
+            pass
     await dispose_db()
 
 

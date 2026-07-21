@@ -201,7 +201,10 @@ INSERT INTO system_config (key, value) VALUES
     ('llm_api_key', ''),
     ('llm_model', ''),
     ('welcome_prompt', ''),
-    ('skills_refresh_secs', '300')
+    ('skills_refresh_secs', '300'),
+    ('distill_auto_enabled', 'false'),
+    ('distill_interval_secs', '3600'),
+    ('webhook_registered', '[]')
 ON CONFLICT (key) DO NOTHING;
 
 -- ═══════════════════════════════════════════════════════════════════════════════
@@ -236,6 +239,8 @@ INSERT INTO chat_modes (slug, name, system_prompt, config, enabled) VALUES
 ON CONFLICT (slug) DO NOTHING;
 
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS mode_slug VARCHAR(50);
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS distillation_status VARCHAR(20);
+CREATE INDEX IF NOT EXISTS idx_cs_distill_status ON chat_sessions(distillation_status);
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- Data sources — external monitoring/telemetry connections
@@ -291,3 +296,43 @@ CREATE INDEX IF NOT EXISTS idx_kd_type_name ON knowledge_documents(source_type, 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE INDEX IF NOT EXISTS idx_kd_title_trgm ON knowledge_documents USING gin (title gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_kd_content_trgm ON knowledge_documents USING gin (content gin_trgm_ops);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Webhook request logs — monitoring for knowledge center webhooks
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS webhook_logs (
+    id          SERIAL PRIMARY KEY,
+    source      VARCHAR(100) NOT NULL,
+    payload     JSONB        DEFAULT '{}'::jsonb,
+    status      VARCHAR(20)  NOT NULL DEFAULT 'received',
+    doc_id      INTEGER,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_wl_source ON webhook_logs(source);
+CREATE INDEX IF NOT EXISTS idx_wl_created ON webhook_logs(created_at DESC);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Knowledge Distillation — auto-extracted knowledge from conversations
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS distilled_knowledge (
+    id              SERIAL PRIMARY KEY,
+    title           VARCHAR(255) NOT NULL,
+    content         TEXT         NOT NULL DEFAULT '',
+    category        VARCHAR(50),
+    tags            TEXT[],
+    source_type     VARCHAR(20)  NOT NULL DEFAULT 'chat',
+    source_ids      INTEGER[],
+    score           REAL         NOT NULL DEFAULT 0,
+    score_details   JSONB        DEFAULT '{}'::jsonb,
+    status          VARCHAR(20)  NOT NULL DEFAULT 'candidate',
+    reviewer_id     INTEGER      REFERENCES users(id) ON DELETE SET NULL,
+    knowledge_id    VARCHAR(255),
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dk_status ON distilled_knowledge(status);
+CREATE INDEX IF NOT EXISTS idx_dk_score ON distilled_knowledge(score DESC);
+CREATE INDEX IF NOT EXISTS idx_dk_category ON distilled_knowledge(category);
+CREATE INDEX IF NOT EXISTS idx_dk_source_type ON distilled_knowledge(source_type);

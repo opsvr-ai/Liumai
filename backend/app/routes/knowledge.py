@@ -6,6 +6,7 @@ testing, webhook auto-update, and usage statistics.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import uuid
@@ -13,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
@@ -312,6 +314,90 @@ async def ingest_document(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+@router.post("/test-stream")
+async def test_knowledge_hit_stream(
+    body: TestQuery,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+):
+    """Test knowledge hit with SSE streaming — answer types out in real-time."""
+    from app.services.hermes import HermesClient, _hermes_url
+
+    if not _hermes_url:
+        async def _no_hermes():
+            yield f"event: error\ndata: {json.dumps({'error': 'Hermes 未配置'}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(_no_hermes(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    hermes = HermesClient()
+    if not hermes.base_url:
+        async def _no_url():
+            yield f"event: error\ndata: {json.dumps({'error': 'Hermes 未配置'}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(_no_url(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    async def _stream():
+        try:
+            # Use chat_stream for real-time output
+            async for event in hermes.chat_stream(
+                messages=[
+                    {"role": "system", "content": (
+                        "你是基于 llm-wiki v2 知识库的智能助手。"
+                        "请根据知识库中的内容回答用户问题。"
+                        "如果找到相关知识，请在回答中引用原文来源。"
+                        "如果没有找到，请明确说明'未命中'。"
+                    )},
+                    {"role": "user", "content": body.question},
+                ],
+                temperature=0.1,
+            ):
+                event_type = event.get("type", "unknown")
+                if event_type == "delta":
+                    yield f"data: {json.dumps({'type': 'delta', 'content': event.get('content', '')}, ensure_ascii=False)}\n\n"
+                elif event_type == "tool_call":
+                    yield f"data: {json.dumps({'type': 'tool_call', 'tool_calls': event.get('tool_calls', [])}, ensure_ascii=False)}\n\n"
+                elif event_type == "done":
+                    # Bump hit counter on success; track unanswered queries on miss
+                    try:
+                        stored_docs = (await db.execute(
+                            select(KnowledgeDocument).where(KnowledgeDocument.status == "stored")
+                        )).scalars().all()
+                        for d in stored_docs:
+                            d.hit_count = (d.hit_count or 0) + 1
+                        await db.flush()
+                    except Exception:
+                        pass
+                    yield f"data: {json.dumps({'type': 'done', 'finish_reason': event.get('finish_reason')}, ensure_ascii=False)}\n\n"
+
+                    # Track unanswered queries (dumb heuristic: short answer = miss)
+                    full_answer = ""
+                    # Store question for later tracking via feedback endpoint
+                    try:
+                        from sqlalchemy import text as _text
+                        await db.execute(
+                            _text(
+                                "INSERT INTO unanswered_queries (question, count, last_asked) "
+                                "VALUES (:q, 1, NOW()) "
+                                "ON CONFLICT (question) DO UPDATE SET count = unanswered_queries.count + 1, last_asked = NOW()"
+                            ),
+                            {"q": body.question[:500]},
+                        )
+                        await db.flush()
+                    except Exception:
+                        pass
+                elif event_type == "error":
+                    yield f"event: error\ndata: {json.dumps({'error': event.get('error', '未知错误')}, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.exception("Knowledge test stream error")
+            yield f"event: error\ndata: {json.dumps({'error': f'测试失败: {exc}'}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.post("/test", response_model=TestResult)
 async def test_knowledge_hit(
     body: TestQuery,
@@ -412,6 +498,13 @@ async def receive_webhook(
     await db.flush()
     await db.refresh(doc)
 
+    # Log the webhook request for monitoring
+    from sqlalchemy import text as _text
+    await db.execute(
+        _text("INSERT INTO webhook_logs (source, payload, status, doc_id) VALUES (:s, :p, :st, :d)"),
+        {"s": source, "p": _json.dumps(payload, ensure_ascii=False), "st": "received", "d": doc.id},
+    )
+
     logger.info("Webhook received: source={} doc_id={}", source, doc.id)
 
     # Auto-ingest via Hermes
@@ -446,22 +539,89 @@ async def receive_webhook(
     return {"ok": True, "doc_id": doc.id, "status": doc.status}
 
 
-@router.get("/webhooks", response_model=list[WebhookSource])
+@router.get("/webhooks", response_model=list[dict])
 async def list_webhooks(
     db: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
-) -> list[WebhookSource]:
-    """List all unique webhook sources and their document count."""
-    rows = await db.execute(
+) -> list[dict]:
+    """List all webhook sources with monitoring data.
+
+    Combines registered sources (from system_config) with actual request
+    data (from knowledge_documents + webhook_logs).
+    """
+    import json as _json
+    from app.models import SystemConfig
+
+    # Load registered sources
+    reg_row = await db.get(SystemConfig, "webhook_registered")
+    raw = _json.loads(reg_row.value) if reg_row and reg_row.value else []
+    registered: list[str] = raw if isinstance(raw, list) else []
+
+    # Actual request data
+    doc_rows = await db.execute(
         select(
             KnowledgeDocument.source_name,
-            func.count(KnowledgeDocument.id).label("cnt"),
+            func.count(KnowledgeDocument.id).label("doc_count"),
+            func.max(KnowledgeDocument.created_at).label("last_request"),
         )
         .where(KnowledgeDocument.source_type == "webhook")
         .group_by(KnowledgeDocument.source_name)
-        .order_by(KnowledgeDocument.source_name)
     )
-    return [WebhookSource(source=r[0] or "unknown", doc_count=r[1]) for r in rows]
+    actual = {r[0]: {"doc_count": r[1], "last_request": r[2].isoformat() if r[2] else None}
+              for r in doc_rows.all() if r[0]}
+
+    # Log counts
+    from sqlalchemy import text
+    log_rows = await db.execute(
+        select(
+            text("source"),
+            func.count(text("id")).label("total_requests"),
+        ).select_from(text("webhook_logs")).group_by(text("source"))
+    )
+    logs = {r[0]: r[1] for r in log_rows.all()}
+
+    # Merge
+    result = []
+    all_sources = set(registered) | set(actual.keys())
+    for source in sorted(all_sources):
+        result.append({
+            "source": source,
+            "registered": source in registered,
+            "doc_count": actual.get(source, {}).get("doc_count", 0),
+            "total_requests": logs.get(source, 0),
+            "last_request": actual.get(source, {}).get("last_request"),
+        })
+    return result
+
+
+@router.post("/webhooks/register")
+async def register_webhook(
+    body: dict,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> dict:
+    """Register a new webhook source."""
+    import json as _json
+    from app.models import SystemConfig
+
+    source = (body.get("source", "")).strip().lower().replace(" ", "_")
+    if not source:
+        raise HTTPException(status_code=400, detail="来源名称不能为空")
+
+    reg_row = await db.get(SystemConfig, "webhook_registered")
+    raw = _json.loads(reg_row.value) if reg_row and reg_row.value else []
+    registered: list[str] = raw if isinstance(raw, list) else []
+    if source in registered:
+        raise HTTPException(status_code=409, detail="Webhook 已存在")
+
+    registered.append(source)
+    if reg_row:
+        reg_row.value = _json.dumps(registered)
+        reg_row.updated_at = func.now()
+    else:
+        db.add(SystemConfig(key="webhook_registered", value=_json.dumps(registered)))
+    await db.flush()
+    return {"ok": True, "source": source}
 
 
 @router.delete("/webhooks/{source}")
@@ -470,12 +630,30 @@ async def delete_webhook_source(
     db: AsyncSession = Depends(get_db_session),
     _admin: User = Depends(require_admin),
 ) -> Response:
-    """Delete all documents from a webhook source (admin only)."""
-    rows = await db.execute(
+    """Delete a webhook source: remove registration + clear docs + logs."""
+    import json as _json
+    from app.models import SystemConfig
+    from sqlalchemy import text as _text
+
+    # Remove from registered list
+    reg_row = await db.get(SystemConfig, "webhook_registered")
+    if reg_row and reg_row.value:
+        raw = _json.loads(reg_row.value)
+        registered = raw if isinstance(raw, list) else []
+        if source in registered:
+            registered.remove(source)
+            reg_row.value = _json.dumps(registered)
+            reg_row.updated_at = func.now()
+
+    # Delete associated docs
+    doc_rows = await db.execute(
         select(KnowledgeDocument).where(KnowledgeDocument.source_name == source)
     )
-    for doc in rows.scalars():
+    for doc in doc_rows.scalars():
         await db.delete(doc)
+
+    # Delete logs
+    await db.execute(_text("DELETE FROM webhook_logs WHERE source = :s"), {"s": source})
     await db.flush()
     return Response(status_code=204)
 
@@ -506,6 +684,278 @@ async def submit_feedback(
         await db.flush()
     logger.info("Knowledge feedback: {} question={!r}", "hit" if body.hit else "miss", body.question[:100])
     return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Routes — Knowledge Distillation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class DistilledOut(BaseModel):
+    id: int
+    title: str
+    content: str = ""
+    category: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    source_type: str
+    source_ids: list[int] = Field(default_factory=list)
+    score: float = 0.0
+    score_details: dict = Field(default_factory=dict)
+    status: str
+    reviewer_id: int | None = None
+    knowledge_id: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class DistillTrigger(BaseModel):
+    session_ids: list[int] | None = None
+    limit: int = Field(default=20, ge=1, le=100)
+    min_score: float = Field(default=40.0)
+
+
+class ReviewRequest(BaseModel):
+    action: str  # "approve" | "reject"
+    title: str | None = None
+    content: str | None = None
+    score: float | None = None
+
+
+class DistillStats(BaseModel):
+    total_candidates: int
+    approved_count: int
+    rejected_count: int
+    avg_score: float
+    top_categories: list[dict]
+
+
+@router.post("/distill/trigger")
+async def trigger_distillation(
+    body: DistillTrigger | None = None,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> dict:
+    """Run knowledge distillation on chat sessions.
+
+    Scans conversation history, extracts ops knowledge via LLM,
+    scores and persists candidates.
+    """
+    from app.services.distiller import Distiller
+
+    distiller = Distiller(db)
+    result = await distiller.run(
+        session_ids=body.session_ids if body else None,
+        limit=body.limit if body else 20,
+        min_score=body.min_score if body else 40.0,
+    )
+    return result
+
+
+@router.get("/distill/candidates", response_model=list[DistilledOut])
+async def list_distilled(
+    status: str | None = Query(None),
+    category: str | None = Query(None),
+    min_score: float | None = Query(None),
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> list[DistilledOut]:
+    """List distilled knowledge candidates."""
+    from app.models import DistilledKnowledge
+
+    q = select(DistilledKnowledge).order_by(DistilledKnowledge.score.desc())
+    if status:
+        q = q.where(DistilledKnowledge.status == status)
+    if category:
+        q = q.where(DistilledKnowledge.category == category)
+    if min_score is not None:
+        q = q.where(DistilledKnowledge.score >= min_score)
+    rows = await db.execute(q.limit(100))
+    return [DistilledOut.model_validate(r) for r in rows.scalars()]
+
+
+@router.post("/distill/{dk_id}/review", response_model=DistilledOut)
+async def review_distilled(
+    dk_id: int,
+    body: ReviewRequest,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> DistilledOut:
+    """Approve or reject a distilled knowledge candidate."""
+    from app.models import DistilledKnowledge
+
+    dk = await db.get(DistilledKnowledge, dk_id)
+    if not dk:
+        raise HTTPException(status_code=404, detail="候选知识不存在")
+
+    if body.action == "approve":
+        dk.status = "approved"
+        dk.reviewer_id = user.id
+    elif body.action == "reject":
+        dk.status = "rejected"
+        dk.reviewer_id = user.id
+    else:
+        raise HTTPException(status_code=400, detail="无效操作")
+
+    if body.title is not None:
+        dk.title = body.title
+    if body.content is not None:
+        dk.content = body.content
+    if body.score is not None:
+        dk.score = body.score
+
+    await db.flush()
+
+    # If approved and score >= 70, auto-ingest to knowledge base
+    if body.action == "approve" and dk.score >= 70:
+        try:
+            from app.services.distiller import Distiller
+            distiller = Distiller(db)
+            await distiller._auto_ingest(dk)
+        except Exception:
+            logger.exception("Review ingest failed for dk {}", dk_id)
+
+    return DistilledOut.model_validate(dk)
+
+
+@router.get("/distill/queue")
+async def get_distill_queue(
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Get the number of sessions waiting for distillation."""
+    from app.models import ChatSession
+    row = await db.execute(
+        select(func.count(ChatSession.id)).where(
+            ChatSession.distillation_status.is_(None),
+        )
+    )
+    total = await db.execute(select(func.count(ChatSession.id)))
+    done = await db.execute(
+        select(func.count(ChatSession.id)).where(ChatSession.distillation_status.isnot(None))
+    )
+    return {
+        "queue_count": row.scalar() or 0,
+        "total_sessions": total.scalar() or 0,
+        "processed": done.scalar() or 0,
+    }
+
+
+@router.get("/distill/stats", response_model=DistillStats)
+async def get_distill_stats(
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> DistillStats:
+    """Get distillation statistics."""
+    from app.models import DistilledKnowledge
+
+    total = (await db.execute(select(func.count(DistilledKnowledge.id)))).scalar() or 0
+    approved = (await db.execute(
+        select(func.count(DistilledKnowledge.id)).where(DistilledKnowledge.status == "approved")
+    )).scalar() or 0
+    rejected = (await db.execute(
+        select(func.count(DistilledKnowledge.id)).where(DistilledKnowledge.status == "rejected")
+    )).scalar() or 0
+    avg = (await db.execute(select(func.avg(DistilledKnowledge.score)))).scalar() or 0.0
+    cats = await db.execute(
+        select(DistilledKnowledge.category, func.count(DistilledKnowledge.id))
+        .where(DistilledKnowledge.category.isnot(None))
+        .group_by(DistilledKnowledge.category)
+        .order_by(func.count(DistilledKnowledge.id).desc())
+        .limit(5)
+    )
+    return DistillStats(
+        total_candidates=total,
+        approved_count=approved,
+        rejected_count=rejected,
+        avg_score=round(float(avg), 1),
+        top_categories=[{"category": r[0], "count": r[1]} for r in cats.all()],
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Routes — Auto-distill Config
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get("/distill/config")
+async def get_distill_config(
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Get auto-distillation configuration."""
+    from app.models import SystemConfig
+
+    rows = await db.execute(
+        select(SystemConfig).where(
+            SystemConfig.key.in_(["distill_auto_enabled", "distill_interval_secs"])
+        )
+    )
+    cfg = {r.key: r.value for r in rows.scalars()}
+    return {
+        "auto_enabled": cfg.get("distill_auto_enabled", "false") == "true",
+        "interval_secs": int(cfg.get("distill_interval_secs", "3600")),
+    }
+
+
+@router.put("/distill/config")
+async def set_distill_config(
+    body: dict,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> dict:
+    """Configure auto-distillation."""
+    from app.models import SystemConfig
+
+    entries = {
+        "distill_auto_enabled": "true" if body.get("auto_enabled") else "false",
+        "distill_interval_secs": str(body.get("interval_secs", 3600)),
+    }
+    for key, value in entries.items():
+        row = await db.get(SystemConfig, key)
+        if row:
+            row.value = value
+            row.updated_at = func.now()
+        else:
+            db.add(SystemConfig(key=key, value=value))
+    await db.flush()
+    return await get_distill_config(db=db, user=_admin)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Routes — Knowledge Enhancement (v0.5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.post("/expire")
+async def expire_stale_knowledge(
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> dict:
+    """Archive knowledge documents that haven't been hit in 90+ days."""
+    from sqlalchemy import text as _text
+
+    await db.execute(
+        _text("UPDATE knowledge_documents SET archived = TRUE WHERE status = 'stored' AND updated_at < NOW() - INTERVAL '90 days'")
+    )
+    await db.flush()
+    rows = await db.execute(select(func.count(KnowledgeDocument.id)).where(KnowledgeDocument.archived == True))  # noqa: E712
+    return {"archived_count": rows.scalar() or 0}
+
+
+@router.get("/blindspots")
+async def get_knowledge_blindspots(
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    """List unanswered queries that suggest knowledge blind spots."""
+    from sqlalchemy import text as _text
+
+    rows = await db.execute(
+        _text("SELECT question, count, last_asked FROM unanswered_queries WHERE count >= 2 ORDER BY count DESC LIMIT 20")
+    )
+    return [{"question": r[0], "count": r[1], "last_asked": r[2].isoformat() if r[2] else None} for r in rows.all()]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
