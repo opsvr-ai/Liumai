@@ -182,3 +182,69 @@ async def query_source(
     if parse_path:
         response["parsed"] = adapter._parse_json_path(result.raw, parse_path)
     return response
+
+
+# ═══════════════════════════════════════════════════════════
+# Query templates + health check
+# ═══════════════════════════════════════════════════════════
+
+from app.models import QueryTemplate
+
+
+class TemplateOut(BaseModel):
+    id: int; name: str; source_type: str; query: str = ""; params: list = Field(default_factory=list); description: str = ""
+    model_config = {"from_attributes": True}
+
+
+class TemplateCreate(BaseModel):
+    name: str = Field(..., min_length=1); source_type: str; query: str; params: list = Field(default_factory=list); description: str = ""
+
+
+@router.get("/templates", response_model=list[TemplateOut])
+async def list_templates(
+    source_type: str | None = Query(None),
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> list[TemplateOut]:
+    q = select(QueryTemplate).order_by(QueryTemplate.source_type, QueryTemplate.id)
+    if source_type: q = q.where(QueryTemplate.source_type == source_type)
+    rows = await db.execute(q)
+    return [TemplateOut.model_validate(r) for r in rows.scalars()]
+
+
+@router.post("/templates", response_model=TemplateOut, status_code=201)
+async def create_template(
+    body: TemplateCreate, db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> TemplateOut:
+    t = QueryTemplate(**body.model_dump())
+    db.add(t); await db.flush(); await db.refresh(t)
+    return TemplateOut.model_validate(t)
+
+
+@router.delete("/templates/{tpl_id}")
+async def delete_template(tpl_id: int, db: AsyncSession = Depends(get_db_session),
+                          _admin: User = Depends(require_admin)) -> Response:
+    t = await db.get(QueryTemplate, tpl_id)
+    if not t: raise HTTPException(status_code=404, detail="不存在")
+    await db.delete(t); return Response(status_code=204)
+
+
+@router.get("/health-check")
+async def health_check_all(
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> list[dict]:
+    from app.services.datasource_adapters import get_adapter
+    import time
+    rows = await db.execute(select(DataSource).where(DataSource.enabled == True))
+    results = []
+    for ds in rows.scalars().all():
+        t0 = time.monotonic()
+        try:
+            adapter = get_adapter(ds.type, ds.config or {})
+            ok, msg = await adapter.test_connection()
+            latency = round((time.monotonic() - t0) * 1000)
+        except Exception as e: ok, msg, latency = False, str(e), 0
+        results.append({"id": ds.id, "name": ds.name, "type": ds.type, "ok": ok, "message": msg, "latency_ms": latency})
+    return results

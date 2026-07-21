@@ -130,6 +130,28 @@ class User(Base):
         return f"<User id={self.id} username={self.username!r} role={self.role.value}>"
 
 
+class QueryTemplate(Base):
+    """Pre-built query template for a data source type."""
+
+    __tablename__ = "query_templates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False)
+    source_type = Column(String(50), nullable=False, index=True)
+    query = Column(Text, nullable=False)
+    params = Column(JSONB, nullable=True, default=list)
+    description = Column(Text, nullable=True, default="")
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<QueryTemplate id={self.id} name={self.name!r} type={self.source_type}>"
+
+
 class DataSource(Base):
     """External monitoring / telemetry data source for alert rules.
 

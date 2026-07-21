@@ -139,6 +139,9 @@ export const ChatPanel: FC = () => {
   const [cmPrompt, setCmPrompt] = useState("");
   const [cmIcon, setCmIcon] = useState("🤖");
   const [cmProvider, setCmProvider] = useState("llm");
+
+  /* Hermes health */
+  const [hermesOnline, setHermesOnline] = useState(true);
   const [rcaTimeStart, setRcaTimeStart] = useState("");
   const [rcaTimeEnd, setRcaTimeEnd] = useState("");
   const [rcaPreset, setRcaPreset] = useState("none");
@@ -218,6 +221,27 @@ export const ChatPanel: FC = () => {
   useEffect(() => {
     chatModes.list().then(setModes).catch(() => {});
   }, []);
+
+  // Poll Hermes health every 30s; force-switch to general if offline
+  useEffect(() => {
+    const check = () => {
+      hermesDiscovery.health().then(r => {
+        const online = r.ok;
+        setHermesOnline(online);
+        if (!online && activeMode && activeMode !== "system:general" && !activeMode.startsWith("user:")) {
+          setActiveMode("system:general");
+        }
+      }).catch(() => {
+        setHermesOnline(false);
+        if (activeMode && activeMode !== "system:general" && !activeMode.startsWith("user:")) {
+          setActiveMode("system:general");
+        }
+      });
+    };
+    check();
+    const timer = setInterval(check, 30000);
+    return () => clearInterval(timer);
+  }, []); // intentionally no activeMode dep — only check on mount
 
   // Load available LLM models + default model
   useEffect(() => {
@@ -539,19 +563,27 @@ export const ChatPanel: FC = () => {
                     const isActive = activeMode === slug || (!activeMode && slug === "system:general");
                     const config = m.config || {};
                     const userIcon = (config as any)?.icon || "🤖";
+                    const provider = (config as any)?.provider || (slug.startsWith("system:") ? "hermes" : "llm");
+                    const needsHermes = provider === "hermes" || (!isUser && !(config as any)?.provider && slug !== "system:general");
+                    const disabled = needsHermes && !hermesOnline;
+
                     return (
                       <div key={slug} className="relative group flex items-center">
                         <button
                           type="button"
-                          onClick={() => setActiveMode(isActive ? null : slug)}
+                          disabled={disabled}
+                          onClick={() => { if (!disabled) setActiveMode(isActive ? null : slug); }}
+                          title={disabled ? "Hermes 服务不可用" : undefined}
                           className={cn(
                             "relative flex items-center gap-1.5 px-2.5 py-2 text-[12px] font-medium transition-colors duration-200",
-                            isActive ? "text-text-primary" : "text-muted-foreground/60 hover:text-text-secondary",
+                            disabled ? "opacity-35 cursor-not-allowed" : "",
+                            isActive && !disabled ? "text-text-primary" : disabled ? "text-muted-foreground/40" : "text-muted-foreground/60 hover:text-text-secondary",
                           )}
                         >
                           {isUser ? <span className="text-sm leading-none">{userIcon}</span> : <Icon className="h-3 w-3" />}
                           {m.name}
-                          {isActive && <span className="absolute bottom-0 left-1/2 -translate-x-1/2 w-2/3 h-[2px] rounded-full bg-text-primary/80" />}
+                          {disabled && <span className="text-[9px] opacity-60">⚠</span>}
+                          {isActive && !disabled && <span className="absolute bottom-0 left-1/2 -translate-x-1/2 w-2/3 h-[2px] rounded-full bg-text-primary/80" />}
                         </button>
                         {/* Edit/delete for user modes */}
                         {isUser && (
@@ -577,6 +609,11 @@ export const ChatPanel: FC = () => {
                     className="flex items-center justify-center h-6 w-6 rounded-md text-muted-foreground/40 hover:text-text-secondary hover:bg-black/[0.03] transition-colors ml-1">
                     <Plus className="h-3.5 w-3.5" />
                   </button>
+                  {/* Hermes health indicator */}
+                  <span className={cn("ml-1.5 flex items-center gap-1 text-[10px]", hermesOnline ? "text-muted-foreground/30" : "text-status-active")} title={hermesOnline ? "Hermes 在线" : "Hermes 离线"}>
+                    <span className={cn("h-1.5 w-1.5 rounded-full", hermesOnline ? "bg-status-resolved" : "bg-status-active animate-pulse")} />
+                    {hermesOnline ? "" : "离线"}
+                  </span>
                 </div>
               )}
 

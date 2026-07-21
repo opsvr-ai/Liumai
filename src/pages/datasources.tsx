@@ -60,6 +60,7 @@ export default function DataSourcesPage() {
   const [formConfig, setFormConfig] = useState<Record<string, unknown>>({});
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState<number | null>(null);
+  const [healthCheck, setHealthCheck] = useState<Array<{ id: number; name: string; ok: boolean; latency_ms: number }>>([]);
 
   /* ── Headers / body editor state ────────────────── */
   const [headerRows, setHeaderRows] = useState<{ key: string; value: string }[]>([{ key: "", value: "" }]);
@@ -198,6 +199,10 @@ export default function DataSourcesPage() {
         </div>
         <div className="flex items-center gap-2">
           <Button variant="ghostMuted" size="icon-sm" onClick={refresh}><RefreshCw className="h-4 w-4" /></Button>
+          <Button variant="outline" size="sm" onClick={async () => {
+            try { const r = await dataSourceApi.healthCheckAll(); setHealthCheck(r); toast.success(`检测完成: ${r.filter(h => h.ok).length}/${r.length} 在线`); }
+            catch { toast.error("检测失败"); }
+          }}>健康检测</Button>
           <Button size="sm" onClick={openCreate}><Plus className="h-4 w-4 mr-1" />新建数据源</Button>
         </div>
       </div>
@@ -250,7 +255,12 @@ export default function DataSourcesPage() {
                     {ds.type === "api" && `${(ds.config as any)?.method ?? "GET"} ${(ds.config as any)?.url ?? ""}`}
                   </td>
                   <td className="px-4 py-2.5">
-                    {ds.enabled ? <span className="text-green-600 text-xs flex items-center gap-1"><Check className="h-3 w-3" />启用</span> : <span className="text-muted-foreground text-xs"><X className="h-3 w-3" />禁用</span>}
+                    <div className="flex items-center gap-2">
+                      {ds.enabled ? <span className="text-green-600 text-xs flex items-center gap-1"><Check className="h-3 w-3" />启用</span> : <span className="text-muted-foreground text-xs"><X className="h-3 w-3" />禁用</span>}
+                      {healthCheck.find(h => h.id === ds.id) && (
+                        <span className={cn("h-1.5 w-1.5 rounded-full", healthCheck.find(h => h.id === ds.id)!.ok ? "bg-status-resolved" : "bg-status-active animate-pulse")} title={healthCheck.find(h => h.id === ds.id)!.ok ? "在线" : "离线"} />
+                      )}
+                    </div>
                   </td>
                   <td className="px-4 py-2.5 text-right">
                     <div className="flex items-center justify-end gap-0.5">

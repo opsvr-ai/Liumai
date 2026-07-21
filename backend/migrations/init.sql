@@ -257,6 +257,22 @@ CREATE TABLE IF NOT EXISTS data_sources (
 );
 CREATE INDEX IF NOT EXISTS idx_data_sources_type ON data_sources(type);
 
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Query templates — pre-built queries for data source types
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS query_templates (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    source_type VARCHAR(50)  NOT NULL,
+    query       TEXT         NOT NULL,
+    params      JSONB        DEFAULT '[]'::jsonb,
+    description TEXT         DEFAULT '',
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_qt_source_type ON query_templates(source_type);
+
 -- Add unique constraint on name (safe for re-runs)
 DO $$ BEGIN
     ALTER TABLE data_sources ADD CONSTRAINT uq_data_sources_name UNIQUE (name);

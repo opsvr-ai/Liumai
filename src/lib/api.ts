@@ -413,6 +413,15 @@ export const dataSourceApi = {
       { query, params, parse_path: parsePath },
     );
   },
+  templates(sourceType?: string) {
+    const q = sourceType ? `?source_type=${sourceType}` : "";
+    return request<Array<{ id: number; name: string; source_type: string; query: string; params: Array<{ name: string; label: string; default: string }>; description: string }>>("GET", `/datasources/templates${q}`);
+  },
+  createTemplate(data: { name: string; source_type: string; query: string }) { return request("POST", "/datasources/templates", data); },
+  deleteTemplate(id: number) { return request<void>("DELETE", `/datasources/templates/${id}`); },
+  healthCheckAll() {
+    return request<Array<{ id: number; name: string; type: string; ok: boolean; message: string; latency_ms: number }>>("GET", "/datasources/health-check");
+  },
 };
 
 /* ── Hermes skills & toolsets ─────────────────────── */
