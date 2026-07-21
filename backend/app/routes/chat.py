@@ -166,15 +166,31 @@ async def chat_stream_endpoint(
         {"role": m.role, "content": m.content} for m in body.messages
     ]
 
+    mode: Any = None  # ChatMode or UserChatMode
+    mode_config: dict[str, Any] = {}
+
     if body.mode:
-        from app.models import ChatMode as ChatModeModel
-        row = await db.execute(
-            select(ChatModeModel).where(
-                ChatModeModel.slug == body.mode,
-                ChatModeModel.enabled == True,  # noqa: E712
+        if body.mode.startswith("user:"):
+            # User custom mode
+            from app.models import UserChatMode
+            mode_id = int(body.mode.split(":", 1)[1])
+            row = await db.get(UserChatMode, mode_id)
+            if row and row.user_id == user.id and row.enabled:
+                mode = row
+                mode_config = {"provider": row.provider, "icon": row.icon, "user_mode": True}
+        else:
+            # System mode — strip "system:" prefix if present
+            slug = body.mode.replace("system:", "", 1)
+            from app.models import ChatMode as ChatModeModel
+            row = await db.execute(
+                select(ChatModeModel).where(
+                    ChatModeModel.slug == slug,
+                    ChatModeModel.enabled == True,  # noqa: E712
+                )
             )
-        )
-        mode = row.scalar_one_or_none()
+            mode = row.scalar_one_or_none()
+            if mode:
+                mode_config = mode.config or {}
         if mode and mode.system_prompt:
             # Prepend system prompt only if not already present
             if not messages or messages[0].get("role") != "system":
@@ -193,7 +209,7 @@ async def chat_stream_endpoint(
             body.temperature = 0.3
 
     # ── LLM direct path (mode with provider=llm) ─────────────────────────
-    if mode and (mode.config or {}).get("provider") == "llm":
+    if mode and mode_config.get("provider") == "llm":
         return await _llm_direct_stream(messages, body, mode, db)
 
     # Guard against empty URL (not yet configured by admin)
@@ -593,15 +609,14 @@ async def list_chat_modes(
     db: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ) -> list[ChatModeOut]:
-    """List all enabled chat modes."""
-    from app.models import ChatMode as ChatModeModel
-
+    """List all enabled chat modes (system + user custom)."""
+    from app.models import ChatMode as ChatModeModel, UserChatMode
     from sqlalchemy import case as _sql_case
+
     rows = await db.execute(
         select(ChatModeModel)
         .where(ChatModeModel.enabled == True)  # noqa: E712
         .order_by(
-            # Put 'general' first, then 智能助理, then the rest
             _sql_case(
                 (ChatModeModel.slug == "general", 0),
                 (ChatModeModel.slug == "default", 1),
@@ -610,17 +625,77 @@ async def list_chat_modes(
             ChatModeModel.id,
         )
     )
-    modes = rows.scalars().all()
-    return [
+    result = [
         ChatModeOut(
-            slug=m.slug,
+            slug=f"system:{m.slug}",
             name=m.name,
             system_prompt=m.system_prompt or "",
             config=m.config or {},
             enabled=m.enabled,
         )
-        for m in modes
+        for m in rows.scalars().all()
     ]
+    # User custom modes
+    user_rows = await db.execute(
+        select(UserChatMode)
+        .where(UserChatMode.user_id == user.id, UserChatMode.enabled == True)  # noqa: E712
+        .order_by(UserChatMode.created_at.desc())
+    )
+    for um in user_rows.scalars().all():
+        result.append(ChatModeOut(
+            slug=f"user:{um.id}",
+            name=um.name,
+            system_prompt=um.system_prompt or "",
+            config={"provider": um.provider, "icon": um.icon, "user_mode": True},
+            enabled=um.enabled,
+        ))
+    return result
+
+
+class UserModeCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    system_prompt: str = Field(default="")
+    icon: str = Field(default="🤖")
+    provider: str = Field(default="llm")
+
+
+@router.post("/user-modes", response_model=ChatModeOut, status_code=201)
+async def create_user_mode(
+    body: UserModeCreate,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> ChatModeOut:
+    """Create a custom assistant (private)."""
+    from app.models import UserChatMode
+    um = UserChatMode(user_id=user.id, name=body.name, system_prompt=body.system_prompt, icon=body.icon, provider=body.provider)
+    db.add(um); await db.flush(); await db.refresh(um)
+    return ChatModeOut(slug=f"user:{um.id}", name=um.name, system_prompt=um.system_prompt, config={"provider": um.provider, "icon": um.icon, "user_mode": True}, enabled=um.enabled)
+
+
+@router.put("/user-modes/{mode_id}", response_model=ChatModeOut)
+async def update_user_mode(
+    mode_id: int, body: UserModeCreate,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> ChatModeOut:
+    """Update custom assistant."""
+    from app.models import UserChatMode
+    um = await db.get(UserChatMode, mode_id)
+    if not um or um.user_id != user.id: raise HTTPException(status_code=404, detail="不存在")
+    um.name = body.name; um.system_prompt = body.system_prompt; um.icon = body.icon; um.provider = body.provider
+    await db.flush()
+    return ChatModeOut(slug=f"user:{um.id}", name=um.name, system_prompt=um.system_prompt, config={"provider": um.provider, "icon": um.icon, "user_mode": True}, enabled=um.enabled)
+
+
+@router.delete("/user-modes/{mode_id}")
+async def delete_user_mode(
+    mode_id: int, db: AsyncSession = Depends(get_db_session), user: User = Depends(get_current_user),
+) -> Response:
+    """Delete custom assistant."""
+    from app.models import UserChatMode
+    um = await db.get(UserChatMode, mode_id)
+    if not um or um.user_id != user.id: raise HTTPException(status_code=404, detail="不存在")
+    await db.delete(um); return Response(status_code=204)
 
 
 @router.put("/modes/{slug}", response_model=ChatModeOut)

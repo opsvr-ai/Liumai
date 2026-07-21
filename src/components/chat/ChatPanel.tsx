@@ -36,7 +36,9 @@ import { ChatMessage } from "@/components/chat/ChatMessage";
 import { LiumaiLogo } from "@/components/liumai-logo";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { chatHistory, chatModes, authApi, hermesDiscovery, type ChatModeOut, type ChatSessionSummary } from "@/lib/api";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
 /* ── Relative time formatter ─────────────────────────────── */
@@ -126,9 +128,17 @@ export const ChatPanel: FC = () => {
 
   /* ── Mode state ───────────────────────────────────── */
   const [modes, setModes] = useState<ChatModeOut[]>([]);
-  const [activeMode, setActiveMode] = useState<string | null>("general");
+  const [activeMode, setActiveMode] = useState<string | null>("system:general");
   const [availableModels, setAvailableModels] = useState<Array<{ id: string }>>([]);
   const [selectedModel, setSelectedModel] = useState<string>("");
+
+  /* Custom assistant creation dialog */
+  const [showCreate, setShowCreate] = useState(false);
+  const [editMode, setEditMode] = useState<ChatModeOut | null>(null);
+  const [cmName, setCmName] = useState("");
+  const [cmPrompt, setCmPrompt] = useState("");
+  const [cmIcon, setCmIcon] = useState("🤖");
+  const [cmProvider, setCmProvider] = useState("llm");
   const [rcaTimeStart, setRcaTimeStart] = useState("");
   const [rcaTimeEnd, setRcaTimeEnd] = useState("");
   const [rcaPreset, setRcaPreset] = useState("none");
@@ -245,11 +255,12 @@ export const ChatPanel: FC = () => {
     }
     const twStart = activeMode === "rca" ? (rcaTimeStart || new Date(Date.now() - 15 * 60000).toISOString()) : undefined;
     const twEnd = activeMode === "rca" ? (rcaTimeEnd || new Date().toISOString()) : undefined;
+    const realMode = activeMode?.startsWith("system:") ? activeMode.replace("system:", "") : activeMode;
     await sendMessage(text, {
       mode: activeMode ?? undefined,
       timeWindowStart: twStart,
       timeWindowEnd: twEnd,
-      model: activeMode === "general" ? (selectedModel || undefined) : undefined,
+      model: (activeMode === "system:general" || activeMode?.startsWith("user:")) ? (selectedModel || undefined) : undefined,
     });
   }, [input, isStreaming, sendMessage, activeMode, rcaTimeStart, rcaTimeEnd, attachedContent, attachedFile, clearAttachment]);
 
@@ -408,8 +419,9 @@ export const ChatPanel: FC = () => {
     <div className="flex flex-row h-full bg-surface-primary">
       {sidebarContent}
 
-      {/* Chat area */}
-      <div className="flex-1 flex flex-col min-w-0 max-w-[48rem] mx-auto w-full">
+      {/* Chat area — subtle gradient depth */}
+      <div className="flex-1 flex flex-col min-w-0 max-w-[48rem] mx-auto w-full"
+        style={{ background: "radial-gradient(ellipse at 50% 80%, rgba(59,130,246,0.04) 0%, transparent 60%)" }}>
         {/* Top bar — minimal spacer */}
         <div className="shrink-0 h-2" />
 
@@ -496,49 +508,80 @@ export const ChatPanel: FC = () => {
               </div>
             )}
 
-            {/* ── Input card: tab bar + extensions + textarea ── */}
-            <div className="rounded-2xl border border-border bg-surface-secondary shadow-sm overflow-hidden transition-shadow focus-within:ring-2 focus-within:ring-interactive-primary/20 focus-within:border-interactive-primary">
-              {/* Tab bar — pill-style with icons */}
+            {/* Mode extensions — shown above input card */}
+            {activeMode === "system:rca" && (
+              <div className="flex items-center gap-1.5 bg-white/60 backdrop-blur rounded-xl px-2 py-1.5 self-center border border-border/30 shadow-sm">
+                <Clock className="h-3 w-3 text-muted-foreground" />
+                {[["none","自定义"],["15m","15分钟"],["1h","1小时"],["4h","4小时"],["24h","24小时"]].map(([val, label]) => (
+                  <button key={val} type="button" onClick={() => applyRcaPreset(val)} className={cn("px-2 py-0.5 rounded-full text-[11px] transition-colors", rcaPreset === val ? "bg-interactive-primary/10 text-interactive-primary font-medium" : "text-muted-foreground hover:text-text-secondary")}>{label}</button>
+                ))}
+                {rcaPreset === "none" && (<><input type="datetime-local" value={rcaTimeStart} onChange={(e) => setRcaTimeStart(e.target.value)} className="h-7 rounded-lg border border-border/50 bg-white px-2 text-[11px]" /><span className="text-[11px] text-muted-foreground">→</span><input type="datetime-local" value={rcaTimeEnd} onChange={(e) => setRcaTimeEnd(e.target.value)} className="h-7 rounded-lg border border-border/50 bg-white px-2 text-[11px]" /></>)}
+              </div>
+            )}
+            {/* Attached file badge */}
+            {attachedFile && !converting && (activeMode === "system:general" || activeMode?.startsWith("user:")) && (
+              <div className="flex items-center gap-2 self-center bg-white/80 backdrop-blur rounded-lg px-3 py-1 border border-border/30 shadow-sm text-[12px]">
+                <FileText className="h-3 w-3 text-muted-foreground" />{attachedFile.name}
+                <button type="button" onClick={clearAttachment} className="text-muted-foreground hover:text-status-active"><X className="h-3 w-3" /></button>
+              </div>
+            )}
+
+            {/* ── Input card ── */}
+            <div className="rounded-2xl bg-white shadow-lg ring-1 ring-black/[0.04] overflow-hidden transition-all duration-200 focus-within:shadow-xl">
+              {/* Tab bar — underline style */}
               {modes.length > 0 && (
-                <div className="flex items-center gap-1 px-2.5 py-2">
+                <div className="flex items-center gap-0 px-3 pt-2.5">
                   {modes.map((m) => {
-                    const Icon = modeIcons[m.slug] || MessageCircle;
-                    const isActive = activeMode === m.slug || (!activeMode && m.slug === "general");
+                    const isUser = m.slug.startsWith("user:");
+                    const slug = m.slug;
+                    const systemSlug = slug.startsWith("system:") ? slug.replace("system:", "") : slug;
+                    const Icon = modeIcons[systemSlug] || MessageCircle;
+                    const isActive = activeMode === slug || (!activeMode && slug === "system:general");
+                    const config = m.config || {};
+                    const userIcon = (config as any)?.icon || "🤖";
                     return (
-                      <button
-                        key={m.slug}
-                        type="button"
-                        onClick={() => setActiveMode(isActive ? null : m.slug)}
-                        className={cn(
-                          "flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[12px] font-medium transition-all duration-200",
-                          isActive
-                            ? "bg-interactive-primary/8 text-interactive-primary shadow-sm"
-                            : "text-muted-foreground hover:text-text-secondary hover:bg-surface-primary/40",
+                      <div key={slug} className="relative group flex items-center">
+                        <button
+                          type="button"
+                          onClick={() => setActiveMode(isActive ? null : slug)}
+                          className={cn(
+                            "relative flex items-center gap-1.5 px-2.5 py-2 text-[12px] font-medium transition-colors duration-200",
+                            isActive ? "text-text-primary" : "text-muted-foreground/60 hover:text-text-secondary",
+                          )}
+                        >
+                          {isUser ? <span className="text-sm leading-none">{userIcon}</span> : <Icon className="h-3 w-3" />}
+                          {m.name}
+                          {isActive && <span className="absolute bottom-0 left-1/2 -translate-x-1/2 w-2/3 h-[2px] rounded-full bg-text-primary/80" />}
+                        </button>
+                        {/* Edit/delete for user modes */}
+                        {isUser && (
+                          <div className="hidden group-hover:flex absolute -top-1 -right-1 gap-0.5">
+                            <button type="button" onClick={(e) => { e.stopPropagation();
+                              const id = parseInt(slug.split(":")[1]);
+                              setEditMode(m); setCmName(m.name); setCmPrompt(m.system_prompt);
+                              setCmIcon(userIcon); setCmProvider((config as any)?.provider || "llm");
+                              setShowCreate(true);
+                            }} className="h-4 w-4 rounded-full bg-surface-tertiary flex items-center justify-center text-[8px] hover:bg-surface-primary">✎</button>
+                            <button type="button" onClick={async (e) => { e.stopPropagation();
+                              const id = parseInt(slug.split(":")[1]);
+                              await chatModes.deleteUserMode(id);
+                              chatModes.list().then(setModes).catch(() => {});
+                            }} className="h-4 w-4 rounded-full bg-surface-tertiary flex items-center justify-center text-[8px] hover:bg-surface-primary">✕</button>
+                          </div>
                         )}
-                      >
-                        <Icon className="h-3 w-3" />
-                        {m.name}
-                        {isActive && (
-                          <span className="ml-0.5 h-1.5 w-1.5 rounded-full bg-interactive-primary animate-pulse" />
-                        )}
-                      </button>
+                      </div>
                     );
                   })}
-                </div>
-              )}
-
-{activeMode === "rca" && (
-                <div className="px-4 py-2 flex flex-wrap items-center gap-2 border-t border-border/30">
-                  <Clock className="h-3.5 w-3.5 text-muted-foreground" />
-                  {[["none","自定义"],["15m","15分钟"],["1h","1小时"],["4h","4小时"],["24h","24小时"]].map(([val, label]) => (
-                    <button key={val} type="button" onClick={() => applyRcaPreset(val)} className={cn("px-2 py-0.5 rounded text-[11px] transition-colors border", rcaPreset === val ? "bg-interactive-primary/10 text-interactive-primary border-interactive-primary/30" : "text-muted-foreground border-transparent hover:border-border")}>{label}</button>
-                  ))}
-                  {rcaPreset === "none" && (<><input type="datetime-local" value={rcaTimeStart} onChange={(e) => setRcaTimeStart(e.target.value)} className="h-7 rounded border border-border bg-surface-primary px-2 text-[11px] text-text-primary" /><span className="text-[11px] text-muted-foreground">→</span><input type="datetime-local" value={rcaTimeEnd} onChange={(e) => setRcaTimeEnd(e.target.value)} className="h-7 rounded border border-border bg-surface-primary px-2 text-[11px] text-text-primary" /></>)}
+                  {/* + button */}
+                  <button type="button" onClick={() => { setEditMode(null); setCmName(""); setCmPrompt(""); setCmIcon("🤖"); setCmProvider("llm"); setShowCreate(true); }}
+                    className="flex items-center justify-center h-6 w-6 rounded-md text-muted-foreground/40 hover:text-text-secondary hover:bg-black/[0.03] transition-colors ml-1">
+                    <Plus className="h-3.5 w-3.5" />
+                  </button>
                 </div>
               )}
 
               {/* Textarea with bottom bar */}
-              <div className={cn("relative flex flex-col", (activeMode === "knowledge" || activeMode === "rca") && "border-t border-border/30")}>
+              <div className="relative flex flex-col">
                 <textarea
                   ref={textareaRef}
                   value={input}
@@ -546,67 +589,122 @@ export const ChatPanel: FC = () => {
                   onKeyDown={handleKeyDown}
                   placeholder={
                     isStreaming ? "等待回复中…"
-                    : activeMode === "general" ? "通用模型智能问答，支持多格式文档上传… Enter 发送，Shift+Enter 换行"
-                    : activeMode === "default" ? "智能运维助理，具备工具调用与自主执行能力… Enter 发送，Shift+Enter 换行"
-                    : activeMode === "knowledge" ? "遵循 LLM-WIKI V2 协议，从知识库进行知识检索与问答… Enter 发送，Shift+Enter 换行"
-                    : activeMode === "rca" ? "故障根因分析，输入服务名称和时间窗口… Enter 发送，Shift+Enter 换行"
+                    : activeMode === "system:general" ? "通用模型智能问答，支持多格式文档上传… Enter 发送，Shift+Enter 换行"
+                    : activeMode === "system:default" ? "智能运维助理，具备工具调用与自主执行能力… Enter 发送，Shift+Enter 换行"
+                    : activeMode === "system:knowledge" ? "遵循 LLM-WIKI V2 协议，从知识库进行知识检索与问答… Enter 发送，Shift+Enter 换行"
+                    : activeMode === "system:rca" ? "故障根因分析，输入服务名称和时间窗口… Enter 发送，Shift+Enter 换行"
+                    : activeMode?.startsWith("user:") ? `与 ${cmName || "自定义助理"} 对话… Enter 发送，Shift+Enter 换行`
                     : "输入消息，Enter 发送，Shift+Enter 换行"
                   }
                   disabled={isStreaming}
                   rows={1}
-                  className="w-full bg-transparent pl-5 pr-12 py-3 text-sm text-text-primary placeholder:text-muted-foreground/50 disabled:opacity-50 resize-none leading-relaxed outline-none"
-                  style={{ minHeight: "48px" }}
+                  className="w-full bg-transparent pl-5 pr-5 py-3.5 text-[14px] text-text-primary placeholder:text-muted-foreground/35 disabled:opacity-40 resize-none leading-relaxed outline-none focus-visible:outline-0"
+                  style={{ minHeight: "52px" }}
                   aria-label="聊天输入"
                 />
 
-                {/* Bottom bar: file upload (left) + attached file name + model dropdown (right) + send */}
-                <div className="flex items-center justify-between px-3 pb-2.5 gap-2">
-                  {/* Left: file upload (general mode only) */}
+                {/* Bottom bar */}
+                <div className="flex items-center justify-between px-3 pb-3 gap-2">
                   <div className="flex items-center gap-1.5">
-                    {activeMode === "general" && (
+                    {(activeMode === "system:general" || activeMode?.startsWith("user:")) && (
                       <>
                         <input ref={fileInputRef} type="file" onChange={handleFileSelect} className="hidden"
                           accept=".pdf,.docx,.pptx,.xlsx,.xls,.epub,.html,.csv,.json,.xml,.ipynb,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.zip,.txt,.md,.py,.js,.ts,.log,.sql,.yaml,.yml,.ini,.cfg,.css,.rss" />
                         <button type="button" onClick={() => fileInputRef.current?.click()} disabled={converting}
-                          className="flex items-center justify-center h-7 w-7 rounded-lg border border-border/60 text-muted-foreground hover:text-text-primary hover:border-interactive-primary/30 hover:bg-interactive-primary/5 transition-all disabled:opacity-50"
+                          className="flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground/50 hover:text-muted-foreground hover:bg-black/[0.03] transition-all disabled:opacity-50"
                           title="上传文档">
                           {converting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-4 w-4" />}
                         </button>
-                        {attachedFile && !converting && (
-                          <span className="text-[11px] text-muted-foreground truncate max-w-[140px] flex items-center gap-1">
-                            <FileText className="h-3 w-3 shrink-0" />
-                            {attachedFile.name}
-                            <button type="button" onClick={clearAttachment} className="text-muted-foreground hover:text-status-active"><X className="h-3 w-3" /></button>
-                          </span>
-                        )}
                       </>
                     )}
-                  </div>
-
-                  {/* Right: model dropdown + send */}
-                  <div className="flex items-center gap-1.5">
-                    {activeMode === "general" && availableModels.length > 0 && (
+                    {(activeMode === "system:general" || activeMode?.startsWith("user:")) && availableModels.length > 0 && (
                       <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)}
-                        className="h-7 rounded-lg border border-border/60 bg-surface-primary/60 px-2 text-[11px] text-text-secondary focus:outline-none focus:ring-2 focus:ring-interactive-primary/25 cursor-pointer max-w-[140px] truncate">
+                        className="h-7 rounded-lg border-0 bg-transparent px-1.5 text-[11px] text-muted-foreground/60 focus:outline-none cursor-pointer max-w-[130px] truncate hover:text-text-secondary">
                         {availableModels.map((m) => (
                           <option key={m.id} value={m.id}>{m.id}</option>
                         ))}
                       </select>
                     )}
-                    <Button size="icon" onClick={handleSend}
-                      disabled={!input.trim() || isStreaming}
-                      className="rounded-xl h-8 w-8 shrink-0"
-                      aria-label={isStreaming ? "发送中…" : "发送"}
-                    >
-                      {isStreaming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                    </Button>
                   </div>
+
+                  <button
+                    onClick={handleSend}
+                    disabled={!input.trim() || isStreaming}
+                    className={cn(
+                      "flex items-center justify-center h-8 w-8 rounded-full transition-all duration-200 shrink-0",
+                      input.trim() && !isStreaming
+                        ? "bg-text-primary text-white shadow-md shadow-black/10 hover:bg-text-primary/90 hover:shadow-lg hover:scale-[1.04]"
+                        : "bg-black/[0.04] text-muted-foreground/30 cursor-not-allowed",
+                    )}
+                    aria-label="发送"
+                  >
+                    {isStreaming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
+                  </button>
                 </div>
               </div>
             </div>
           </div>
         </div>
       </div>
+
+      {/* ── Create/Edit custom assistant dialog ──────────── */}
+      {showCreate && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setShowCreate(false)}>
+          <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md mx-4 space-y-4" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold">{editMode ? "编辑助理" : "创建智能助理"}</h3>
+              <button onClick={() => setShowCreate(false)} className="text-muted-foreground hover:text-text-primary"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="space-y-3">
+              {/* Icon picker */}
+              <div>
+                <label className="text-[12px] font-medium text-text-secondary">图标</label>
+                <div className="flex gap-1 mt-1 flex-wrap">
+                  {["🤖","🧠","🔧","📊","🛡️","🚀","💡","🎯","⚡","🔍","📝","💬"].map(emoji => (
+                    <button key={emoji} type="button" onClick={() => setCmIcon(emoji)}
+                      className={cn("h-8 w-8 rounded-lg text-lg flex items-center justify-center transition-all", cmIcon === emoji ? "bg-interactive-primary/10 ring-2 ring-interactive-primary/30" : "hover:bg-surface-secondary")}>{emoji}</button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label className="text-[12px] font-medium text-text-secondary">名称</label>
+                <Input value={cmName} onChange={e => setCmName(e.target.value)} placeholder="我的助理" className="mt-1" />
+              </div>
+              <div>
+                <label className="text-[12px] font-medium text-text-secondary">引擎</label>
+                <select value={cmProvider} onChange={e => setCmProvider(e.target.value)}
+                  className="mt-1 w-full h-9 rounded-lg border border-border bg-white px-3 text-sm">
+                  <option value="llm">LLM 直连 (通用模型)</option>
+                  <option value="hermes">Hermes (工具调用)</option>
+                </select>
+              </div>
+              <div>
+                <label className="text-[12px] font-medium text-text-secondary">系统提示词</label>
+                <textarea value={cmPrompt} onChange={e => setCmPrompt(e.target.value)} rows={6}
+                  placeholder="你是一个专业的...&#10;设定助理的角色、能力和回复风格"
+                  className="mt-1 w-full rounded-lg border border-border bg-white px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-interactive-primary/25" />
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" onClick={() => setShowCreate(false)}>取消</Button>
+              <Button disabled={!cmName.trim()} onClick={async () => {
+                const data = { name: cmName, system_prompt: cmPrompt, icon: cmIcon, provider: cmProvider };
+                try {
+                  if (editMode) {
+                    const id = parseInt(editMode.slug.split(":")[1]);
+                    await chatModes.updateUserMode(id, data);
+                  } else {
+                    await chatModes.createUserMode(data);
+                  }
+                  toast.success(editMode ? "已更新" : "已创建");
+                  setShowCreate(false);
+                  chatModes.list().then(setModes).catch(() => {});
+                } catch (err: any) { toast.error(err.message || "失败"); }
+              }}>{editMode ? "保存" : "创建"}</Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

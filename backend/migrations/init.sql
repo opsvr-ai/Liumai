@@ -294,6 +294,8 @@ CREATE INDEX IF NOT EXISTS idx_kd_type_name ON knowledge_documents(source_type, 
 
 -- Full-text search support for knowledge_documents
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
+ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE;
 CREATE INDEX IF NOT EXISTS idx_kd_title_trgm ON knowledge_documents USING gin (title gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_kd_content_trgm ON knowledge_documents USING gin (content gin_trgm_ops);
 
@@ -336,3 +338,33 @@ CREATE INDEX IF NOT EXISTS idx_dk_status ON distilled_knowledge(status);
 CREATE INDEX IF NOT EXISTS idx_dk_score ON distilled_knowledge(score DESC);
 CREATE INDEX IF NOT EXISTS idx_dk_category ON distilled_knowledge(category);
 CREATE INDEX IF NOT EXISTS idx_dk_source_type ON distilled_knowledge(source_type);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- User custom chat modes — private AI assistants
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS user_chat_modes (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name            VARCHAR(100) NOT NULL,
+    system_prompt   TEXT         NOT NULL DEFAULT '',
+    icon            VARCHAR(10)  DEFAULT '🤖',
+    provider        VARCHAR(10)  DEFAULT 'llm',
+    enabled         BOOLEAN      DEFAULT TRUE,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_ucm_user_id ON user_chat_modes(user_id);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Unanswered queries — knowledge blind spot tracking
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS unanswered_queries (
+    id          SERIAL PRIMARY KEY,
+    question    TEXT NOT NULL UNIQUE,
+    count       INTEGER DEFAULT 1,
+    last_asked  TIMESTAMPTZ DEFAULT NOW(),
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_uq_count ON unanswered_queries(count DESC);

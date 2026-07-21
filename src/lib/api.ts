@@ -659,8 +659,14 @@ export const chatModes = {
   list() {
     return request<ChatModeOut[]>("GET", "/chat/modes");
   },
-  update(slug: string, data: { system_prompt?: string; enabled?: boolean }) {
-    return request<ChatModeOut>("PUT", `/chat/modes/${slug}`, data);
+  createUserMode(data: { name: string; system_prompt: string; icon: string; provider: string }) {
+    return request<ChatModeOut>("POST", "/chat/user-modes", data);
+  },
+  updateUserMode(id: number, data: { name: string; system_prompt: string; icon: string; provider: string }) {
+    return request<ChatModeOut>("PUT", `/chat/user-modes/${id}`, data);
+  },
+  deleteUserMode(id: number) {
+    return request<void>("DELETE", `/chat/user-modes/${id}`);
   },
 };
 

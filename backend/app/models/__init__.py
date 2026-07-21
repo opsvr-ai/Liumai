@@ -411,6 +411,31 @@ class KnowledgeDocument(Base):
         return f"<KnowledgeDocument id={self.id} title={self.title!r} status={self.status}>"
 
 
+class UserChatMode(Base):
+    """A private chat mode / assistant created by a user."""
+
+    __tablename__ = "user_chat_modes"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    name = Column(String(100), nullable=False)
+    system_prompt = Column(Text, nullable=False, default="")
+    icon = Column(String(10), default="🤖")
+    provider = Column(String(10), default="llm")
+    enabled = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<UserChatMode id={self.id} name={self.name!r} user={self.user_id}>"
+
+
 class DistilledKnowledge(Base):
     """Knowledge extracted from conversations via LLM distillation.
 

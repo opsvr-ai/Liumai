@@ -202,9 +202,12 @@ body {
 
 
 /* ==========================================================================
- *  Section 4: Focus Ring
+ *  Section 4: Focus Ring — only for clickable/interactive elements
  * ========================================================================== */
-:focus-visible {
+a:focus-visible,
+button:focus-visible,
+[role="button"]:focus-visible,
+[tabindex]:focus-visible {
   outline: 2px solid var(--primary);
   outline-offset: 2px;
 }
