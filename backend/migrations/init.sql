@@ -384,3 +384,29 @@ CREATE TABLE IF NOT EXISTS unanswered_queries (
     created_at  TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_uq_count ON unanswered_queries(count DESC);
+
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Application systems — lightweight index for Hermes mem0-backed system profiles
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS app_systems (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(200) NOT NULL UNIQUE,
+    tier        VARCHAR(10)  NOT NULL DEFAULT 'L2',
+    status      VARCHAR(20)  NOT NULL DEFAULT 'active',
+    description VARCHAR(500),
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS app_system_resources (
+    id            SERIAL PRIMARY KEY,
+    system_id     INTEGER NOT NULL REFERENCES app_systems(id) ON DELETE CASCADE,
+    resource_type VARCHAR(30) NOT NULL,
+    resource_id   INTEGER NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(system_id, resource_type, resource_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_asr_system_id ON app_system_resources(system_id);
+CREATE INDEX IF NOT EXISTS idx_asr_type_id ON app_system_resources(resource_type, resource_id);
