@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import enum
 
+from datetime import datetime
+
 from sqlalchemy import (
     ARRAY,
     Boolean,
@@ -19,9 +21,11 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.database import Base
 
@@ -522,3 +526,34 @@ class ChatMode(Base):
 
     def __repr__(self) -> str:
         return f"<ChatMode slug={self.slug!r} name={self.name!r}>"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Application systems — lightweight index (content lives in Hermes mem0)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class AppSystem(Base):
+    __tablename__ = "app_systems"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(200), unique=True, nullable=False)
+    tier: Mapped[str] = mapped_column(String(10), default="L2", nullable=False)
+    status: Mapped[str] = mapped_column(String(20), default="active", nullable=False)
+    description: Mapped[str | None] = mapped_column(String(500))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AppSystemResource(Base):
+    __tablename__ = "app_system_resources"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    system_id: Mapped[int] = mapped_column(ForeignKey("app_systems.id", ondelete="CASCADE"), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    resource_id: Mapped[int] = mapped_column(nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("system_id", "resource_type", "resource_id"),
+    )
