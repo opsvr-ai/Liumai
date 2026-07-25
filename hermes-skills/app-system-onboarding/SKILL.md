@@ -7,43 +7,13 @@ license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [AIOps, Knowledge, Onboarding, mem0]
+    tags: [AIOps, Knowledge, Onboarding]
     related_skills: [rca-fault-delimitation]
-    requires_toolsets: [mem0]
     config:
       - key: onboarding.max_turns_per_step
         description: 每个访谈步骤的最大对话轮次
         default: 5
         prompt: 单步最大对话轮次
-      - key: onboarding.profile_template
-        description: 系统档案模板（Markdown）
-        default: |
-          # 系统档案: {name}
-          ## 元信息
-          - 业务层级: {tier}
-          - 负责团队: {team}
-          - Owner: {owner}
-          - SLA目标: {sla}
-          ## 架构概览
-          {architecture}
-          ## 组件清单
-          {components}
-          ## 依赖拓扑
-          {dependencies}
-          ## 监控与告警
-          {monitoring}
-          ## 历史故障
-          {incidents}
-          ## 运维手册
-          {runbooks}
-        prompt: 系统档案 Markdown 模板，使用 {field} 占位符
-required_environment_variables:
-  - name: MEM0_API_URL
-    prompt: mem0 API 地址
-    required_for: 写入和检索系统知识记忆
-  - name: MEM0_API_KEY
-    prompt: mem0 API Key
-    required_for: 写入和检索系统知识记忆
 ---
 
 # 应用系统知识采集 — 交互式访谈
