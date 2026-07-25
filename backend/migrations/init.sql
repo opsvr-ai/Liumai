@@ -235,7 +235,13 @@ INSERT INTO chat_modes (slug, name, system_prompt, config, enabled) VALUES
      '{"time_window": true}'::jsonb, TRUE),
     ('knowledge', '知识问答',
      '你是一个知识库检索助手，基于 llm-wiki v2 知识库进行知识检索。请根据 llm-wiki v2 中的文档内容回答用户的问题。如果知识库中没有相关信息，请明确说明。回答时应引用知识库中的原文段落，确保信息的准确性和可追溯性。',
-     '{}'::jsonb, TRUE)
+     '{}'::jsonb, TRUE),
+    ('app-system-onboarding', '系统档案采集',
+     '你是应用系统知识采集助手。请按照 app-system-onboarding 技能的规范流程，通过渐进式访谈引导用户描述应用系统的架构、组件、依赖和运维知识。每个步骤完成时通过 tool_call 事件回传 Markdown 预览。最终生成结构化系统档案并写入 mem0 记忆系统。',
+     '{"provider": "hermes", "file_upload": true}'::jsonb, TRUE),
+    ('app-system-update', '系统档案更新',
+     '你是应用系统知识更新助手。对已有系统档案进行增量更新。请先加载现有档案，让用户选择需要更新的章节，然后执行针对性访谈。',
+     '{"provider": "hermes"}'::jsonb, TRUE)
 ON CONFLICT (slug) DO NOTHING;
 
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS mode_slug VARCHAR(50);

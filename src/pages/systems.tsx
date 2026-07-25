@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Plus, Search, Trash2, Pencil, Layers, RefreshCw,
-  Database, Shield, BookOpen, Activity, Link2,
+  Database, Shield, BookOpen, Activity, Link2, MessageCircle,
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
@@ -31,6 +31,7 @@ const RESOURCE_TYPE_LABELS: Record<string, { label: string; icon: typeof Shield 
 
 export default function SystemsPage() {
   const { isAdmin } = useAuth();
+  const navigate = useNavigate();
   const [systems, setSystems] = useState<AppSystem[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -100,7 +101,10 @@ export default function SystemsPage() {
         <div className="flex items-center gap-2">
           <Button variant="ghostMuted" size="icon-sm" onClick={refresh}><RefreshCw className="h-4 w-4" /></Button>
           {isAdmin && (
-            <Button size="sm" onClick={openCreate}><Plus className="h-4 w-4 mr-1" />新建系统档案</Button>
+            <>
+              <Button size="sm" variant="ghostMuted" onClick={openCreate}><Plus className="h-4 w-4 mr-1" />快速创建</Button>
+              <Button size="sm" onClick={() => navigate("/chat?mode=app-system-onboarding")}><MessageCircle className="h-4 w-4 mr-1" />开始访谈</Button>
+            </>
           )}
         </div>
       </div>
@@ -137,7 +141,10 @@ export default function SystemsPage() {
                 <>
                   <Layers className="h-10 w-10 mx-auto mb-2 text-muted-foreground/40" />
                   <p>还没有应用系统</p>
-                  <p className="text-xs mt-1">点击「新建系统档案」开始交互式访谈，让智能体了解你的系统</p>
+                  <p className="text-xs mt-1 mb-3">点击「开始访谈」让 AI 引导你构建系统档案</p>
+                  <Button size="sm" onClick={() => navigate("/chat?mode=app-system-onboarding")}>
+                    <MessageCircle className="h-3.5 w-3.5 mr-1" />开始访谈
+                  </Button>
                 </>
               ) : (
                 <p>暂无应用系统</p>

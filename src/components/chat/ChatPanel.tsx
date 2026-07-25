@@ -15,6 +15,7 @@ import {
   type FC,
   type KeyboardEvent,
 } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   Send,
   Trash2,
@@ -127,8 +128,12 @@ export const ChatPanel: FC = () => {
   };
 
   /* ── Mode state ───────────────────────────────────── */
+  const [searchParams] = useSearchParams();
+  const initialModeFromUrl = searchParams.get("mode");
   const [modes, setModes] = useState<ChatModeOut[]>([]);
-  const [activeMode, setActiveMode] = useState<string | null>("system:general");
+  const [activeMode, setActiveMode] = useState<string | null>(
+    initialModeFromUrl ? `system:${initialModeFromUrl}` : "system:general"
+  );
   const [availableModels, setAvailableModels] = useState<Array<{ id: string }>>([]);
   const [selectedModel, setSelectedModel] = useState<string>("");
 
