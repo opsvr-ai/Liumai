@@ -10,6 +10,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { dataSourceApi, type DataSourceOut } from "@/lib/api";
 import { toast } from "sonner";
+import { cn } from "@/lib/utils";
 
 const TYPE_META: Record<string, { label: string; variant: "default" | "secondary" | "outline" | "destructive" }> = {
   prometheus: { label: "Prometheus", variant: "default" },
@@ -256,7 +257,12 @@ export default function DataSourcesPage() {
                   </td>
                   <td className="px-4 py-2.5">
                     <div className="flex items-center gap-2">
-                      {ds.enabled ? <span className="text-green-600 text-xs flex items-center gap-1"><Check className="h-3 w-3" />启用</span> : <span className="text-muted-foreground text-xs"><X className="h-3 w-3" />禁用</span>}
+                      <button onClick={async (e) => { e.stopPropagation();
+                        try { await dataSourceApi.update(ds.id, { enabled: !ds.enabled }); refresh(); }
+                        catch { toast.error("操作失败"); }
+                      }} className={cn("text-[11px] px-1.5 py-0.5 rounded border transition-colors", ds.enabled ? "border-status-resolved/30 text-status-resolved hover:bg-status-resolved/5" : "border-muted-foreground/20 text-muted-foreground hover:bg-muted/20")}>
+                        {ds.enabled ? "启用" : "禁用"}
+                      </button>
                       {healthCheck.find(h => h.id === ds.id) && (
                         <span className={cn("h-1.5 w-1.5 rounded-full", healthCheck.find(h => h.id === ds.id)!.ok ? "bg-status-resolved" : "bg-status-active animate-pulse")} title={healthCheck.find(h => h.id === ds.id)!.ok ? "在线" : "离线"} />
                       )}
