@@ -174,7 +174,7 @@ async def health_check() -> dict[str, str | int]:
 
 # ── Router registration ─────────────────────────────────────────────────────
 
-from app.routes import alerts, auth, chat, datasources, history, jobs, knowledge, rca, rules, users  # noqa: E402
+from app.routes import alerts, auth, chat, datasources, history, jobs, knowledge, rca, rules, systems, users  # noqa: E402
 
 app.include_router(alerts.router, prefix="/api/alerts", tags=["alerts"])
 app.include_router(rca.router, prefix="/api/rca", tags=["rca"])
@@ -186,6 +186,7 @@ app.include_router(users.router, prefix="/api/users", tags=["users"])
 app.include_router(datasources.router, prefix="/api/datasources", tags=["datasources"])
 app.include_router(jobs.router, prefix="/api/jobs", tags=["jobs"])
 app.include_router(knowledge.router, prefix="/api/knowledge", tags=["knowledge"])
+app.include_router(systems.router, prefix="/api/systems", tags=["systems"])
 
 
 # ── Static files (uploaded avatars) ─────────────────────────────────────────
