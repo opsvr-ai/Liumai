@@ -424,6 +424,68 @@ export const dataSourceApi = {
   },
 };
 
+/* ── Application Systems ──────────────────────────── */
+
+export interface AppSystemResource {
+  id: number;
+  resource_type: string;
+  resource_id: number;
+}
+
+export interface AppSystem {
+  id: number;
+  name: string;
+  tier: "L0" | "L1" | "L2";
+  status: "active" | "inactive" | "archived";
+  description?: string | null;
+  resources: AppSystemResource[];
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export const systemApi = {
+  list(params?: { search?: string; tier?: string }) {
+    const qs = new URLSearchParams();
+    if (params?.search) qs.set("search", params.search);
+    if (params?.tier) qs.set("tier", params.tier);
+    const q = qs.toString();
+    return request<AppSystem[]>("GET", `/systems${q ? `?${q}` : ""}`);
+  },
+
+  get(id: number) {
+    return request<AppSystem>("GET", `/systems/${id}`);
+  },
+
+  create(data: { name: string; tier?: string; description?: string }) {
+    return request<AppSystem>("POST", "/systems", data);
+  },
+
+  update(id: number, data: { name?: string; tier?: string; status?: string; description?: string }) {
+    return request<AppSystem>("PUT", `/systems/${id}`, data);
+  },
+
+  delete(id: number) {
+    return request<void>("DELETE", `/systems/${id}`);
+  },
+
+  resources: {
+    list(systemId: number) {
+      return request<AppSystemResource[]>("GET", `/systems/${systemId}/resources`);
+    },
+
+    attach(systemId: number, resourceType: string, resourceId: number) {
+      return request<AppSystemResource>("POST", `/systems/${systemId}/resources`, {
+        resource_type: resourceType,
+        resource_id: resourceId,
+      });
+    },
+
+    detach(systemId: number, resourceId: number) {
+      return request<void>("DELETE", `/systems/${systemId}/resources/${resourceId}`);
+    },
+  },
+};
+
 /* ── Hermes skills & toolsets ─────────────────────── */
 
 export interface HermesSkill {

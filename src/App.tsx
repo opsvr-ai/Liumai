@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Activity, BookOpen, Clock, Database, HelpCircle, History, Home, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
+import { Activity, BookOpen, Clock, Database, HelpCircle, History, Home, Layers, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-context";
 import { DashboardShell, type SidebarItem } from "@/components/layout/dashboard-shell";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -20,6 +20,7 @@ import DataSourcesPage from "@/pages/datasources";
 import ProfilePage from "@/pages/profile";
 import JobsPage from "@/pages/jobs";
 import KnowledgePage from "@/pages/knowledge";
+import SystemsPage from "@/pages/systems";
 import HelpPage from "@/pages/help";
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
@@ -46,6 +47,7 @@ function Shell({ children }: { children: React.ReactNode }) {
       { id: "chat", label: "智能对话", icon: <MessageCircle className="h-4 w-4" />, isActive: location.pathname.startsWith("/chat"), onClick: () => navigate("/chat") },
       { id: "rca", label: "RCA 分析", icon: <Activity className="h-4 w-4" />, isActive: location.pathname.startsWith("/rca"), onClick: () => navigate("/rca") },
       { id: "rules", label: "告警规则", icon: <Shield className="h-4 w-4" />, isActive: location.pathname.startsWith("/rules"), onClick: () => navigate("/rules") },
+      { id: "systems", label: "应用系统", icon: <Layers className="h-4 w-4" />, isActive: location.pathname.startsWith("/systems"), onClick: () => navigate("/systems") },
       { id: "datasources", label: "数据源", icon: <Database className="h-4 w-4" />, isActive: location.pathname.startsWith("/datasources"), onClick: () => navigate("/datasources") },
       { id: "history", label: "历史记录", icon: <History className="h-4 w-4" />, isActive: location.pathname.startsWith("/history"), onClick: () => navigate("/history") },
       { id: "knowledge", label: "知识中心", icon: <BookOpen className="h-4 w-4" />, isActive: location.pathname.startsWith("/knowledge"), onClick: () => navigate("/knowledge") },
@@ -99,6 +101,7 @@ export default function App() {
                     <Route path="/datasources" element={<DataSourcesPage />} />
                     <Route path="/profile" element={<ProfilePage />} />
                     <Route path="/knowledge" element={<KnowledgePage />} />
+                    <Route path="/systems" element={<SystemsPage />} />
                     <Route path="/jobs" element={<RequireAdmin><JobsPage /></RequireAdmin>} />
                     <Route path="/help" element={<HelpPage />} />
                     <Route path="*" element={<Navigate to="/" replace />} />
