@@ -1,16 +1,23 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   ArrowRight,
   BellRing,
   Check,
+  ChevronDown,
+  Clock,
   Copy,
+  Eye,
+  EyeOff,
+  Inbox,
   KeyRound,
   PlayCircle,
   Plus,
   RefreshCw,
+  Save,
   Search,
-  ShieldAlert,
+  SlidersHorizontal,
+  Terminal,
   Trash2,
   Webhook,
   X,
@@ -19,13 +26,25 @@ import {
 import { useAuth } from "@/components/auth/auth-context";
 import { PermissionGate } from "@/components/auth/permission-gate";
 import { usePermissions } from "@/hooks/usePermissions";
+import {
+  CheckChip,
+  CollapsibleList,
+  Field,
+  GroupCard,
+  POLICY_INPUT_CLASS,
+  POLICY_SELECT_CLASS,
+  POLICY_TEXTAREA_CLASS,
+  ToggleRow,
+} from "@/components/alerts/policy-ui";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { cn } from "@/lib/utils";
 import {
   alertsApi,
   rca,
@@ -79,6 +98,14 @@ const NOTIFY_CHANNEL_OPTIONS: Array<{
   { key: "webhook", label: "Webhook", hint: "POST {title, markdown, links, session_id, ts}，5 秒超时" },
   { key: "email", label: "邮件", hint: "SMTP 通过环境变量配置，未配置时静默跳过" },
 ];
+
+const MULTI_PATH_OPTIONS: Array<{ key: "A" | "B" | "C"; label: string; hint: string }> = [
+  { key: "A", label: "关键组件", hint: "告警对象命中关键组件清单，且级别达标" },
+  { key: "B", label: "高危签名", hint: "告警内容命中高危故障签名" },
+  { key: "C", label: "交易量波动", hint: "交易量异常波动信号" },
+];
+
+const SEVERITY_LABEL = ["严重", "重要", "一般", "告警", "提示"];
 
 const STATUS_LABEL: Record<string, string> = {
   pending: "待处理",
@@ -253,6 +280,38 @@ export default function AlertsPage() {
   const inboxPages = Math.max(1, Math.ceil(inboxTotal / pageSize));
   const trashPages = Math.max(1, Math.ceil(trashTotal / pageSize));
 
+  /* ── 草稿脏检查：按分组统计，驱动卡片角标与底部保存栏 ── */
+  const policyDirty = useMemo(() => {
+    if (!draft || !policy) return false;
+    try {
+      return JSON.stringify(toPolicyPayload(draft))
+        !== JSON.stringify(toPolicyPayload(normalizePolicy(policy)));
+    } catch {
+      return false;
+    }
+  }, [draft, policy]);
+
+  const dirtyGroups = useMemo(() => {
+    const empty = { trigger: false, timing: false, retention: false };
+    if (!draft || !policy) return empty;
+    const baseline = normalizePolicy(policy);
+    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+    return {
+      trigger: !same(
+        { trigger: draft.trigger, multi: draft.multi },
+        { trigger: baseline.trigger, multi: baseline.multi },
+      ),
+      timing: !same(
+        { dedup: draft.dedup, rca: draft.rca },
+        { dedup: baseline.dedup, rca: baseline.rca },
+      ),
+      retention: !same(
+        { retention: draft.retention, notify: draft.notify },
+        { retention: baseline.retention, notify: baseline.notify },
+      ),
+    };
+  }, [draft, policy]);
+
   const setMode = useCallback(async (mode: "auto" | "manual") => {
     if (!draft) return;
     setBusy(true);
@@ -421,6 +480,23 @@ export default function AlertsPage() {
     );
   }
 
+  function updateDraft(mutator: (p: AlertPolicyExt) => void) {
+    setDraft((current) => {
+      if (!current) return current;
+      const next = structuredClone(current);
+      mutator(next);
+      return next;
+    });
+  }
+
+  function toggleChannel(key: NotifyChannel, checked: boolean) {
+    updateDraft((p) => {
+      const next = p.notify.channels.filter((c) => c !== key);
+      if (checked) next.push(key);
+      p.notify.channels = next.length ? next : ["wecom"];
+    });
+  }
+
   const statCards = useMemo(() => ([
     { label: "待处理", value: stats?.pending ?? 0, icon: BellRing, color: "text-amber-600", bg: "bg-amber-50" },
     { label: "已触发 RCA", value: stats?.triggered ?? 0, icon: Zap, color: "text-status-resolved", bg: "bg-status-resolved/10" },
@@ -430,11 +506,11 @@ export default function AlertsPage() {
 
   return (
     <div className="p-4 md:p-6 space-y-6 max-w-6xl mx-auto">
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold">告警中心</h2>
-          <p className="text-sm text-muted-foreground mt-0.5">
+      {/* ── Header ─────────────────────────────────────────── */}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h1 className="text-lg font-semibold text-text-primary">告警中心</h1>
+          <p className="mt-0.5 text-sm text-muted-foreground">
             Webhook 告警接入 · 自动去重 / 应用级合并 · 多信号触发 RCA · 近 7 天共 {stats?.total ?? 0} 条
           </p>
         </div>
@@ -442,60 +518,81 @@ export default function AlertsPage() {
           <Button
             variant="outline"
             size="sm"
-            className="h-7 text-xs"
+            className="h-8 gap-1.5 text-xs"
             onClick={() => navigate("/rca?status=running")}
             title="查看运行中的 RCA 会话"
           >
             <PlayCircle className="h-3.5 w-3.5" />
-            进行中事件 {rcaQueue?.active_count ?? 0}
+            进行中事件
+            <Badge variant="secondary" className="h-4 px-1.5 text-[10px] tabular-nums">
+              {rcaQueue?.active_count ?? 0}
+            </Badge>
             <ArrowRight className="h-3.5 w-3.5" />
           </Button>
           <PermissionGate perm="policy">
-            <div className="inline-flex rounded-lg border border-border p-0.5">
+            <div className="inline-flex items-center rounded-lg border border-border p-0.5" role="group" aria-label="触发模式">
               {(["auto", "manual"] as const).map((mode) => (
                 <button
                   key={mode}
+                  type="button"
                   disabled={busy}
+                  aria-pressed={(draft?.mode ?? "auto") === mode}
                   onClick={() => void setMode(mode)}
-                  className={`px-3 h-7 rounded-md text-xs font-medium transition-colors ${
+                  className={cn(
+                    "h-7 rounded-md px-3 text-xs font-medium transition-colors",
                     (draft?.mode ?? "auto") === mode
-                      ? "bg-interactive-primary text-white"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
+                      ? "bg-interactive-primary text-text-on-solid"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
                 >
                   {mode === "auto" ? "自动触发" : "人工触发"}
                 </button>
               ))}
             </div>
           </PermissionGate>
-          <Button variant="ghostMuted" size="icon-sm" onClick={() => void refreshAll()} aria-label="刷新">
-            <RefreshCw className="h-4 w-4" />
+          <Button variant="ghostMuted" size="icon-sm" onClick={() => void refreshAll()} aria-label="刷新" title="刷新">
+            <RefreshCw className={cn("h-4 w-4", loading && "animate-spin")} />
           </Button>
         </div>
       </div>
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+      {/* ── KPI ────────────────────────────────────────────── */}
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         {statCards.map((item) => (
           <Card key={item.label}>
-            <CardContent className="p-3 flex items-center gap-3">
-              <div className={`shrink-0 h-9 w-9 rounded-lg ${item.bg} flex items-center justify-center`}>
-                <item.icon className={`h-4 w-4 ${item.color}`} />
+            <CardContent className="flex items-center gap-3 p-3">
+              <div className={cn("flex h-9 w-9 shrink-0 items-center justify-center rounded-lg", item.bg)}>
+                <item.icon className={cn("h-4 w-4", item.color)} />
               </div>
-              <div>
-                <p className="text-lg font-bold text-text-primary">{item.value}</p>
-                <p className="text-[11px] text-muted-foreground">{item.label}</p>
+              <div className="min-w-0">
+                <p className="text-lg font-bold tabular-nums text-text-primary">{item.value}</p>
+                <p className="text-xs text-muted-foreground">{item.label}</p>
               </div>
             </CardContent>
           </Card>
         ))}
       </div>
 
+      {/* ── Tabs ───────────────────────────────────────────── */}
       <Tabs value={tab} onValueChange={(v) => setTab(String(v) as TabKey)}>
-        <TabsList>
-          <TabsTrigger value="inbox">收件箱 {inboxTotal > 0 ? `(${inboxTotal})` : ""}</TabsTrigger>
-          <TabsTrigger value="trash">垃圾箱</TabsTrigger>
-          <TabsTrigger value="policy">触发策略 / 接入</TabsTrigger>
+        <TabsList className="h-9 p-1">
+          <TabsTrigger value="inbox" className="gap-1.5 px-3 text-xs">
+            <Inbox className="h-3.5 w-3.5" />
+            收件箱
+            {inboxTotal > 0 && (
+              <span className="rounded-full bg-muted px-1.5 text-[10px] font-medium tabular-nums text-muted-foreground">
+                {inboxTotal}
+              </span>
+            )}
+          </TabsTrigger>
+          <TabsTrigger value="trash" className="gap-1.5 px-3 text-xs">
+            <Trash2 className="h-3.5 w-3.5" />
+            垃圾箱
+          </TabsTrigger>
+          <TabsTrigger value="policy" className="gap-1.5 px-3 text-xs">
+            <SlidersHorizontal className="h-3.5 w-3.5" />
+            触发策略 · 接入
+          </TabsTrigger>
         </TabsList>
 
         {/* ── Inbox ─────────────────────────────────────────── */}
@@ -709,202 +806,229 @@ export default function AlertsPage() {
         </TabsContent>
 
         {/* ── Policy / webhook ───────────────────────────────── */}
-        <TabsContent value="policy">
-          <div className="grid gap-4 lg:grid-cols-2">
-            {/* Trigger policy */}
+        <TabsContent value="policy" className="space-y-6">
+          {!draft ? (
             <Card>
-              <CardHeader>
-                <CardTitle className="text-sm font-medium flex items-center gap-2">
-                  <ShieldAlert className="h-4 w-4" /> 触发策略
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                {!draft ? (
-                  <Skeleton className="h-64 w-full" />
-                ) : (
-                  <>
-                    <Field label="严重级别阈值（≤ 该级别立即触发）">
+              <CardContent className="p-6">
+                <Skeleton className="h-64 w-full" />
+              </CardContent>
+            </Card>
+          ) : (
+            <>
+              <div className="space-y-6">
+                {/* ① 触发条件 */}
+                <GroupCard
+                  index="01"
+                  icon={Zap}
+                  title="触发条件"
+                  description="什么情况下值得起一次 RCA：级别阈值、多信号路径与关键对象名单。"
+                  dirty={dirtyGroups.trigger}
+                >
+                  <div className="grid gap-4 md:grid-cols-2 md:gap-5">
+                    <Field label="严重级别阈值" hint="≤ 该级别的告警立即触发 RCA（1 最严重，5 最轻）">
                       <select
-                        className="h-8 w-full rounded-lg border border-input bg-background px-2 text-sm"
+                        className={POLICY_SELECT_CLASS}
                         value={draft.trigger.severity_max}
                         onChange={(e) => updateDraft((p) => { p.trigger.severity_max = Number(e.target.value); })}
                       >
                         {[1, 2, 3, 4, 5].map((n) => (
-                          <option key={n} value={n}>{n} · {["严重", "重要", "一般", "告警", "提示"][n - 1]}</option>
+                          <option key={n} value={n}>{n} · {SEVERITY_LABEL[n - 1]}</option>
                         ))}
                       </select>
                     </Field>
 
-                    <label className="flex items-center gap-2 text-xs text-text-secondary">
-                      <input
-                        type="checkbox"
-                        className="accent-interactive-primary"
-                        checked={draft.trigger.severity_trigger}
-                        onChange={(e) => updateDraft((p) => { p.trigger.severity_trigger = e.target.checked; })}
-                      />
-                      按严重级别直接触发（关闭后仅按关键组件 / 高危签名 / 交易量波动触发）
-                    </label>
-
-                    <div className="grid grid-cols-3 gap-2">
-                      <Field label="分析前溯（分钟）">
-                        <Input
-                          type="number" min={0} max={240} className="h-8 text-sm"
-                          value={draft.trigger.analysis_start_offset_minutes}
-                          onChange={(e) => updateDraft((p) => { p.trigger.analysis_start_offset_minutes = Number(e.target.value); })}
-                        />
-                      </Field>
-                      <Field label="应用合并窗（秒）">
-                        <Input
-                          type="number" min={0} max={86400} className="h-8 text-sm"
-                          value={draft.trigger.app_coalesce_window}
-                          onChange={(e) => updateDraft((p) => { p.trigger.app_coalesce_window = Number(e.target.value); })}
-                        />
-                      </Field>
-                      <Field label="去重窗（秒）">
-                        <Input
-                          type="number" min={0} max={86400} className="h-8 text-sm"
-                          value={draft.dedup.window_seconds}
-                          onChange={(e) => updateDraft((p) => { p.dedup.window_seconds = Number(e.target.value); })}
-                        />
-                      </Field>
-                    </div>
-
-                    <div className="flex items-center gap-4 text-xs">
-                      <span className="text-muted-foreground">多信号路径：</span>
-                      {(["A", "B", "C"] as const).map((key) => (
-                        <label key={key} className="flex items-center gap-1.5">
-                          <input
-                            type="checkbox"
-                            className="accent-interactive-primary"
-                            checked={draft.multi.trigger_paths[key]}
-                            onChange={(e) => updateDraft((p) => { p.multi.trigger_paths[key] = e.target.checked; })}
+                    <Field label="多信号路径" hint="按业务信号补充判断；关闭级别触发后仅这些路径生效">
+                      <div className="flex flex-wrap gap-2">
+                        {MULTI_PATH_OPTIONS.map((option) => (
+                          <CheckChip
+                            key={option.key}
+                            label={option.label}
+                            hint={option.hint}
+                            checked={draft.multi.trigger_paths[option.key]}
+                            onChange={(checked) => updateDraft((p) => { p.multi.trigger_paths[option.key] = checked; })}
                           />
-                          {key === "A" ? "关键组件" : key === "B" ? "高危签名" : "交易量波动"}
-                        </label>
-                      ))}
-                    </div>
-
-                    <Field label="关键组件（每行一个，命中且级别达标即触发）">
-                      <textarea
-                        rows={4}
-                        className="w-full rounded-lg border border-input bg-background px-2 py-1.5 text-xs font-mono"
-                        value={draft.trigger.critical_components.join("\n")}
-                        onChange={(e) => updateDraft((p) => { p.trigger.critical_components = splitLines(e.target.value); })}
-                      />
-                    </Field>
-                    <Field label="高危故障签名（每行一个，命中即触发）">
-                      <textarea
-                        rows={5}
-                        className="w-full rounded-lg border border-input bg-background px-2 py-1.5 text-xs font-mono"
-                        value={draft.trigger.high_risk_keywords.join("\n")}
-                        onChange={(e) => updateDraft((p) => { p.trigger.high_risk_keywords = splitLines(e.target.value); })}
-                      />
+                        ))}
+                      </div>
                     </Field>
 
-                    <div className="grid grid-cols-2 gap-2">
-                      <Field label="RCA 超时（秒）">
+                    <ToggleRow
+                      className="md:col-span-2"
+                      label="按严重级别直接触发"
+                      hint="关闭后仅按关键组件 / 高危签名 / 交易量波动触发"
+                      checked={draft.trigger.severity_trigger}
+                      onChange={(checked) => updateDraft((p) => { p.trigger.severity_trigger = checked; })}
+                    />
+
+                    <CollapsibleList
+                      className="md:col-span-2"
+                      label="关键组件"
+                      hint="命中且级别达标即触发"
+                      value={draft.trigger.critical_components}
+                      onChange={(lines) => updateDraft((p) => { p.trigger.critical_components = lines; })}
+                      placeholder={"payment-service\norder-service"}
+                    />
+                    <CollapsibleList
+                      className="md:col-span-2"
+                      label="高危故障签名"
+                      hint="命中即触发，无需级别达标"
+                      value={draft.trigger.high_risk_keywords}
+                      onChange={(lines) => updateDraft((p) => { p.trigger.high_risk_keywords = lines; })}
+                      placeholder={"OOMKilled\ndeadlock"}
+                    />
+                  </div>
+                </GroupCard>
+
+                {/* ② 时序与合并 */}
+                <GroupCard
+                  index="02"
+                  icon={Clock}
+                  title="时序与合并"
+                  description="触发之后如何收敛：前溯、合并、去重与并发，决定 RCA 会话数量和分析质量。"
+                  dirty={dirtyGroups.timing}
+                  footer={<p className="text-xs text-muted-foreground">窗口越大越不容易重复触发，但首次分析也可能被延后。</p>}
+                >
+                  <div className="grid gap-4 md:grid-cols-2 md:gap-5">
+                    <Field label="分析前溯（分钟）" hint="从告警时间往前回看的数据范围，0–240">
+                      <Input
+                        type="number" min={0} max={240} className={POLICY_INPUT_CLASS}
+                        value={draft.trigger.analysis_start_offset_minutes}
+                        onChange={(e) => updateDraft((p) => { p.trigger.analysis_start_offset_minutes = Number(e.target.value); })}
+                      />
+                    </Field>
+                    <Field label="应用合并窗口（秒）" hint="同应用新告警附着到进行中的 RCA，不重复拉起">
+                      <Input
+                        type="number" min={0} max={86400} className={POLICY_INPUT_CLASS}
+                        value={draft.trigger.app_coalesce_window}
+                        onChange={(e) => updateDraft((p) => { p.trigger.app_coalesce_window = Number(e.target.value); })}
+                      />
+                    </Field>
+                    <Field label="去重窗口（秒）" hint="窗口内相同 alertId 的告警直接忽略">
+                      <Input
+                        type="number" min={0} max={86400} className={POLICY_INPUT_CLASS}
+                        value={draft.dedup.window_seconds}
+                        onChange={(e) => updateDraft((p) => { p.dedup.window_seconds = Number(e.target.value); })}
+                      />
+                    </Field>
+                    <Field label="RCA 超时（秒）" hint="单次分析超过该时长即标记失败，60–7200">
+                      <Input
+                        type="number" min={60} max={7200} className={POLICY_INPUT_CLASS}
+                        value={draft.rca.run_timeout_seconds}
+                        onChange={(e) => updateDraft((p) => { p.rca.run_timeout_seconds = Number(e.target.value); })}
+                      />
+                    </Field>
+                    <Field label="并发上限" hint="同时运行的 RCA 会话数量，1–16">
+                      <Input
+                        type="number" min={1} max={16} className={POLICY_INPUT_CLASS}
+                        value={draft.rca.concurrency}
+                        onChange={(e) => updateDraft((p) => { p.rca.concurrency = Number(e.target.value); })}
+                      />
+                    </Field>
+                    <Field label="当前队列" hint="实时运行 / 排队中的 RCA 会话">
+                      <div className="flex h-9 items-center gap-2 rounded-lg border border-border/70 bg-muted/30 px-2.5">
+                        <Badge variant="success" className="text-[11px] tabular-nums">运行 {rcaQueue?.active_count ?? 0}</Badge>
+                        <Badge variant="secondary" className="text-[11px] tabular-nums">排队 {rcaQueue?.queued_count ?? 0}</Badge>
+                        <span className="text-xs text-muted-foreground tabular-nums">上限 {rcaQueue?.max_concurrency ?? draft.rca.concurrency}</span>
+                      </div>
+                    </Field>
+                  </div>
+                </GroupCard>
+
+                {/* ③ 保留与通知 */}
+                <GroupCard
+                  index="03"
+                  icon={BellRing}
+                  title="保留与通知"
+                  description="数据存多久、清理是否自动，以及 RCA 进度要推送到哪里。"
+                  dirty={dirtyGroups.retention}
+                >
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-sm font-medium text-text-primary">数据保留</p>
+                      <Badge
+                        variant={draft.retention.auto_clear_enabled ? "success" : "outline"}
+                        className="text-[11px]"
+                      >
+                        {draft.retention.auto_clear_enabled ? "自动清理已开启" : "仅手动清理"}
+                      </Badge>
+                    </div>
+
+                    <div className="grid gap-4 md:grid-cols-2 md:gap-5">
+                      <Field label="收件箱保留（天）" hint="0 = 不自动清理，0–3650">
                         <Input
-                          type="number" min={60} max={7200} className="h-8 text-sm"
-                          value={draft.rca.run_timeout_seconds}
-                          onChange={(e) => updateDraft((p) => { p.rca.run_timeout_seconds = Number(e.target.value); })}
+                          type="number" min={0} max={3650} className={POLICY_INPUT_CLASS}
+                          value={draft.retention.inbox_days}
+                          onChange={(e) => updateDraft((p) => { p.retention.inbox_days = Number(e.target.value); })}
                         />
                       </Field>
-                      <Field label="并发上限">
+                      <Field label="垃圾箱保留（天）" hint="0 = 不自动清理，0–3650">
                         <Input
-                          type="number" min={1} max={16} className="h-8 text-sm"
-                          value={draft.rca.concurrency}
-                          onChange={(e) => updateDraft((p) => { p.rca.concurrency = Number(e.target.value); })}
+                          type="number" min={0} max={3650} className={POLICY_INPUT_CLASS}
+                          value={draft.retention.trash_days}
+                          onChange={(e) => updateDraft((p) => { p.retention.trash_days = Number(e.target.value); })}
                         />
                       </Field>
                     </div>
 
-                    <div className="rounded-lg border border-border/60 p-3 space-y-2">
-                      <div className="flex items-center justify-between">
-                        <p className="text-xs font-medium text-text-secondary">告警保留期 / 定时清空</p>
-                        <label className="flex items-center gap-2 text-xs text-text-secondary">
-                          <input
-                            type="checkbox"
-                            className="accent-interactive-primary"
-                            checked={draft.retention.auto_clear_enabled}
-                            onChange={(e) => updateDraft((p) => { p.retention.auto_clear_enabled = e.target.checked; })}
-                          />
-                          自动清空
-                        </label>
-                      </div>
-                      <div className="grid grid-cols-2 gap-2">
-                        <Field label="收件箱保留（天，0=不清理）">
-                          <Input
-                            type="number" min={0} max={3650} className="h-8 text-sm"
-                            value={draft.retention.inbox_days}
-                            onChange={(e) => updateDraft((p) => { p.retention.inbox_days = Number(e.target.value); })}
-                          />
-                        </Field>
-                        <Field label="垃圾箱保留（天，0=不清理）">
-                          <Input
-                            type="number" min={0} max={3650} className="h-8 text-sm"
-                            value={draft.retention.trash_days}
-                            onChange={(e) => updateDraft((p) => { p.retention.trash_days = Number(e.target.value); })}
-                          />
-                        </Field>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="text-[11px] text-muted-foreground leading-relaxed">
-                          后台每小时最多自动清理一次（随 webhook / 列表访问惰性触发）。
-                        </p>
+                    <ToggleRow
+                      label="自动清空"
+                      hint="按保留期在后台清理，每小时最多一次（随 webhook / 列表访问惰性触发）"
+                      checked={draft.retention.auto_clear_enabled}
+                      onChange={(checked) => updateDraft((p) => { p.retention.auto_clear_enabled = checked; })}
+                    />
+
+                    <div className="space-y-2 rounded-lg border border-border/70 bg-muted/20 px-3 py-2.5">
+                      <p className="text-xs text-muted-foreground">需要立即释放空间？按当前保留期立刻清理本团队的过期告警。</p>
+                      <div className="flex justify-end">
                         <PermissionGate perm="trash_clear">
                           <Button
-                            variant="outline" size="sm" className="h-7 shrink-0 text-xs"
+                            variant="ghostMuted" size="sm" className="h-7 shrink-0 text-xs"
                             disabled={purgeBusy}
                             onClick={() => void purgeNow()}
                           >
-                            <Trash2 className="h-3.5 w-3.5" /> 立即清理当前团队
+                            <Trash2 className="h-3.5 w-3.5" /> 立即清理
                           </Button>
                         </PermissionGate>
                       </div>
                     </div>
+                  </div>
 
-                    <div className="rounded-lg border border-border/60 p-3 space-y-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <p className="text-xs font-medium text-text-secondary">通知通道</p>
-                        <label className="flex items-center gap-2 text-xs text-text-secondary">
-                          <input
-                            type="checkbox"
-                            className="accent-interactive-primary"
-                            checked={draft.notify.enabled}
-                            onChange={(e) => updateDraft((p) => { p.notify.enabled = e.target.checked; })}
-                          />
-                          启用通知（开始 / 完成 / 失败时推送）
-                        </label>
-                      </div>
+                  <Separator className="bg-border/60" />
 
-                      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-sm font-medium text-text-primary">通知通道</p>
+                      <Badge variant={draft.notify.enabled ? "success" : "outline"} className="text-[11px]">
+                        {draft.notify.enabled ? "已启用" : "未启用"}
+                      </Badge>
+                    </div>
+
+                    <ToggleRow
+                      label="启用通知"
+                      hint="RCA 开始 / 完成 / 失败时推送"
+                      checked={draft.notify.enabled}
+                      onChange={(checked) => updateDraft((p) => { p.notify.enabled = checked; })}
+                    />
+
+                    <Field label="通知渠道" hint="未选择时默认企业微信；渠道配置在关闭通知后仍会保留">
+                      <div className="flex flex-wrap gap-2">
                         {NOTIFY_CHANNEL_OPTIONS.map((option) => (
-                          <label
+                          <CheckChip
                             key={option.key}
-                            className="flex items-center gap-1.5"
-                            title={option.hint}
-                          >
-                            <input
-                              type="checkbox"
-                              className="accent-interactive-primary"
-                              checked={draft.notify.channels.includes(option.key)}
-                              onChange={(e) => updateDraft((p) => {
-                                const next = p.notify.channels.filter((c) => c !== option.key);
-                                if (e.target.checked) next.push(option.key);
-                                p.notify.channels = next.length ? next : ["wecom"];
-                              })}
-                            />
-                            {option.label}
-                          </label>
+                            label={option.label}
+                            hint={option.hint}
+                            checked={draft.notify.channels.includes(option.key)}
+                            onChange={(checked) => toggleChannel(option.key, checked)}
+                          />
                         ))}
-                        <span className="text-[11px] text-muted-foreground">未选择时默认企业微信</span>
                       </div>
+                    </Field>
 
+                    <div className="grid gap-4 md:grid-cols-2 md:gap-5">
                       {draft.notify.channels.includes("wecom") && (
-                        <Field label="企业微信群 chat_id（可选）">
+                        <Field label="企业微信群 chat_id（可选）" hint="留空使用默认接收群">
                           <Input
                             placeholder="企微群 chat_id（可选）"
-                            className="h-8 text-xs"
+                            className={cn(POLICY_INPUT_CLASS, "text-xs")}
                             value={draft.notify.wecom_chat_id}
                             onChange={(e) => updateDraft((p) => { p.notify.wecom_chat_id = e.target.value; })}
                           />
@@ -912,15 +1036,15 @@ export default function AlertsPage() {
                       )}
 
                       {draft.notify.channels.includes("webhook") && (
-                        <Field label="Webhook URL（POST JSON，5 秒超时）">
+                        <Field className="md:col-span-2" label="Webhook 通知地址" hint="POST JSON，5 秒超时；留空则该通道静默跳过">
                           <Input
                             placeholder="https://hooks.example.com/incident"
-                            className="h-8 text-xs font-mono"
+                            className={cn(POLICY_INPUT_CLASS, "font-mono text-xs")}
                             value={draft.notify.webhook_url}
                             onChange={(e) => updateDraft((p) => { p.notify.webhook_url = e.target.value; })}
                           />
                           {!draft.notify.webhook_url.trim() && (
-                            <p className="text-[11px] text-amber-600">
+                            <p className="text-xs text-amber-600">
                               已选择 Webhook 通道但未填写地址，保存后该通道会被静默跳过。
                             </p>
                           )}
@@ -928,238 +1052,393 @@ export default function AlertsPage() {
                       )}
 
                       {draft.notify.channels.includes("email") && (
-                        <Field label="邮件收件人（多个用逗号 / 换行分隔）">
+                        <Field
+                          className="md:col-span-2"
+                          label="邮件收件人"
+                          hint="多个用逗号 / 换行分隔；SMTP 主机与账号通过环境变量配置：SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS（可选 SMTP_SSL / SMTP_TLS、SMTP_FROM），未配置时邮件通道静默跳过"
+                        >
                           <textarea
-                            rows={2}
-                            placeholder="oncall@example.com, sre@example.com"
-                            className="w-full rounded-lg border border-input bg-background px-2 py-1.5 text-xs font-mono"
+                            placeholder={"oncall@example.com\nsre@example.com"}
+                            className={cn(POLICY_TEXTAREA_CLASS, "h-20")}
                             value={draft.notify.email_to}
                             onChange={(e) => updateDraft((p) => { p.notify.email_to = e.target.value; })}
                           />
-                          <p className="text-[11px] leading-relaxed text-muted-foreground">
-                            SMTP 服务器 / 账号 / 密码属于敏感项，通过环境变量配置：
-                            SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / SMTP_FROM
-                            （可选 SMTP_SSL / SMTP_TLS）。SMTP 或收件人未配置时邮件通道静默跳过。
-                          </p>
                         </Field>
                       )}
                     </div>
-
-                    <div className="flex justify-end gap-2">
-                      <Button variant="outline" size="sm" onClick={() => setDraft(policy ? normalizePolicy(policy) : null)}>
-                        还原
-                      </Button>
-                      <PermissionGate perm="policy">
-                        <Button size="sm" disabled={busy} onClick={() => void saveDraft()}>
-                          保存策略
-                        </Button>
-                      </PermissionGate>
-                    </div>
-                    {!has("policy") && <p className="text-[11px] text-muted-foreground text-right">当前角色缺少「改变触发策略」权限</p>}
-                  </>
-                )}
-              </CardContent>
-            </Card>
-
-            {/* Webhook integration */}
-            <Card>
-              <CardHeader>
-                <CardTitle className="text-sm font-medium flex items-center gap-2">
-                  <Webhook className="h-4 w-4" /> Webhook 接入
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                {!webhook ? (
-                  <Skeleton className="h-64 w-full" />
-                ) : (
-                  <>
-                    <Field label="回调地址">
-                      <div className="flex gap-2">
-                        <Input readOnly value={webhook.url} className="h-8 text-xs font-mono" />
-                        <Button variant="outline" size="icon-sm" onClick={() => copyText(webhook.url, "地址")}><Copy className="h-3.5 w-3.5" /></Button>
-                      </div>
-                    </Field>
-
-                    <Field label={`鉴权令牌${webhook.token_configured ? "（已启用）" : "（未启用，开放接入）"}`}>
-                      <div className="flex gap-2">
-                        <Input
-                          readOnly
-                          type={showToken ? "text" : "password"}
-                          value={webhook.token || "未设置"}
-                          className="h-8 text-xs font-mono"
-                        />
-                        <Button variant="outline" size="icon-sm" onClick={() => setShowToken((v) => !v)}><KeyRound className="h-3.5 w-3.5" /></Button>
-                        <Button variant="outline" size="icon-sm" onClick={() => copyText(webhook.token, "令牌")}><Copy className="h-3.5 w-3.5" /></Button>
-                        {isAdmin && <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => void rotateToken()}>重新生成</Button>}
-                      </div>
-                    </Field>
-
-                    <Field label="测试命令">
-                      <pre className="rounded-lg bg-muted/60 p-3 text-[11px] leading-relaxed overflow-x-auto whitespace-pre-wrap break-all">{webhook.curl}</pre>
-                      <div className="flex justify-end">
-                        <Button variant="ghostMuted" size="sm" className="h-7 text-xs" onClick={() => copyText(webhook.curl, "命令")}>
-                          <Copy className="h-3 w-3" /> 复制 curl
-                        </Button>
-                      </div>
-                    </Field>
-
-                    <Field label="支持的告警格式">
-                      <ul className="space-y-1 text-xs text-muted-foreground">
-                        {webhook.formats.map((f) => <li key={f}>• {f}</li>)}
-                      </ul>
-                    </Field>
-
-                    <details className="text-xs">
-                      <summary className="cursor-pointer text-interactive-primary select-none">查看示例告警 JSON</summary>
-                      <pre className="mt-2 rounded-lg bg-muted/60 p-3 text-[11px] overflow-x-auto">{JSON.stringify(webhook.sample_payload, null, 2)}</pre>
-                    </details>
-
-                    <div className="rounded-lg border border-border/60 p-3 text-[11px] leading-relaxed text-muted-foreground space-y-1">
-                      <p>• 支持单条对象或 JSON 数组批量推送；Tarsier 原生字段与通用字段（alertId/alertLevel/alertContent…）均可。</p>
-                      <p>• 去重窗内重复 alertId 会被忽略；同应用在合并窗口内的新告警会附着到进行中的 RCA，不重复拉起会话。</p>
-                      <p>• 自动模式下按策略判定；人工模式下所有告警先入收件箱，可勾选后触发。</p>
-                    </div>
-                  </>
-                )}
-              </CardContent>
-            </Card>
-          </div>
-
-          {/* Multi-team webhook tokens (P2-13) */}
-          <Card className="mt-4">
-            <CardHeader>
-              <CardTitle className="text-sm font-medium flex items-center gap-2">
-                <KeyRound className="h-4 w-4" /> Webhook 令牌 → 团队
-                <span className="text-xs font-normal text-muted-foreground">（多团队接入）</span>
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              {!isAdmin ? (
-                <p className="text-xs text-muted-foreground">仅管理员可查看和管理 webhook 令牌。</p>
-              ) : !tokens ? (
-                <Skeleton className="h-24 w-full" />
-              ) : (
-                <>
-                  <div className="rounded-lg border border-border/60 p-3 text-[11px] leading-relaxed text-muted-foreground space-y-1">
-                    {tokens.configured ? (
-                      <p>
-                        已配置 {tokens.items.length} 个令牌：推送时按 <code className="mx-0.5">X-Webhook-Token</code>
-                        （或 <code className="mx-0.5">?token=</code>）匹配团队；未命中或已禁用一律返回 401。
-                      </p>
-                    ) : (
-                      <p>
-                        当前为单团队兼容模式：未配置令牌映射，所有 webhook 告警归入 team 1，
-                        并沿用全局令牌校验（若已设置）。
-                      </p>
-                    )}
-                    {tokens.configured && tokens.legacy_token_configured && (
-                      <p>旧全局令牌仍可用，统一视为 team 1；如需完全隔离，请清空全局令牌。</p>
-                    )}
-                    <p>令牌明文只保存一份，列表仅显示前 6 位；创建后完整值仅展示一次。</p>
                   </div>
+                </GroupCard>
 
-                  {tokens.items.length > 0 && (
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-sm">
-                        <thead>
-                          <tr className="border-b border-border text-muted-foreground text-xs">
-                            <th className="text-left px-3 py-2 font-medium">名称</th>
-                            <th className="text-left px-3 py-2 font-medium">团队</th>
-                            <th className="text-left px-3 py-2 font-medium">创建时间</th>
-                            <th className="text-left px-3 py-2 font-medium">令牌（掩码）</th>
-                            <th className="text-right px-3 py-2 font-medium">操作</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {tokens.items.map((item) => (
-                            <tr key={item.id} className="border-b border-border/50">
-                              <td className="px-3 py-2 text-xs">{item.name}</td>
-                              <td className="px-3 py-2 text-xs">
-                                {item.team_name || "—"}
-                                <span className="text-muted-foreground">（team {item.team_id}）</span>
-                              </td>
-                              <td className="px-3 py-2 text-xs text-muted-foreground whitespace-nowrap">
-                                {fmtTime(item.created_at)}
-                              </td>
-                              <td className="px-3 py-2">
-                                <code className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded">{item.masked}</code>
-                              </td>
-                              <td className="px-3 py-2 text-right">
-                                <Button
-                                  variant="ghostMuted" size="icon-sm" title="删除令牌"
-                                  disabled={tokenBusy}
-                                  onClick={() => void deleteToken(item)}
-                                >
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                </Button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-
-                  <div className="flex flex-wrap items-end gap-2">
-                    <Field label="名称（可选）">
-                      <Input
-                        value={tokenName}
-                        onChange={(e) => setTokenName(e.target.value)}
-                        placeholder="例如：支付团队接入"
-                        className="h-8 w-52 text-xs"
-                      />
-                    </Field>
-                    <Field label="归属团队">
-                      <select
-                        className="h-8 rounded-lg border border-input bg-background px-2 text-sm"
-                        value={tokenTeam}
-                        onChange={(e) => setTokenTeam(Number(e.target.value))}
-                        disabled={tokens.teams.length === 0}
-                      >
-                        {tokens.teams.map((team) => (
-                          <option key={team.id} value={team.id}>
-                            {team.name}（team {team.id}）
-                          </option>
-                        ))}
-                      </select>
-                    </Field>
-                    <Button
-                      size="sm" className="h-8 text-xs"
-                      disabled={
-                        tokenBusy
-                        || tokens.teams.length === 0
-                        || tokens.items.length >= tokens.max_tokens
-                      }
-                      onClick={() => void createToken()}
-                    >
-                      <Plus className="h-3.5 w-3.5" /> 生成令牌
-                    </Button>
-                  </div>
-
-                  {createdToken && (
-                    <div className="rounded-lg border border-status-resolved/40 bg-status-resolved/10 p-3 space-y-2">
-                      <p className="text-xs font-medium text-text-primary">
-                        新令牌（仅完整展示这一次，请立即复制保存）
-                      </p>
-                      <div className="flex gap-2">
-                        <Input readOnly value={createdToken.token} className="h-8 text-xs font-mono" />
-                        <Button
-                          variant="outline" size="icon-sm"
-                          onClick={() => copyText(createdToken.token, "令牌")}
+                {/* Webhook 接入 */}
+                <Card>
+                  <CardHeader>
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <CardTitle className="flex items-center gap-2 text-sm font-semibold text-text-primary">
+                          <Webhook className="h-4 w-4 text-muted-foreground" /> Webhook 接入
+                        </CardTitle>
+                        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                          把监控系统告警 POST 到下方地址，自动进入去重 / 合并 / 触发流程。
+                        </p>
+                      </div>
+                      {webhook && (
+                        <Badge
+                          variant={webhook.token_configured ? "success" : "investigating"}
+                          className="shrink-0 text-[11px]"
                         >
-                          <Copy className="h-3.5 w-3.5" />
-                        </Button>
-                      </div>
-                      <p className="text-[11px] text-muted-foreground">
-                        名称 {createdToken.item.name} · 归属 {createdToken.item.team_name || "—"}
-                        （team {createdToken.item.team_id}）
-                      </p>
+                          {webhook.token_configured ? "鉴权已启用" : "开放接入"}
+                        </Badge>
+                      )}
                     </div>
-                  )}
-                </>
-              )}
-            </CardContent>
-          </Card>
+                  </CardHeader>
+                  <CardContent className="space-y-5">
+                    {!webhook ? (
+                      <Skeleton className="h-64 w-full" />
+                    ) : (
+                      <>
+                        {/* 1. 接入地址 */}
+                        <div className="space-y-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-md bg-muted px-1.5 text-[11px] font-semibold tabular-nums text-muted-foreground">
+                              1
+                            </span>
+                            <p className="text-xs font-medium text-text-secondary">接入地址</p>
+                            <Badge variant="secondary" className="text-[11px]">POST</Badge>
+                          </div>
+                          <div className="flex gap-2">
+                            <Input
+                              readOnly
+                              value={webhook.url}
+                              aria-label="Webhook 接入地址"
+                              className="h-9 font-mono text-xs"
+                            />
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-9 w-9 shrink-0"
+                              onClick={() => copyText(webhook.url, "地址")}
+                              aria-label="复制接入地址"
+                              title="复制接入地址"
+                            >
+                              <Copy className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                          <p className="text-xs text-muted-foreground">支持单条 JSON 对象或数组批量推送，批量时逐条判定触发。</p>
+                        </div>
+
+                        <Separator className="bg-border/60" />
+
+                        {/* 2. 鉴权令牌 */}
+                        <div className="space-y-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-md bg-muted px-1.5 text-[11px] font-semibold tabular-nums text-muted-foreground">
+                              2
+                            </span>
+                            <p className="text-xs font-medium text-text-secondary">鉴权令牌</p>
+                            <Badge
+                              variant={webhook.token_configured ? "success" : "outline"}
+                              className="text-[11px]"
+                            >
+                              {webhook.token_configured ? "已启用" : "未启用"}
+                            </Badge>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <Input
+                              readOnly
+                              type={showToken ? "text" : "password"}
+                              value={webhook.token || "未设置"}
+                              aria-label="Webhook 鉴权令牌"
+                              className="h-9 min-w-[12rem] flex-1 font-mono text-xs"
+                            />
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-9 w-9 shrink-0"
+                              onClick={() => setShowToken((v) => !v)}
+                              aria-label={showToken ? "隐藏令牌" : "显示令牌"}
+                              title={showToken ? "隐藏令牌" : "显示令牌"}
+                            >
+                              {showToken ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-9 w-9 shrink-0"
+                              onClick={() => copyText(webhook.token, "令牌")}
+                              aria-label="复制令牌"
+                              title="复制令牌"
+                            >
+                              <Copy className="h-3.5 w-3.5" />
+                            </Button>
+                            {isAdmin && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-9 shrink-0 text-xs"
+                                onClick={() => void rotateToken()}
+                              >
+                                <RefreshCw className="h-3.5 w-3.5" /> 重新生成
+                              </Button>
+                            )}
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            {webhook.token_configured
+                              ? "推送需携带 X-Webhook-Token 请求头或 ?token= 查询参数。"
+                              : "当前未启用令牌，任何来源都可推送；建议重新生成令牌。"}
+                          </p>
+                        </div>
+
+                        {/* 3. 测试命令（默认折叠） */}
+                        <details className="group rounded-lg border border-border/70">
+                          <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 [&::-webkit-details-marker]:hidden">
+                            <Terminal className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                            <span className="flex-1 text-xs font-medium text-text-secondary">测试命令</span>
+                            <span className="text-xs text-muted-foreground">curl 自测</span>
+                            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+                          </summary>
+                          <div className="space-y-2 border-t border-border/60 p-3">
+                            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-muted/60 p-3 text-[11px] leading-relaxed text-text-secondary">{webhook.curl}</pre>
+                            <div className="flex justify-end">
+                              <Button
+                                variant="ghostMuted"
+                                size="sm"
+                                className="h-7 text-xs"
+                                onClick={() => copyText(webhook.curl, "命令")}
+                              >
+                                <Copy className="h-3 w-3" /> 复制 curl
+                              </Button>
+                            </div>
+                          </div>
+                        </details>
+
+                        {/* 支持的告警格式（默认折叠） */}
+                        <details className="group rounded-lg border border-border/70">
+                          <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 [&::-webkit-details-marker]:hidden">
+                            <span className="flex-1 text-xs font-medium text-text-secondary">支持的告警格式</span>
+                            <Badge variant="secondary" className="text-[11px] tabular-nums">
+                              {webhook.formats.length}
+                            </Badge>
+                            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+                          </summary>
+                          <ul className="space-y-1 border-t border-border/60 px-3 py-2.5 text-xs text-muted-foreground">
+                            {webhook.formats.map((f) => (
+                              <li key={f} className="flex gap-1.5">
+                                <span aria-hidden="true">·</span>
+                                <span>{f}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+
+                        {/* 示例 JSON（默认折叠） */}
+                        <details className="group rounded-lg border border-border/70">
+                          <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 [&::-webkit-details-marker]:hidden">
+                            <span className="flex-1 text-xs font-medium text-text-secondary">示例告警 JSON</span>
+                            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+                          </summary>
+                          <pre className="max-h-72 overflow-auto border-t border-border/60 p-3 text-[11px] leading-relaxed">{JSON.stringify(webhook.sample_payload, null, 2)}</pre>
+                        </details>
+
+                        <div className="space-y-1 rounded-lg border border-border/60 bg-muted/20 p-3 text-xs leading-relaxed text-muted-foreground">
+                          <p>· 支持单条对象或 JSON 数组批量推送；Tarsier 原生字段与通用字段（alertId / alertLevel / alertContent…）均可。</p>
+                          <p>· 去重窗内重复 alertId 会被忽略；同应用在合并窗口内的新告警会附着到进行中的 RCA，不重复拉起会话。</p>
+                          <p>· 自动模式下按策略判定；人工模式下所有告警先入收件箱，可勾选后触发。</p>
+                        </div>
+                      </>
+                    )}
+                  </CardContent>
+                </Card>
+
+                {/* Multi-team webhook tokens (P2-13) */}
+                <Card>
+                  <CardHeader>
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <CardTitle className="flex items-center gap-2 text-sm font-semibold text-text-primary">
+                          <KeyRound className="h-4 w-4 text-muted-foreground" /> Webhook 令牌 → 团队
+                          <Badge variant="outline" className="text-[11px]">仅管理员</Badge>
+                        </CardTitle>
+                        <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                          多团队接入：按令牌把告警路由到不同团队，未配置时全部归入 team 1。
+                        </p>
+                      </div>
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-4">
+                    {!isAdmin ? (
+                      <p className="text-xs text-muted-foreground">仅管理员可查看和管理 webhook 令牌。</p>
+                    ) : !tokens ? (
+                      <Skeleton className="h-24 w-full" />
+                    ) : (
+                      <>
+                        <div className="space-y-1 rounded-lg border border-border/60 bg-muted/20 p-3 text-xs leading-relaxed text-muted-foreground">
+                          {tokens.configured ? (
+                            <p>
+                              已配置 {tokens.items.length} 个令牌：推送时按 <code className="mx-0.5">X-Webhook-Token</code>
+                              （或 <code className="mx-0.5">?token=</code>）匹配团队；未命中或已禁用一律返回 401。
+                            </p>
+                          ) : (
+                            <p>
+                              当前为单团队兼容模式：未配置令牌映射，所有 webhook 告警归入 team 1，
+                              并沿用全局令牌校验（若已设置）。
+                            </p>
+                          )}
+                          {tokens.configured && tokens.legacy_token_configured && (
+                            <p>旧全局令牌仍可用，统一视为 team 1；如需完全隔离，请清空全局令牌。</p>
+                          )}
+                          <p>令牌明文只保存一份，列表仅显示前 6 位；创建后完整值仅展示一次。</p>
+                        </div>
+
+                        {tokens.items.length > 0 && (
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                              <thead>
+                                <tr className="border-b border-border text-muted-foreground text-xs">
+                                  <th className="text-left px-3 py-2 font-medium">名称</th>
+                                  <th className="text-left px-3 py-2 font-medium">团队</th>
+                                  <th className="text-left px-3 py-2 font-medium">创建时间</th>
+                                  <th className="text-left px-3 py-2 font-medium">令牌（掩码）</th>
+                                  <th className="text-right px-3 py-2 font-medium">操作</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {tokens.items.map((item) => (
+                                  <tr key={item.id} className="border-b border-border/50">
+                                    <td className="px-3 py-2 text-xs">{item.name}</td>
+                                    <td className="px-3 py-2 text-xs">
+                                      {item.team_name || "—"}
+                                      <span className="text-muted-foreground">（team {item.team_id}）</span>
+                                    </td>
+                                    <td className="px-3 py-2 text-xs text-muted-foreground whitespace-nowrap">
+                                      {fmtTime(item.created_at)}
+                                    </td>
+                                    <td className="px-3 py-2">
+                                      <code className="text-xs font-mono bg-muted px-1.5 py-0.5 rounded">{item.masked}</code>
+                                    </td>
+                                    <td className="px-3 py-2 text-right">
+                                      <Button
+                                        variant="ghostMuted" size="icon-sm" title="删除令牌"
+                                        disabled={tokenBusy}
+                                        onClick={() => void deleteToken(item)}
+                                      >
+                                        <Trash2 className="h-3.5 w-3.5" />
+                                      </Button>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        )}
+
+                        <div className="flex flex-wrap items-end gap-2">
+                          <Field label="名称（可选）">
+                            <Input
+                              value={tokenName}
+                              onChange={(e) => setTokenName(e.target.value)}
+                              placeholder="例如：支付团队接入"
+                              className="h-9 w-52 text-xs"
+                            />
+                          </Field>
+                          <Field label="归属团队">
+                            <select
+                              className={cn(POLICY_SELECT_CLASS, "w-auto")}
+                              value={tokenTeam}
+                              onChange={(e) => setTokenTeam(Number(e.target.value))}
+                              disabled={tokens.teams.length === 0}
+                            >
+                              {tokens.teams.map((team) => (
+                                <option key={team.id} value={team.id}>
+                                  {team.name}（team {team.id}）
+                                </option>
+                              ))}
+                            </select>
+                          </Field>
+                          <Button
+                            size="sm" className="h-9 text-xs"
+                            disabled={
+                              tokenBusy
+                              || tokens.teams.length === 0
+                              || tokens.items.length >= tokens.max_tokens
+                            }
+                            onClick={() => void createToken()}
+                          >
+                            <Plus className="h-3.5 w-3.5" /> 生成令牌
+                          </Button>
+                        </div>
+
+                        {createdToken && (
+                          <div className="rounded-lg border border-status-resolved/40 bg-status-resolved/10 p-3 space-y-2">
+                            <p className="text-xs font-medium text-text-primary">
+                              新令牌（仅完整展示这一次，请立即复制保存）
+                            </p>
+                            <div className="flex gap-2">
+                              <Input readOnly value={createdToken.token} className="h-9 font-mono text-xs" />
+                              <Button
+                                variant="outline" size="icon"
+                                className="h-9 w-9 shrink-0"
+                                onClick={() => copyText(createdToken.token, "令牌")}
+                                aria-label="复制新令牌"
+                              >
+                                <Copy className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                            <p className="text-xs text-muted-foreground">
+                              名称 {createdToken.item.name} · 归属 {createdToken.item.team_name || "—"}
+                              （team {createdToken.item.team_id}）
+                            </p>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </CardContent>
+                </Card>
+              </div>
+
+              {/* 底部粘性保存栏：集中「保存策略」+ 已修改提示 */}
+              <div className="sticky bottom-0 z-20">
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-border bg-card/95 px-4 py-3 shadow-lg backdrop-blur">
+                  <div className="flex min-w-0 flex-wrap items-center gap-2">
+                    {policyDirty ? (
+                      <>
+                        <Badge variant="investigating" className="text-[11px]">有未保存的修改</Badge>
+                        <span className="text-xs text-muted-foreground">保存后立即生效</span>
+                      </>
+                    ) : (
+                      <>
+                        <Badge variant="success" className="text-[11px]">已保存</Badge>
+                        <span className="text-xs text-muted-foreground">策略与当前生效配置一致</span>
+                      </>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="ghostMuted" size="sm" className="h-8 text-xs"
+                      disabled={!policyDirty || busy}
+                      onClick={() => setDraft(policy ? normalizePolicy(policy) : null)}
+                    >
+                      还原
+                    </Button>
+                    <PermissionGate perm="policy">
+                      <Button
+                        size="sm" className="h-8 gap-1.5 text-xs"
+                        disabled={!policyDirty || busy}
+                        onClick={() => void saveDraft()}
+                      >
+                        {busy ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+                        保存策略
+                      </Button>
+                    </PermissionGate>
+                  </div>
+                </div>
+                {!has("policy") && (
+                  <p className="mt-1.5 text-right text-xs text-muted-foreground">
+                    当前角色缺少「改变触发策略」权限，仅可查看。
+                  </p>
+                )}
+              </div>
+            </>
+          )}
         </TabsContent>
       </Tabs>
 
@@ -1204,22 +1483,9 @@ export default function AlertsPage() {
       </Sheet>
     </div>
   );
-
-  function updateDraft(mutator: (p: AlertPolicyExt) => void) {
-    setDraft((current) => {
-      if (!current) return current;
-      const next = structuredClone(current);
-      mutator(next);
-      return next;
-    });
-  }
 }
 
 /* ── small helpers ─────────────────────────────────────── */
-
-function splitLines(text: string): string[] {
-  return text.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-}
 
 function splitEmails(text: string): string[] {
   return text.split(/[,;\s]+/).map((s) => s.trim()).filter(Boolean);
@@ -1279,15 +1545,6 @@ function toPolicyPayload(draft: AlertPolicyExt): AlertPolicyExt {
       email_to: splitEmails(draft.notify.email_to),
     },
   };
-}
-
-function Field({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="space-y-1.5">
-      <p className="text-[11px] font-medium text-text-secondary">{label}</p>
-      {children}
-    </div>
-  );
 }
 
 function Kv({ label, value, mono }: { label: string; value: string; mono?: boolean }) {

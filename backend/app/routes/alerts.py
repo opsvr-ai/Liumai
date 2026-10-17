@@ -38,7 +38,7 @@ from fastapi import (
     status,
 )
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -191,6 +191,23 @@ class AlertOut(BaseModel):
     rca_session_id: int | None
     raw_payload: dict[str, Any] | None
     created_at: datetime
+
+    @field_validator("raw_payload", mode="before")
+    @classmethod
+    def _coerce_raw_payload(cls, v: Any) -> Any:
+        """Accept legacy rows that stored ``raw_payload`` as a JSON string.
+
+        Some writers (older code paths, external integrations, seed scripts)
+        store the payload as text.  Without this coercion the whole inbox/trash
+        listing 500s on the first such row.
+        """
+        if isinstance(v, str):
+            import json as _json
+            try:
+                return _json.loads(v)
+            except Exception:
+                return {"_raw": v[:2000]}
+        return v
 
 
 class PaginatedAlerts(BaseModel):
