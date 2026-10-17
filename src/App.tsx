@@ -1,82 +1,74 @@
-import { useMemo } from "react";
-import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Activity, BellRing, BookOpen, Clock, Database, HelpCircle, History, Home, Layers, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
+import { Suspense, useMemo, useState, type ReactNode } from "react";
+import { BrowserRouter, Navigate, Outlet, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/components/auth/auth-context";
-import { DashboardShell, type SidebarItem } from "@/components/layout/dashboard-shell";
+import { DashboardShell, type SidebarGroup } from "@/components/layout/dashboard-shell";
+import { CommandPalette } from "@/components/layout/command-palette";
+import { BootLoader, PageLoader } from "@/components/layout/page-loader";
+import { buildNavGroups, canAccess, isNavItemActive, type NavPermission } from "@/components/layout/nav-config";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "sonner";
 
-import LoginPage from "@/pages/login";
-import DashboardPage from "@/pages/dashboard";
-import AlertsPage from "@/pages/alerts";
-import ChatPage from "@/pages/chat/chat-page";
-import RcaPage from "@/pages/rca/rca-page";
-import RulesPage from "@/pages/rules/rules-page";
-import HistoryPage from "@/pages/history/history-page";
-import SettingsPage from "@/pages/settings";
-import UsersPage from "@/pages/users";
-import SkillsPage from "@/pages/skills";
-import DataSourcesPage from "@/pages/datasources";
-import ProfilePage from "@/pages/profile";
-import JobsPage from "@/pages/jobs";
-import KnowledgePage from "@/pages/knowledge";
-import SystemsPage from "@/pages/systems";
-import HelpPage from "@/pages/help";
+import { APP_ROUTES, LoginPage } from "@/routes";
 
-function RequireAuth({ children }: { children: React.ReactNode }) {
+function RequireAuth({ children }: { children: ReactNode }) {
   const { isAuthenticated } = useAuth();
   const location = useLocation();
   if (!isAuthenticated) return <Navigate to="/login" state={{ from: location }} replace />;
   return <>{children}</>;
 }
 
-function RequireAdmin({ children }: { children: React.ReactNode }) {
-  const { isAdmin } = useAuth();
-  if (!isAdmin) return <Navigate to="/" replace />;
+function RequirePermission({ permission, children }: { permission?: NavPermission; children: ReactNode }) {
+  const { role } = useAuth();
+  if (!canAccess(permission, role)) return <Navigate to="/" replace />;
   return <>{children}</>;
 }
 
-function Shell({ children }: { children: React.ReactNode }) {
-  const { username, role, logout, isAdmin } = useAuth();
+function AppShell() {
+  const { username, role, logout } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
-  const sidebarItems = useMemo<SidebarItem[]>(() => {
-    const items: SidebarItem[] = [
-      { id: "home", label: "概览", icon: <Home className="h-4 w-4" />, isActive: location.pathname === "/", onClick: () => navigate("/") },
-      { id: "alerts", label: "告警中心", icon: <BellRing className="h-4 w-4" />, isActive: location.pathname.startsWith("/alerts"), onClick: () => navigate("/alerts") },
-      { id: "chat", label: "智能对话", icon: <MessageCircle className="h-4 w-4" />, isActive: location.pathname.startsWith("/chat"), onClick: () => navigate("/chat") },
-      { id: "rca", label: "RCA 分析", icon: <Activity className="h-4 w-4" />, isActive: location.pathname.startsWith("/rca"), onClick: () => navigate("/rca") },
-      { id: "rules", label: "告警规则", icon: <Shield className="h-4 w-4" />, isActive: location.pathname.startsWith("/rules"), onClick: () => navigate("/rules") },
-      { id: "systems", label: "应用系统", icon: <Layers className="h-4 w-4" />, isActive: location.pathname.startsWith("/systems"), onClick: () => navigate("/systems") },
-      { id: "datasources", label: "数据源", icon: <Database className="h-4 w-4" />, isActive: location.pathname.startsWith("/datasources"), onClick: () => navigate("/datasources") },
-      { id: "history", label: "历史记录", icon: <History className="h-4 w-4" />, isActive: location.pathname.startsWith("/history"), onClick: () => navigate("/history") },
-      { id: "knowledge", label: "知识中心", icon: <BookOpen className="h-4 w-4" />, isActive: location.pathname.startsWith("/knowledge"), onClick: () => navigate("/knowledge") },
-      { id: "skills", label: "技能中心", icon: <Wrench className="h-4 w-4" />, isActive: location.pathname.startsWith("/skills"), onClick: () => navigate("/skills") },
-      { id: "jobs", label: "定时任务", icon: <Clock className="h-4 w-4" />, isActive: location.pathname.startsWith("/jobs"), onClick: () => navigate("/jobs") },
-    ];
-    if (isAdmin) {
-      items.push(
-        { id: "users", label: "用户管理", icon: <Users className="h-4 w-4" />, isActive: location.pathname.startsWith("/users"), onClick: () => navigate("/users") },
-        { id: "settings", label: "系统设置", icon: <Settings className="h-4 w-4" />, isActive: location.pathname.startsWith("/settings"), onClick: () => navigate("/settings") },
-      );
-    }
-    return items;
-  }, [location.pathname, navigate, isAdmin]);
+  // Navigation is derived from the single config in nav-config.ts. Permission
+  // filtering happens there; this layer only maps config → shell view model.
+  const navGroups = useMemo<SidebarGroup[]>(() => {
+    return buildNavGroups(role).map((group) => ({
+      id: group.id,
+      label: group.label,
+      collapsible: group.collapsible,
+      items: group.items.map((item) => ({
+        id: item.id,
+        label: item.label,
+        href: item.path,
+        icon: <item.icon className="h-4 w-4" />,
+        isActive: isNavItemActive(item, location.pathname),
+      })),
+    }));
+  }, [role, location.pathname]);
 
   return (
-    <DashboardShell
-      sidebarItems={sidebarItems}
-      onHomeClick={() => navigate("/")}
-      userInfo={{
-        username: username ?? "",
-        role: role ?? "",
-        onLogout: () => { logout(); navigate("/login"); },
-      }}
-    >
-      {children}
-    </DashboardShell>
+    <>
+      <DashboardShell
+        navGroups={navGroups}
+        onHomeClick={() => navigate("/")}
+        onOpenCommandPalette={() => setPaletteOpen(true)}
+        userInfo={{
+          username: username ?? "",
+          role: role ?? "",
+          onLogout: () => {
+            logout();
+            navigate("/login");
+          },
+        }}
+      >
+        {/* Route-level code splitting: only the matched page chunk is loaded. */}
+        <Suspense fallback={<PageLoader />}>
+          <Outlet />
+        </Suspense>
+      </DashboardShell>
+      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
+    </>
   );
 }
 
@@ -86,35 +78,38 @@ export default function App() {
       <TooltipProvider>
         <AuthProvider>
           <BrowserRouter>
-          <Routes>
-            <Route path="/login" element={<LoginPage />} />
-            <Route path="*" element={
-              <RequireAuth>
-                <Shell>
-                  <Routes>
-                    <Route path="/" element={<DashboardPage />} />
-                    <Route path="/alerts" element={<AlertsPage />} />
-                    <Route path="/chat" element={<ChatPage />} />
-                    <Route path="/rca" element={<RcaPage />} />
-                    <Route path="/rules" element={<RulesPage />} />
-                    <Route path="/history" element={<HistoryPage />} />
-                    <Route path="/settings" element={<RequireAdmin><SettingsPage /></RequireAdmin>} />
-                    <Route path="/users" element={<RequireAdmin><UsersPage /></RequireAdmin>} />
-                    <Route path="/skills" element={<SkillsPage />} />
-                    <Route path="/datasources" element={<DataSourcesPage />} />
-                    <Route path="/profile" element={<ProfilePage />} />
-                    <Route path="/knowledge" element={<KnowledgePage />} />
-                    <Route path="/systems" element={<SystemsPage />} />
-                    <Route path="/jobs" element={<RequireAdmin><JobsPage /></RequireAdmin>} />
-                    <Route path="/help" element={<HelpPage />} />
-                    <Route path="*" element={<Navigate to="/" replace />} />
-                  </Routes>
-                </Shell>
-              </RequireAuth>
-            } />
-          </Routes>
-          <Toaster position="top-right" richColors />
-        </BrowserRouter>
+            <Routes>
+              <Route
+                path="/login"
+                element={
+                  <Suspense fallback={<BootLoader />}>
+                    <LoginPage />
+                  </Suspense>
+                }
+              />
+              <Route
+                element={
+                  <RequireAuth>
+                    <AppShell />
+                  </RequireAuth>
+                }
+              >
+                {APP_ROUTES.map(({ path, Component, permission }) => (
+                  <Route
+                    key={path}
+                    path={path}
+                    element={
+                      <RequirePermission permission={permission}>
+                        <Component />
+                      </RequirePermission>
+                    }
+                  />
+                ))}
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Route>
+            </Routes>
+            <Toaster position="top-right" richColors />
+          </BrowserRouter>
         </AuthProvider>
       </TooltipProvider>
     </ErrorBoundary>

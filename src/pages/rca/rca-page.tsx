@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   Activity,
+  Ban,
   BookOpen,
   CheckCircle,
   Clock,
@@ -15,9 +16,11 @@ import {
   X,
   XCircle,
 } from "lucide-react";
+import { PermissionGate } from "@/components/auth/permission-gate";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -32,6 +35,7 @@ import {
   type RcaSessionSummary,
   type RootCauseItem,
 } from "@/lib/api";
+import { usePermissions } from "@/hooks/usePermissions";
 import { toast } from "sonner";
 
 const statusLabel: Record<string, string> = {
@@ -49,6 +53,7 @@ type TabKey = "sessions" | "reports" | "knowledge";
 
 export default function RcaPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const { has } = usePermissions();
   const [tab, setTab] = useState<TabKey>("sessions");
   const [sessions, setSessions] = useState<RcaSessionSummary[]>([]);
   const [queue, setQueue] = useState<QueueStatus | null>(null);
@@ -58,6 +63,17 @@ export default function RcaPage() {
   const [report, setReport] = useState<RcaReport | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
   const [downloading, setDownloading] = useState<"md" | "html" | null>(null);
+
+  // `/rca?status=running` 的初始筛选（仅接受后端枚举值；非法值按“全部”处理）。
+  const [statusFilter, setStatusFilter] = useState<string>(() => {
+    const raw = (searchParams.get("status") || "").trim().toUpperCase();
+    return ["QUEUED", "RUNNING", "COMPLETED", "FAILED"].includes(raw) ? raw : "";
+  });
+  const [cancelTarget, setCancelTarget] = useState<RcaSessionSummary | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+
+  // 终止/重新分析按 `rca_terminate` 权限位显隐（权限接口不可用时权限集为空，按钮隐藏）。
+  const canTerminate = has("rca_terminate");
 
   const [reports, setReports] = useState<RcaReport[]>([]);
   const [reportSearch, setReportSearch] = useState("");
@@ -71,11 +87,11 @@ export default function RcaPage() {
 
   const refresh = useCallback(() => {
     setLoading(true);
-    Promise.all([rca.list(1, 50), rca.queue()])
+    Promise.all([rca.list(1, 50, statusFilter || undefined), rca.queue()])
       .then(([s, q]) => { setSessions(s.items); setQueue(q); })
       .catch(() => toast.error("加载 RCA 数据失败"))
       .finally(() => setLoading(false));
-  }, []);
+  }, [statusFilter]);
 
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -145,7 +161,10 @@ export default function RcaPage() {
     const tick = async () => {
       if (document.visibilityState !== "visible") return;
       try {
-        const [next, q] = await Promise.all([rca.list(1, 50), rca.queue()]);
+        const [next, q] = await Promise.all([
+          rca.list(1, 50, statusFilter || undefined),
+          rca.queue(),
+        ]);
         if (cancelled) return;
         setSessions(next.items);
         setQueue(q);
@@ -165,7 +184,7 @@ export default function RcaPage() {
       document.removeEventListener("visibilitychange", onVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [detailOpen, sessions]);
+  }, [detailOpen, sessions, statusFilter]);
 
   useEffect(() => {
     if (tab === "reports") void loadReports();
@@ -199,7 +218,12 @@ export default function RcaPage() {
   }
 
   async function openDetail(sid: number, syncUrl = true) {
-    if (syncUrl) setSearchParams({ s: String(sid) });
+    if (syncUrl) {
+      // 保留当前 status 筛选，避免打开详情后把入口条件丢掉。
+      const next: Record<string, string> = { s: String(sid) };
+      if (statusFilter) next.status = statusFilter.toLowerCase();
+      setSearchParams(next);
+    }
     setReport(null);
     try {
       const d = await rca.detail(sid);
@@ -216,6 +240,55 @@ export default function RcaPage() {
       }
     } catch {
       toast.error("加载详情失败");
+    }
+  }
+
+  function updateStatusFilter(next: string) {
+    setStatusFilter(next);
+    setSearchParams((prev) => {
+      const params = new URLSearchParams(prev);
+      if (next) params.set("status", next.toLowerCase());
+      else params.delete("status");
+      return params;
+    }, { replace: true });
+  }
+
+  function closeDetail() {
+    setDetailOpen(false);
+    setSearchParams((prev) => {
+      const params = new URLSearchParams(prev);
+      params.delete("s");
+      return params;
+    }, { replace: true });
+  }
+
+  async function confirmCancel() {
+    const target = cancelTarget;
+    if (!target) return;
+    setCancelling(true);
+    try {
+      const res = await rca.cancel(target.id);
+      toast.success(
+        res.hermes_stopped
+          ? "已终止分析，并请求 Hermes 停止上游任务"
+          : "已终止分析",
+      );
+      setCancelTarget(null);
+      if (detail?.id === target.id) {
+        // 抽屉保持打开，刷新为终态并展示「手动终止」时间线事件。
+        try {
+          setDetail(await rca.detail(target.id));
+        } catch {
+          setDetail((prev) => (prev ? { ...prev, status: "FAILED" } : prev));
+        }
+      }
+      refresh();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "终止失败");
+      // 409（会话已结束）等情况下列表可能已过期，顺手刷新一次。
+      refresh();
+    } finally {
+      setCancelling(false);
     }
   }
 
@@ -304,6 +377,10 @@ export default function RcaPage() {
 
   const isCompleted = (status?: string | null) => status?.toUpperCase() === "COMPLETED";
   const isFailed = (status?: string | null) => status?.toUpperCase() === "FAILED";
+  const isActive = (status?: string | null) => {
+    const normalized = status?.toUpperCase();
+    return normalized === "QUEUED" || normalized === "RUNNING";
+  };
   const detailReportCase = report ? cases.find((c) => c.session_id === report.session_id) : undefined;
   const allReportsSelected = reports.length > 0 && selectedSessions.size === reports.length;
   const someReportsSelected = selectedSessions.size > 0 && !allReportsSelected;
@@ -346,12 +423,39 @@ export default function RcaPage() {
         {/* ── Sessions ────────────────────────────────────────── */}
         <TabsContent value="sessions">
           <Card>
-            <CardHeader><CardTitle className="text-sm font-medium flex items-center gap-2"><Activity className="h-4 w-4" /> 分析会话（含告警自动触发）</CardTitle></CardHeader>
+            <CardHeader>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <CardTitle className="text-sm font-medium flex items-center gap-2"><Activity className="h-4 w-4" /> 分析会话（含告警自动触发）</CardTitle>
+                <div className="flex flex-wrap items-center gap-1" role="group" aria-label="按状态筛选会话">
+                  {[
+                    { value: "", label: "全部" },
+                    { value: "RUNNING", label: "运行中" },
+                    { value: "QUEUED", label: "排队中" },
+                    { value: "COMPLETED", label: "已完成" },
+                    { value: "FAILED", label: "失败" },
+                  ].map((option) => (
+                    <Button
+                      key={option.value || "all"}
+                      variant={statusFilter === option.value ? "secondary" : "ghostMuted"}
+                      size="xs"
+                      aria-pressed={statusFilter === option.value}
+                      onClick={() => updateStatusFilter(option.value)}
+                    >
+                      {option.label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+            </CardHeader>
             <CardContent className="p-0">
               {loading ? (
                 <div className="p-4 space-y-2">{Array.from({ length: 5 }).map((_, i) => <Skeleton key={i} className="h-10 w-full" />)}</div>
               ) : sessions.length === 0 ? (
-                <p className="text-sm text-muted-foreground py-6 text-center">暂无 RCA 会话。告警命中触发策略后会自动进入这里。</p>
+                <p className="text-sm text-muted-foreground py-6 text-center">
+                  {statusFilter
+                    ? "当前筛选下暂无 RCA 会话，可切换「全部」查看。"
+                    : "暂无 RCA 会话。告警命中触发策略后会自动进入这里。"}
+                </p>
               ) : (
                 <table className="w-full text-sm">
                   <thead><tr className="border-b border-border text-muted-foreground text-xs">
@@ -375,7 +479,21 @@ export default function RcaPage() {
                         <td className="px-4 py-2.5"><Badge variant={isCompleted(s.status) ? "success" : isFailed(s.status) ? "destructive" : s.status?.toUpperCase() === "RUNNING" ? "info" : "secondary"} className="text-[11px]">{statusLabel[s.status] || s.status}</Badge></td>
                         <td className="px-4 py-2.5 max-w-xs truncate">{s.root_cause_summary || "—"}</td>
                         <td className="px-4 py-2.5 text-xs text-muted-foreground">{s.created_at ? new Date(s.created_at).toLocaleString() : ""}</td>
-                        <td className="px-4 py-2.5 text-right"><Button variant="ghostMuted" size="icon-sm" onClick={() => void openDetail(s.id)}><Eye className="h-3.5 w-3.5" /></Button></td>
+                        <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                          <Button variant="ghostMuted" size="icon-sm" onClick={() => void openDetail(s.id)} aria-label={`查看会话 #${s.id} 详情`}><Eye className="h-3.5 w-3.5" /></Button>
+                          {canTerminate && isActive(s.status) && (
+                            <Button
+                              variant="ghostMuted"
+                              size="sm"
+                              className="text-status-active"
+                              title="终止分析"
+                              aria-label={`终止会话 #${s.id}`}
+                              onClick={() => setCancelTarget(s)}
+                            >
+                              <Ban className="h-3.5 w-3.5" /> 终止
+                            </Button>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -393,24 +511,28 @@ export default function RcaPage() {
                 <CardTitle className="text-sm font-medium flex items-center gap-2"><BookOpen className="h-4 w-4" /> RCA 报告库</CardTitle>
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-xs text-muted-foreground">已选 {selectedSessions.size} 项</span>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-8 text-xs"
-                    disabled={selectedSessions.size === 0 || exporting !== null}
-                    onClick={() => void exportReports("md")}
-                  >
-                    <Download className="h-3.5 w-3.5 mr-1" /> {exporting === "md" ? "导出中…" : "导出 Markdown"}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-8 text-xs"
-                    disabled={selectedSessions.size === 0 || exporting !== null}
-                    onClick={() => void exportReports("html")}
-                  >
-                    <Download className="h-3.5 w-3.5 mr-1" /> {exporting === "html" ? "导出中…" : "导出 HTML"}
-                  </Button>
+                  <PermissionGate perm="report_export">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 text-xs"
+                      disabled={selectedSessions.size === 0 || exporting !== null}
+                      onClick={() => void exportReports("md")}
+                    >
+                      <Download className="h-3.5 w-3.5 mr-1" /> {exporting === "md" ? "导出中…" : "导出 Markdown"}
+                    </Button>
+                  </PermissionGate>
+                  <PermissionGate perm="report_export">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8 text-xs"
+                      disabled={selectedSessions.size === 0 || exporting !== null}
+                      onClick={() => void exportReports("html")}
+                    >
+                      <Download className="h-3.5 w-3.5 mr-1" /> {exporting === "html" ? "导出中…" : "导出 HTML"}
+                    </Button>
+                  </PermissionGate>
                   <div className="relative">
                     <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
                     <Input
@@ -526,8 +648,10 @@ export default function RcaPage() {
                         <td className="px-4 py-2.5 max-w-md line-clamp-2 text-xs">{c.root_cause || "—"}</td>
                         <td className="px-4 py-2.5"><Badge variant={labelVariant[c.label] || "secondary"} className="text-[10px]">{labelText[c.label] || c.label}</Badge></td>
                         <td className="px-4 py-2.5 text-right whitespace-nowrap">
-                          <Button variant="ghostMuted" size="icon-sm" title="确认根因" onClick={() => void annotate(c, "confirmed")}><ThumbsUp className="h-3.5 w-3.5" /></Button>
-                          <Button variant="ghostMuted" size="icon-sm" title="标记误报" onClick={() => void annotate(c, "false_positive")}><ThumbsDown className="h-3.5 w-3.5" /></Button>
+                          <PermissionGate perm="kb_annotate">
+                            <Button variant="ghostMuted" size="icon-sm" title="确认根因" onClick={() => void annotate(c, "confirmed")}><ThumbsUp className="h-3.5 w-3.5" /></Button>
+                            <Button variant="ghostMuted" size="icon-sm" title="标记误报" onClick={() => void annotate(c, "false_positive")}><ThumbsDown className="h-3.5 w-3.5" /></Button>
+                          </PermissionGate>
                         </td>
                       </tr>
                     ))}
@@ -540,7 +664,7 @@ export default function RcaPage() {
       </Tabs>
 
       {/* ── Detail drawer ─────────────────────────────────────── */}
-      <Sheet open={detailOpen} onOpenChange={(o) => { if (!o) { setDetailOpen(false); setSearchParams({}); } }}>
+      <Sheet open={detailOpen} onOpenChange={(o) => { if (!o) closeDetail(); }}>
         <SheetContent side="right" className="w-[560px] sm:max-w-[560px] p-0 overflow-y-auto">
           {detail ? (
             <>
@@ -643,18 +767,20 @@ export default function RcaPage() {
                         <Download className="h-3.5 w-3.5" /> 下载 HTML
                       </Button>
                       {detailReportCase && detailReportCase.label === "pending" && (
-                        <>
+                        <PermissionGate perm="kb_annotate">
                           <Button variant="outline" size="sm" onClick={() => void annotate(detailReportCase, "false_positive")}>
                             <ThumbsDown className="h-3.5 w-3.5" /> 标记误报
                           </Button>
                           <Button size="sm" onClick={() => void annotate(detailReportCase, "confirmed")}>
                             <ThumbsUp className="h-3.5 w-3.5" /> 确认根因
                           </Button>
-                        </>
+                        </PermissionGate>
                       )}
-                      <Button variant="outline" size="sm" onClick={() => void rerun(detail.id)}>
-                        <RefreshCw className="h-3.5 w-3.5" /> 重新分析
-                      </Button>
+                      <PermissionGate perm="rca_terminate">
+                        <Button variant="outline" size="sm" onClick={() => void rerun(detail.id)}>
+                          <RefreshCw className="h-3.5 w-3.5" /> 重新分析
+                        </Button>
+                      </PermissionGate>
                     </div>
                   </div>
                 )}
@@ -675,8 +801,19 @@ export default function RcaPage() {
                   </div>
                 )}
 
+                {canTerminate && isActive(detail.status) && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3">
+                    <p className="text-xs text-muted-foreground">
+                      终止后会话立即结束；若已提交 Hermes，会尽力停止上游任务。
+                    </p>
+                    <Button variant="destructive" size="sm" onClick={() => setCancelTarget(detail)}>
+                      <Ban className="h-3.5 w-3.5" /> 终止分析
+                    </Button>
+                  </div>
+                )}
+
                 <div className="flex justify-end">
-                  <Button variant="ghostMuted" size="sm" onClick={() => { setDetailOpen(false); setSearchParams({}); }}>
+                  <Button variant="ghostMuted" size="sm" onClick={closeDetail}>
                     <X className="h-3.5 w-3.5" /> 关闭
                   </Button>
                 </div>
@@ -687,6 +824,20 @@ export default function RcaPage() {
           )}
         </SheetContent>
       </Sheet>
+
+      <ConfirmDialog
+        open={cancelTarget !== null}
+        onOpenChange={(open) => { if (!open && !cancelling) setCancelTarget(null); }}
+        title="终止 RCA 分析"
+        description={cancelTarget
+          ? `确定要终止会话 #${cancelTarget.id}（${cancelTarget.service_name || "未知服务"}）吗？终止后状态将变为「失败」，且不可恢复。`
+          : ""}
+        confirmLabel="终止"
+        variant="destructive"
+        isLoading={cancelling}
+        onConfirm={() => void confirmCancel()}
+        onCancel={() => setCancelTarget(null)}
+      />
     </div>
   );
 }

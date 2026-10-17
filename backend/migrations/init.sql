@@ -145,11 +145,15 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
 -- ═══════════════════════════════════════════════════════════════════════════════
 
 CREATE TABLE IF NOT EXISTS chat_sessions (
-    id          SERIAL PRIMARY KEY,
-    user_id     INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title       VARCHAR(255) NOT NULL DEFAULT '新对话',
-    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    id                  SERIAL PRIMARY KEY,
+    user_id             INTEGER      NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title               VARCHAR(255) NOT NULL DEFAULT '新对话',
+    mode_slug           VARCHAR(50),
+    distillation_status VARCHAR(20),
+    hermes_session_id   VARCHAR(128),
+    active_run_id       VARCHAR(128),
+    created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_id ON chat_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated ON chat_sessions(updated_at DESC);
@@ -245,8 +249,14 @@ ON CONFLICT (slug) DO NOTHING;
 
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS mode_slug VARCHAR(50);
 ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS distillation_status VARCHAR(20);
+-- Hermes agent linkage: continue the same agent session after a reload and
+-- reattach to the run that is still executing (see 20261017_chat_session_hermes.sql).
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS hermes_session_id VARCHAR(128);
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS active_run_id VARCHAR(128);
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_mode ON chat_sessions(mode_slug);
 CREATE INDEX IF NOT EXISTS idx_cs_distill_status ON chat_sessions(distillation_status);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_hermes_session ON chat_sessions(hermes_session_id);
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_active_run ON chat_sessions(active_run_id);
 
 -- ═══════════════════════════════════════════════════════════════════════════════
 -- Data sources — external monitoring/telemetry connections

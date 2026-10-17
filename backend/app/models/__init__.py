@@ -343,6 +343,14 @@ class ChatSession(Base):
     mode_slug = Column(String(50), nullable=True, default=None)
     distillation_status = Column(String(20), nullable=True, default=None)
     title = Column(String(255), nullable=False, default="新对话")
+    # ── Hermes conversation linkage ──────────────────────────────────────
+    # ``hermes_session_id`` is the continuity token for the agent session
+    # behind this chat; persisting it lets a reloaded transcript *continue*
+    # the same agent context instead of replaying the whole history.
+    # ``active_run_id`` is the Hermes run currently executing for the chat so
+    # a fresh page can reattach to it (and never silently lose the run).
+    hermes_session_id = Column(String(128), nullable=True, default=None)
+    active_run_id = Column(String(128), nullable=True, default=None)
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),

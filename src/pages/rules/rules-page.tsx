@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Plus, Pencil, Trash2, Power, PowerOff, RefreshCw, Shield, CheckCircle, AlertTriangle, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { PermissionGate } from "@/components/auth/permission-gate";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Card, CardContent } from "@/components/ui/card";
@@ -316,7 +317,9 @@ export default function RulesPage() {
         <div><h2 className="text-lg font-semibold">告警规则</h2><p className="text-sm text-muted-foreground mt-0.5">命中规则的告警优先触发 RCA；未命中时回落全局触发策略</p></div>
         <div className="flex items-center gap-2">
           <Button variant="ghostMuted" size="icon-sm" onClick={refresh}><RefreshCw className="h-4 w-4" /></Button>
-          <Button size="sm" onClick={openCreate}><Plus className="h-4 w-4 mr-1" />新建规则</Button>
+          <PermissionGate perm="policy">
+            <Button size="sm" onClick={openCreate}><Plus className="h-4 w-4 mr-1" />新建规则</Button>
+          </PermissionGate>
         </div>
       </div>
 
@@ -356,11 +359,13 @@ export default function RulesPage() {
                   </td>
                   <td className="px-4 py-2.5 align-top">{r.enabled ? <span className="text-green-600 text-xs">启用</span> : <span className="text-muted-foreground text-xs">禁用</span>}</td>
                   <td className="px-4 py-2.5 text-right align-top">
-                    <div className="flex items-center justify-end gap-0.5">
-                      <Button variant="ghostMuted" size="icon-sm" onClick={() => handleToggle(r)}>{r.enabled ? <PowerOff className="h-3.5 w-3.5" /> : <Power className="h-3.5 w-3.5" />}</Button>
-                      <Button variant="ghostMuted" size="icon-sm" onClick={() => openEdit(r)}><Pencil className="h-3.5 w-3.5" /></Button>
-                      <Button variant="ghostMuted" size="icon-sm" onClick={() => handleDelete(r)}><Trash2 className="h-3.5 w-3.5 text-destructive" /></Button>
-                    </div>
+                    <PermissionGate perm="policy">
+                      <div className="flex items-center justify-end gap-0.5">
+                        <Button variant="ghostMuted" size="icon-sm" onClick={() => handleToggle(r)}>{r.enabled ? <PowerOff className="h-3.5 w-3.5" /> : <Power className="h-3.5 w-3.5" />}</Button>
+                        <Button variant="ghostMuted" size="icon-sm" onClick={() => openEdit(r)}><Pencil className="h-3.5 w-3.5" /></Button>
+                        <Button variant="ghostMuted" size="icon-sm" onClick={() => handleDelete(r)}><Trash2 className="h-3.5 w-3.5 text-destructive" /></Button>
+                      </div>
+                    </PermissionGate>
                   </td>
                 </tr>
               ))}</tbody>
@@ -439,7 +444,9 @@ export default function RulesPage() {
 
             <div className="flex justify-end gap-2 pt-1">
               <Button variant="ghostMuted" onClick={() => setDialogOpen(false)}>取消</Button>
-              <Button onClick={handleSave} disabled={saving}>{saving ? "保存中..." : "保存"}</Button>
+              <PermissionGate perm="policy">
+                <Button onClick={handleSave} disabled={saving}>{saving ? "保存中..." : "保存"}</Button>
+              </PermissionGate>
             </div>
           </div>
         </DialogContent>

@@ -42,7 +42,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user, require_admin
+from app.auth import (
+    PERM_INBOX_DELETE,
+    PERM_POLICY,
+    PERM_TRASH_CLEAR,
+    PERM_TRIGGER_MODE,
+    get_current_user,
+    require_admin,
+    require_permission,
+)
 from app.models import (
     Alert,
     CollaborationEvent,
@@ -872,7 +880,7 @@ async def purge_alerts_now(
         description="true = 清理所有团队（全局）；默认只清理当前管理员所属团队",
     ),
     db: AsyncSession = Depends(get_db_session),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_permission(PERM_TRASH_CLEAR)),
 ) -> dict[str, Any]:
     """Manually delete inbox/trash alerts beyond the configured retention."""
     policy = await get_policy(db)
@@ -984,7 +992,7 @@ async def list_trash(
 @router.post("/trash/clear")
 async def clear_trash(
     db: AsyncSession = Depends(get_db_session),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_permission(PERM_TRASH_CLEAR)),
 ) -> dict[str, Any]:
     """Empty the current team's trash (filtered / dismissed alerts)."""
     result = await db.execute(
@@ -1103,7 +1111,7 @@ async def read_policy(
 async def update_policy(
     payload: dict[str, Any] = Body(...),
     db: AsyncSession = Depends(get_db_session),
-    admin: User = Depends(require_admin),
+    admin: User = Depends(require_permission(PERM_POLICY)),
 ) -> dict[str, Any]:
     updated = await save_policy(db, payload)
     await record_audit(
@@ -1125,7 +1133,7 @@ async def batch_trigger_alerts(
     payload: BatchTriggerRequest,
     background: BackgroundTasks,
     db: AsyncSession = Depends(get_db_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission(PERM_TRIGGER_MODE)),
 ) -> dict[str, Any]:
     """人工批量触发 RCA：1~50 条告警聚合为 **1 个** RcaSession（P1-4）。
 
@@ -1320,7 +1328,7 @@ async def trigger_alert(
     alert_id: int,
     background: BackgroundTasks,
     db: AsyncSession = Depends(get_db_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission(PERM_TRIGGER_MODE)),
 ) -> dict[str, Any]:
     """Manually trigger RCA for one inbox/trash alert."""
     alert = await db.get(Alert, alert_id)
@@ -1365,7 +1373,7 @@ async def trigger_alert(
 async def dismiss_alert(
     alert_id: int,
     db: AsyncSession = Depends(get_db_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission(PERM_INBOX_DELETE)),
 ) -> dict[str, Any]:
     alert = await db.get(Alert, alert_id)
     if alert is None or alert.team_id != user.team_id:

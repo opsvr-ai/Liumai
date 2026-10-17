@@ -9,6 +9,7 @@ that the frontend chat panel renders in real time.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from datetime import datetime
@@ -845,15 +846,31 @@ class ChatSessionDetail(BaseModel):
     created_at: datetime
     updated_at: datetime
     messages: list[dict] = []
+    # Hermes agent linkage (null when the chat has no agent session yet).
+    hermes_session_id: str | None = None
+    # Run still executing for this chat — lets the UI reattach after a reload.
+    active_run_id: str | None = None
 
     model_config = {"from_attributes": True}
 
 
 class SaveMessagesRequest(BaseModel):
-    """Bulk-save messages for a session (upsert: clear + re-insert)."""
+    """Bulk-save messages for a session (upsert: clear + re-insert).
 
-    messages: list[dict] = Field(default_factory=list)
+    ``messages`` is optional so callers can update only the Hermes linkage;
+    omitting it keeps the stored transcript, while an explicit list (even
+    ``[]``) replaces it.
+
+    ``hermes_session_id`` / ``active_run_id`` persist the Hermes linkage in the
+    same write as the transcript.  They use ``model_fields_set`` semantics: a
+    field is only touched when the caller sent it (an explicit ``null`` clears
+    it), so older clients that omit them keep the stored values intact.
+    """
+
+    messages: list[dict] | None = None
     title: str | None = None
+    hermes_session_id: str | None = None
+    active_run_id: str | None = None
 
 
 @router.get("/sessions", response_model=list[ChatSessionOut])
@@ -943,6 +960,8 @@ async def get_chat_session(
         created_at=row.created_at,
         updated_at=row.updated_at,
         messages=messages,
+        hermes_session_id=row.hermes_session_id,
+        active_run_id=row.active_run_id,
     )
 
 
@@ -953,32 +972,41 @@ async def save_messages(
     db: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ) -> Response:
-    """Save (replace) all messages in a session."""
+    """Save messages and/or the Hermes linkage for a session."""
     row = await db.get(ChatSession, session_id)
     if not row or row.user_id != user.id:
         raise HTTPException(status_code=404, detail="会话不存在")
 
-    # Delete existing messages
-    from sqlalchemy import delete
+    # Replace the transcript only when the caller sent one; a link-only update
+    # (messages omitted) must not wipe the stored conversation.
+    if body.messages is not None:
+        from sqlalchemy import delete
 
-    await db.execute(
-        delete(ChatMessage).where(ChatMessage.session_id == session_id)
-    )
-
-    # Insert new messages
-    for m in body.messages:
-        db.add(
-            ChatMessage(
-                session_id=session_id,
-                role=m.get("role", "user"),
-                content=m.get("content", ""),
-                tool_calls=m.get("tool_calls"),
-            )
+        await db.execute(
+            delete(ChatMessage).where(ChatMessage.session_id == session_id)
         )
+
+        for m in body.messages:
+            db.add(
+                ChatMessage(
+                    session_id=session_id,
+                    role=m.get("role", "user"),
+                    content=m.get("content", ""),
+                    tool_calls=m.get("tool_calls"),
+                )
+            )
 
     # Update title if provided
     if body.title:
         row.title = body.title
+
+    # Persist the Hermes linkage.  Only fields the caller actually sent are
+    # touched (explicit null clears), so partial updates from older clients
+    # cannot wipe a session that is still linked to a running agent.
+    if "hermes_session_id" in body.model_fields_set:
+        row.hermes_session_id = body.hermes_session_id
+    if "active_run_id" in body.model_fields_set:
+        row.active_run_id = body.active_run_id
 
     row.updated_at = func.now()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -1449,6 +1477,121 @@ async def hermes_health(
     except Exception:
         latency_ms = round((time.monotonic() - t0) * 1000)
         return {"ok": False, "status_code": 0, "latency_ms": latency_ms}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hermes capability probe (non-admin chat UI)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+#: Only the feature bits the chat UI can act on.  Everything else Hermes
+#: advertises (version, runtime, model options, endpoints, gateway URL) stays on
+#: the admin-only ``/hermes-info`` self-report below.
+_CHAT_CAPABILITY_FLAGS: tuple[str, ...] = (
+    "run_submission",
+    "run_stop",
+    "run_steer",
+    "run_approval_response",
+    "tool_progress_events",
+    "chat_completions_streaming",
+)
+
+#: ``/v1/capabilities`` only changes on deploy/restart — 60 s keeps an upgrade
+#: visible quickly while sparing the gateway one probe per page load.
+_CAPABILITIES_CACHE_TTL_SECONDS = 60.0
+
+#: Process-wide cache (Hermes is a single global engine).  ``base_url`` is kept
+#: only to invalidate the entry when an admin points the platform elsewhere.
+_capabilities_cache: dict[str, Any] = {
+    "payload": None,
+    "expires_at": 0.0,
+    "base_url": None,
+}
+
+
+def _capability_payload(features: dict[str, Any]) -> dict[str, Any]:
+    """Project Hermes ``features`` onto the safe capability payload.
+
+    Missing/non-boolean flags become ``False`` (the UI hides the matching
+    control); ``session_continuity_header`` is a header name or flag, never a
+    secret.
+    """
+    payload: dict[str, Any] = {
+        key: features.get(key) is True for key in _CHAT_CAPABILITY_FLAGS
+    }
+    header = features.get("session_continuity_header")
+    payload["session_continuity_header"] = (
+        header if isinstance(header, (str, bool)) else None
+    )
+    return payload
+
+
+@router.get(
+    "/hermes-capabilities",
+    summary="Hermes capability bits for the chat UI",
+    description=(
+        "Read-only capability probe available to every signed-in user.  "
+        "Returns only the feature flags the chat panel needs (runs / stop / "
+        "steer / approval / tool progress / streaming) plus the session "
+        "continuity header — never URLs, versions, models or health details.  "
+        "When Hermes is unreachable every flag is false while the endpoint "
+        "still answers 200 so the UI degrades instead of breaking."
+    ),
+)
+async def hermes_capabilities(
+    _user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Return a 60 s-cached, non-sensitive capability payload.
+
+    Deliberately **not** admin-only: ordinary users need to know whether the
+    Runs API exists so the chat panel can hide stop/steer/approval controls that
+    would otherwise 403.  The admin-only :func:`hermes_info` remains the rich
+    inspector for the settings screen.
+
+    Hermes failures are swallowed: every flag is ``False`` and the HTTP status
+    stays 200, which tells the frontend to stay on the legacy
+    ``/api/chat/stream`` path.
+    """
+    from app.services.hermes import HermesClient, _hermes_url
+
+    base_url = (_hermes_url or "").rstrip("/")
+    now = time.monotonic()
+    cached = _capabilities_cache
+    if (
+        cached["payload"] is not None
+        and cached["base_url"] == base_url
+        and now < cached["expires_at"]
+    ):
+        return dict(cached["payload"])
+
+    features: dict[str, Any] = {}
+    if base_url:
+        # Short timeout: a half-dead gateway must not hold the chat page for the
+        # 600 s agent timeout.  Constructed per cache miss (≤ once a minute) and
+        # always closed so no connection is leaked.
+        client = HermesClient(timeout=10.0)
+        try:
+            caps = await client.get_capabilities()
+            raw_features = caps.get("features") if isinstance(caps, dict) else None
+            if isinstance(raw_features, dict):
+                features = raw_features
+        except Exception:  # never 500 the chat page on a probe failure
+            logger.warning("hermes-capabilities probe failed", exc_info=True)
+            features = {}
+        finally:
+            try:
+                await client.close()
+            except Exception:
+                logger.debug("hermes-capabilities: client close failed")
+
+    payload = _capability_payload(features)
+    _capabilities_cache.update(
+        {
+            "payload": payload,
+            "expires_at": now + _CAPABILITIES_CACHE_TTL_SECONDS,
+            "base_url": base_url,
+        }
+    )
+    return dict(payload)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

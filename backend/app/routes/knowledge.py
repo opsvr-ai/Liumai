@@ -6,11 +6,13 @@ testing, webhook auto-update, and usage statistics.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import os
 import re
 import tempfile
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -28,7 +30,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -197,6 +199,74 @@ def _chunk_text(
     return [raw[i:i + chunk_chars] for i in range(0, len(raw), chunk_chars)]
 
 
+# ── 入库进度（进程内，best-effort） ─────────────────────────────────────────
+#
+# 只用于前端轮询展示：进程重启后丢失可接受，不写数据库、不新增列。
+# 结构：doc_id -> {stage, step, total, message, error, updated_at}
+# stage 取值：queued / chunking / extracting / storing / done / failed
+
+_INGEST_PROGRESS: dict[int, dict[str, Any]] = {}
+
+# 正在执行的入库任务（doc_id）。防止并发重复入库 + 作为异步任务的进程内锁。
+_INGEST_INFLIGHT: set[int] = set()
+_ACTIVE_INGEST_STAGES = {"queued", "chunking", "extracting", "storing"}
+
+# 历史数据 / 旧客户端可能仍在用 processing 表示“入库中”，读取时统一成
+# 新的状态机值 ingesting；写入一律使用 ingesting。
+_STATUS_ALIASES = {"processing": "ingesting"}
+
+
+def _normalize_status(value: Any) -> str:
+    """把库里的旧状态别名归一为对外状态机值。"""
+    raw = str(value or "pending").strip().lower()
+    return _STATUS_ALIASES.get(raw, raw)
+
+
+def _set_ingest_progress(
+    doc_id: int,
+    *,
+    stage: str,
+    step: int = 0,
+    total: int = 0,
+    message: str = "",
+    error: str | None = None,
+) -> None:
+    """写入某文档的入库进度（覆盖式）。"""
+    # 简单的容量保护：避免长时间运行后终态条目无限累积。
+    if len(_INGEST_PROGRESS) > 512 and stage in _ACTIVE_INGEST_STAGES:
+        for stale_id, stale in list(_INGEST_PROGRESS.items()):
+            if stale.get("stage") in ("done", "failed"):
+                _INGEST_PROGRESS.pop(stale_id, None)
+    _INGEST_PROGRESS[doc_id] = {
+        "stage": stage,
+        "step": max(0, int(step)),
+        "total": max(0, int(total)),
+        "message": message,
+        "error": (error[:500] if error else None),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+
+def _clear_ingest_progress(doc_id: int) -> None:
+    _INGEST_PROGRESS.pop(doc_id, None)
+
+
+def _default_progress(doc_status: str, error: str | None) -> dict[str, Any]:
+    """没有进程内进度记录时（如进程重启）按持久化状态给出兜底进度。"""
+    if doc_status == "stored":
+        return {"stage": "done", "step": 0, "total": 0, "message": "入库完成"}
+    if doc_status == "failed":
+        return {"stage": "failed", "step": 0, "total": 0, "message": error or "入库失败"}
+    if doc_status == "ingesting":
+        return {
+            "stage": "extracting",
+            "step": 0,
+            "total": 0,
+            "message": "入库中（进程内进度不可用）",
+        }
+    return {"stage": "queued", "step": 0, "total": 0, "message": "等待入库"}
+
+
 def _parse_knowledge_items(raw: str) -> list[dict[str, Any]]:
     """解析 Hermes 输出的 JSON 数组，容忍 ```json 代码块与前后说明文字。
 
@@ -267,20 +337,42 @@ async def _extract_knowledge_from_document(
     *,
     system_prompt: str,
     context_label: str = "",
+    progress_doc_id: int | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """分块调用 Hermes 提炼知识条目，返回 (合并后的条目, hermes_session_id)。
 
     每块 ≤ 8k 字符、整篇最多 30k 字符，避免只发预览或超长上下文；任意
     片段调用/解析失败都会抛异常，由调用方保持 pending/failed 语义。
+
+    ``progress_doc_id`` 非空时，按分块把进度写入进程内 dict（供
+    ``GET /documents/{id}/status`` 轮询展示），不影响提炼逻辑。
     """
     chunks = _chunk_text(content)
     if not chunks:
         raise RuntimeError("文档内容为空")
 
+    total = len(chunks)
+    if progress_doc_id is not None:
+        _set_ingest_progress(
+            progress_doc_id,
+            stage="chunking",
+            step=0,
+            total=total,
+            message=f"已切分 {total} 个片段，准备调用 Hermes",
+        )
+
     items: list[dict[str, Any]] = []
     session_id = ""
 
     for idx, chunk in enumerate(chunks, start=1):
+        if progress_doc_id is not None:
+            _set_ingest_progress(
+                progress_doc_id,
+                stage="extracting",
+                step=idx - 1,
+                total=total,
+                message=f"正在提炼第 {idx}/{total} 个片段",
+            )
         lines = [f"文档标题：{title}"]
         if context_label:
             lines.append(context_label)
@@ -304,6 +396,14 @@ async def _extract_knowledge_from_document(
         chunk_items = _parse_knowledge_items(raw)
         # 单个片段允许返回 []（该片段没有可提炼知识），整体为空才算失败。
         items.extend(chunk_items)
+        if progress_doc_id is not None:
+            _set_ingest_progress(
+                progress_doc_id,
+                stage="extracting",
+                step=idx,
+                total=total,
+                message=f"已完成第 {idx}/{total} 个片段，累计 {len(items)} 条知识",
+            )
 
     merged = _merge_knowledge_items(items)
     if not merged:
@@ -431,6 +531,38 @@ class DocOut(BaseModel):
 
     model_config = {"from_attributes": True}
 
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_status_alias(cls, value: Any) -> str:
+        """对外统一暴露 ingesting，兼容历史 processing 数据。"""
+        return _normalize_status(value)
+
+
+class DocProgressOut(BaseModel):
+    stage: str = "queued"
+    step: int = 0
+    total: int = 0
+    message: str = ""
+
+
+class DocStatusOut(BaseModel):
+    """``GET /documents/{id}/status`` 的轮询响应。"""
+
+    status: str
+    progress: DocProgressOut
+    error: str | None = None
+    updated_at: datetime | None = None
+
+
+class BatchDeleteRequest(BaseModel):
+    ids: list[int] = Field(..., min_length=1, max_length=200)
+
+
+class BatchDeleteResult(BaseModel):
+    deleted: int
+    requested: int
+    missing: list[int] = Field(default_factory=list)
+
 
 class IngestResult(BaseModel):
     ok: bool
@@ -449,6 +581,22 @@ class TestResult(BaseModel):
     answer: str = ""
     sources: list[str] = Field(default_factory=list)
     confidence: float = 0.0
+
+
+class ExplainSource(BaseModel):
+    """一条回答来源；能按标题匹配到本地文档时带上 doc_id。"""
+
+    title: str
+    doc_id: int | None = None
+    score: float | None = None
+
+
+class SearchExplainResult(BaseModel):
+    hit: bool
+    answer: str = ""
+    sources: list[ExplainSource] = Field(default_factory=list)
+    confidence: float = 0.0
+    latency_ms: int = 0
 
 
 class WebhookSource(BaseModel):
@@ -487,7 +635,14 @@ async def list_documents(
             | KnowledgeDocument.content.ilike(f"%{search}%")
         )
     if status_filter:
-        q = q.where(KnowledgeDocument.status == status_filter)
+        normalized_status = _normalize_status(status_filter)
+        if normalized_status == "ingesting":
+            # 兼容历史 processing 数据，避免筛选“入库中”时漏掉旧记录。
+            q = q.where(
+                KnowledgeDocument.status.in_(("ingesting", "processing"))
+            )
+        else:
+            q = q.where(KnowledgeDocument.status == normalized_status)
     if source_type:
         q = q.where(KnowledgeDocument.source_type == source_type)
     offset = (page - 1) * page_size
@@ -568,6 +723,60 @@ async def get_document(
     return DocOut.model_validate(doc)
 
 
+@router.get("/documents/{doc_id}/status", response_model=DocStatusOut)
+async def get_document_status(
+    doc_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> DocStatusOut:
+    """Poll ingestion status/progress for a single document.
+
+    Progress lives in an in-process dict (lost on restart, which is fine for
+    a best-effort UI heartbeat). When there is no in-process entry we fall
+    back to a stage derived from the persisted ``status`` column.
+    """
+    doc = await db.get(KnowledgeDocument, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    progress = _INGEST_PROGRESS.get(doc_id)
+    status_value = _normalize_status(doc.status)
+    if progress:
+        # 后台 task 会先在独立事务里提交 ingesting；进程内 progress 更及时，
+        # 优先据此判断当前状态（尤其是刚入队、DB 尚未落库的窗口）。
+        stage = str(progress.get("stage") or "")
+        if stage in _ACTIVE_INGEST_STAGES:
+            status_value = "ingesting"
+        elif stage == "done":
+            status_value = "stored"
+        elif stage == "failed":
+            status_value = "failed"
+    elif status_value == "ingesting":
+        # 单 worker 部署下，真正在跑的入库任务一定有进程内进度心跳；
+        # 缺失只可能是进程重启/任务丢失，按可重试的失败态返回，避免永久转圈。
+        status_value = "failed"
+        progress = {
+            "stage": "failed",
+            "step": 0,
+            "total": 0,
+            "message": "上次入库被中断（进程内进度已丢失），请重试",
+            "error": "入库中断：进程内进度已丢失，请重试",
+        }
+    else:
+        progress = _default_progress(status_value, doc.error_message)
+    return DocStatusOut(
+        status=status_value,
+        progress=DocProgressOut(
+            stage=str(progress.get("stage") or "queued"),
+            step=int(progress.get("step") or 0),
+            total=int(progress.get("total") or 0),
+            message=str(progress.get("message") or ""),
+        ),
+        error=(progress.get("error") or doc.error_message),
+        updated_at=doc.updated_at,
+    )
+
+
 @router.delete("/documents/{doc_id}")
 async def delete_document(
     doc_id: int,
@@ -578,14 +787,171 @@ async def delete_document(
     doc = await db.get(KnowledgeDocument, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
+    _clear_ingest_progress(doc_id)
     await db.delete(doc)
     await db.flush()
     return Response(status_code=204)
 
 
+@router.post("/documents/batch-delete", response_model=BatchDeleteResult)
+async def batch_delete_documents(
+    body: BatchDeleteRequest,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> BatchDeleteResult:
+    """Delete several documents in one call (admin only).
+
+    Existing single-document delete stays unchanged; this only adds a bulk
+    path so the management UI can delete a multi-selection atomically.
+    """
+    requested_ids = list(dict.fromkeys(int(i) for i in body.ids))
+    rows = await db.execute(
+        select(KnowledgeDocument).where(KnowledgeDocument.id.in_(requested_ids))
+    )
+    docs = list(rows.scalars())
+    found_ids = {doc.id for doc in docs}
+    for doc in docs:
+        _clear_ingest_progress(doc.id)
+        await db.delete(doc)
+    await db.flush()
+    missing = [doc_id for doc_id in requested_ids if doc_id not in found_ids]
+    logger.info(
+        "Knowledge batch delete: requested={} deleted={} missing={}",
+        len(requested_ids),
+        len(found_ids),
+        missing,
+    )
+    return BatchDeleteResult(
+        deleted=len(found_ids),
+        requested=len(requested_ids),
+        missing=missing,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Routes — Ingestion
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+_INGEST_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _on_ingest_task_done(task: asyncio.Task[None], doc_id: int) -> None:
+    """任务收尾：回收引用；被取消/异常时把进度落到 failed，避免前端一直转圈。"""
+    _INGEST_TASKS.discard(task)
+    if task.cancelled():
+        _INGEST_INFLIGHT.discard(doc_id)
+        if _INGEST_PROGRESS.get(doc_id, {}).get("stage") in _ACTIVE_INGEST_STAGES:
+            _set_ingest_progress(
+                doc_id,
+                stage="failed",
+                message="入库任务被中断",
+                error="入库任务被中断",
+            )
+        return
+    exc = task.exception()
+    if exc:  # pragma: no cover - defensive: 正常失败已在任务内处理
+        _INGEST_INFLIGHT.discard(doc_id)
+        logger.opt(exception=exc).error("Knowledge ingest task crashed: {}", exc)
+
+
+def _schedule_ingest_job(doc_id: int) -> None:
+    """在后台事件循环里启动入库任务（不占用请求的 DB 连接/事务）。
+
+    不使用 FastAPI BackgroundTasks：那个机制会在依赖清理（DB commit）之前
+    await 任务，令请求事务长期持有连接与行锁。独立 task 让请求立即完成。
+    """
+    task = asyncio.create_task(_run_ingest_job(doc_id))
+    _INGEST_TASKS.add(task)
+    task.add_done_callback(lambda done: _on_ingest_task_done(done, doc_id))
+
+
+async def _run_ingest_job(doc_id: int) -> None:
+    """后台入库任务：独立 DB 会话，分块写入进程内进度。
+
+    由 ``POST /documents/{id}/ingest`` 通过 ``asyncio.create_task`` 调度，
+    接口立即返回 ``ingesting``，前端轮询 ``/documents/{id}/status`` 查看进度。
+    """
+    from app.models.database import async_session_factory
+
+    total_chunks = 0
+    try:
+        async with async_session_factory() as session:
+            try:
+                doc = await session.get(KnowledgeDocument, doc_id)
+                if not doc:
+                    _clear_ingest_progress(doc_id)
+                    return
+                total_chunks = len(_chunk_text(doc.content))
+                doc.status = "ingesting"
+                doc.error_message = None
+                # 先独立提交“入库中”，让列表/其它工作进程能立即看到状态。
+                await session.commit()
+                _set_ingest_progress(
+                    doc_id,
+                    stage="queued",
+                    step=0,
+                    total=total_chunks,
+                    message="正在准备入库",
+                )
+
+                items, hermes_session_id = await _extract_knowledge_from_document(
+                    doc.title,
+                    doc.content,
+                    system_prompt=KNOWLEDGE_INGEST_SYSTEM_PROMPT,
+                    progress_doc_id=doc_id,
+                )
+
+                _set_ingest_progress(
+                    doc_id,
+                    stage="storing",
+                    step=total_chunks,
+                    total=total_chunks,
+                    message="正在写入知识条目",
+                )
+                doc.status = "stored"
+                # 只使用 Hermes 真实返回的会话 id；取不到时留空，绝不本地伪造。
+                doc.hermes_session_id = hermes_session_id or None
+                doc.processed_content = json.dumps(items, ensure_ascii=False)[:5000]
+                # 条目已由平台侧结构化保存，不再伪造 llm-wiki 条目 id。
+                doc.knowledge_id = None
+                doc.error_message = None
+                await session.commit()
+                _set_ingest_progress(
+                    doc_id,
+                    stage="done",
+                    step=total_chunks,
+                    total=total_chunks,
+                    message=f"入库完成，共 {len(items)} 条知识条目",
+                )
+                logger.info(
+                    "KnowledgeDocument ingested: id={} items={} hermes_session={}",
+                    doc_id, len(items), doc.hermes_session_id or "-",
+                )
+            except Exception as exc:
+                logger.exception("Knowledge ingest failed for doc {}", doc_id)
+                await session.rollback()
+                error_text = str(exc)[:500]
+                try:
+                    failed_doc = await session.get(KnowledgeDocument, doc_id)
+                    if failed_doc:
+                        failed_doc.status = "failed"
+                        failed_doc.error_message = error_text
+                        await session.commit()
+                except Exception:
+                    logger.exception(
+                        "Failed to persist ingest failure for doc {}", doc_id
+                    )
+                _set_ingest_progress(
+                    doc_id,
+                    stage="failed",
+                    step=0,
+                    total=total_chunks,
+                    message="入库失败",
+                    error=error_text,
+                )
+    finally:
+        _INGEST_INFLIGHT.discard(doc_id)
 
 
 @router.post("/documents/{doc_id}/ingest", response_model=IngestResult)
@@ -594,7 +960,12 @@ async def ingest_document(
     db: AsyncSession = Depends(get_db_session),
     _admin: User = Depends(require_admin),
 ) -> IngestResult:
-    """Ingest a document into the llm-wiki v2 knowledge base via Hermes."""
+    """Queue ingestion into the llm-wiki v2 knowledge base via Hermes.
+
+    响应结构与旧版一致（``ok/status/message``），但执行改为后台 task：
+    立即返回 ``status="ingesting"``，客户端通过 status 端点轮询分块进度。
+    请求本身不写文档行，避免与后台任务的 UPDATE 争用同一行锁。
+    """
     doc = await db.get(KnowledgeDocument, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="文档不存在")
@@ -605,51 +976,239 @@ async def ingest_document(
         doc.status = "failed"
         doc.error_message = "Hermes 未配置"
         await db.flush()
+        _set_ingest_progress(
+            doc.id,
+            stage="failed",
+            message="Hermes 未配置",
+            error="Hermes 未配置",
+        )
         return IngestResult(ok=False, status="failed", message="Hermes 未配置")
 
-    doc.status = "processing"
-    doc.error_message = None
-    await db.flush()
-
-    try:
-        # 全文分块提炼（每块 ≤ 8k 字符、整篇最多 30k），不再只发 3k 预览。
-        items, hermes_session_id = await _extract_knowledge_from_document(
-            doc.title,
-            doc.content,
-            system_prompt=KNOWLEDGE_INGEST_SYSTEM_PROMPT,
-        )
-
-        doc.status = "stored"
-        # 只使用 Hermes 真实返回的会话 id；取不到时留空，绝不本地伪造。
-        doc.hermes_session_id = hermes_session_id or None
-        doc.processed_content = json.dumps(items, ensure_ascii=False)[:5000]
-        # 条目已由平台侧结构化保存，不再伪造 llm-wiki 条目 id。
-        doc.knowledge_id = None
-        doc.error_message = None
-        await db.flush()
-
-        logger.info(
-            "KnowledgeDocument ingested: id={} items={} hermes_session={}",
-            doc.id, len(items), doc.hermes_session_id or "-",
-        )
+    progress = _INGEST_PROGRESS.get(doc_id)
+    # 单 worker 下，真正在跑的任务一定有 inflight/进度；落库的 ingesting 若
+    # 没有心跳，说明是重启残留，允许重试（status 端点会把它报成 failed）。
+    already_running = doc_id in _INGEST_INFLIGHT or (
+        progress is not None and progress.get("stage") in _ACTIVE_INGEST_STAGES
+    )
+    if already_running:
         return IngestResult(
-            ok=True,
-            status="stored",
-            hermes_session_id=hermes_session_id or None,
-            message=f"知识已存入 llm-wiki v2（{len(items)} 条知识条目）",
+            ok=False,
+            status="ingesting",
+            message="文档正在入库中，请稍后查看进度",
         )
 
-    except Exception as exc:
-        logger.exception("Knowledge ingest failed for doc {}", doc.id)
-        doc.status = "failed"
-        doc.error_message = str(exc)[:500]
-        await db.flush()
-        return IngestResult(ok=False, status="failed", message=f"入库失败: {exc}")
+    total_chunks = len(_chunk_text(doc.content))
+    _INGEST_INFLIGHT.add(doc_id)
+    _set_ingest_progress(
+        doc_id,
+        stage="queued",
+        step=0,
+        total=total_chunks,
+        message="已进入入库队列",
+    )
+    _schedule_ingest_job(doc_id)
+    logger.info("Knowledge ingest queued: id={} chunks={}", doc_id, total_chunks)
+    return IngestResult(
+        ok=True,
+        status="ingesting",
+        message="已开始入库，进度可在列表中查看",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Routes — Q&A Hit Testing
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# 检索可解释：一次 Hermes 调用同时拿回答、来源与置信度。来源标题再与本地
+# ``knowledge_documents.title`` 做归一化匹配（非向量检索），用于把“模型说
+# 引用了某标题”落到平台内真实文档上。
+SEARCH_EXPLAIN_SYSTEM_PROMPT = """你是基于企业知识库的检索助手。请根据知识库中的内容回答用户问题，并给出可核验的来源。
+
+要求：
+1. 只输出 JSON，不要输出 markdown 代码块、解释或任何多余文字
+2. 输出格式：
+   {"hit": true/false, "answer": "回答内容", "sources": [{"title": "来源标题", "score": 0.0}], "confidence": 0.0}
+3. sources 只列回答中真正引用的来源标题；score 为 0-1 的相关度，可省略
+4. confidence 为 0-1 的整体置信度
+5. 没有找到相关知识时 hit=false，sources 返回空数组，并在 answer 中明确说明"未命中"并给出建议"""
+
+
+def _clamp_confidence(value: Any, default: float = 0.0) -> float:
+    """把模型返回的置信度收敛到 0-1，异常值回退到默认值。"""
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_search_explain_output(raw: str) -> dict[str, Any]:
+    """解析 search-explain 的 Hermes JSON 输出。
+
+    容忍 ```json 代码块与前后说明文字；无法解析时回退为“按回答正文判断
+    是否未命中”，绝不让一次格式抖动变成 500。
+    """
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    parsed: Any = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                parsed = json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                parsed = None
+
+    if not isinstance(parsed, dict):
+        hit = "未命中" not in text.lower() and "没有找到" not in text
+        return {
+            "hit": hit,
+            "answer": text,
+            "sources": [],
+            "confidence": 0.5 if hit else 0.0,
+        }
+
+    answer = parsed.get("answer")
+    answer_text = answer if isinstance(answer, str) else (
+        json.dumps(answer, ensure_ascii=False) if answer is not None else text
+    )
+
+    raw_sources = parsed.get("sources")
+    sources: list[dict[str, Any]] = []
+    if isinstance(raw_sources, list):
+        for item in raw_sources:
+            if isinstance(item, dict):
+                title = str(item.get("title") or item.get("source") or "").strip()
+                if not title:
+                    continue
+                raw_score = item.get("score")
+                try:
+                    score = None if raw_score is None else _clamp_confidence(raw_score)
+                except Exception:
+                    score = None
+                sources.append({"title": title[:255], "score": score})
+            elif isinstance(item, str) and item.strip():
+                sources.append({"title": item.strip()[:255], "score": None})
+
+    return {
+        "hit": bool(parsed.get("hit", False)),
+        "answer": answer_text,
+        "sources": sources,
+        "confidence": _clamp_confidence(parsed.get("confidence"), 0.0),
+    }
+
+
+def _find_doc_by_source_title(
+    title: str,
+    docs: list[KnowledgeDocument],
+) -> KnowledgeDocument | None:
+    """按标题把 Hermes 来源关联到本地文档：先精确（归一化）再互相包含。"""
+    target = _norm_match_text(title)
+    if len(target) < _HIT_MATCH_MIN_TITLE_CHARS:
+        return None
+    for doc in docs:
+        doc_title = _norm_match_text(doc.title or "")
+        if doc_title and doc_title == target:
+            return doc
+    for doc in docs:
+        doc_title = _norm_match_text(doc.title or "")
+        if len(doc_title) < _HIT_MATCH_MIN_TITLE_CHARS:
+            continue
+        if doc_title in target or target in doc_title:
+            return doc
+    return None
+
+
+async def _attach_local_doc_ids(
+    db: AsyncSession,
+    sources: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """给来源补 doc_id：只匹配已入库（stored）文档，匹配不到则留空。"""
+    if not sources:
+        return sources
+    rows = await db.execute(
+        select(KnowledgeDocument).where(KnowledgeDocument.status == "stored")
+    )
+    docs = list(rows.scalars())
+    for source in sources:
+        doc = _find_doc_by_source_title(str(source.get("title") or ""), docs)
+        source["doc_id"] = doc.id if doc else None
+    return sources
+
+
+@router.get("/search-explain", response_model=SearchExplainResult)
+async def search_explain(
+    question: str = Query(..., min_length=1),
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> SearchExplainResult:
+    """Explainable knowledge search: answer + sources + confidence + latency.
+
+    Note: source→document association is title-based (normalized exact /
+    containment), NOT vector retrieval; unmatched sources keep ``doc_id=null``.
+    """
+    from app.services.hermes import _hermes_url
+
+    started = time.perf_counter()
+
+    if not _hermes_url:
+        return SearchExplainResult(
+            hit=False,
+            answer="Hermes 未配置，暂时无法检索知识库",
+            sources=[],
+            confidence=0.0,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    try:
+        raw = await _hermes_chat(
+            [
+                {"role": "system", "content": SEARCH_EXPLAIN_SYSTEM_PROMPT},
+                {"role": "user", "content": question},
+            ],
+            temperature=0.1,
+        )
+        parsed = _parse_search_explain_output(raw)
+        sources = await _attach_local_doc_ids(db, parsed["sources"])
+
+        # 命中统计复用既有口径：只给回答/来源真正点名的文档 +1。
+        try:
+            await _bump_referenced_hits(
+                db,
+                str(parsed["answer"]),
+                [str(s.get("title") or "") for s in sources],
+            )
+        except Exception:
+            logger.warning(
+                "知识命中统计失败（不影响检索结果）: question={!r}",
+                question[:80],
+            )
+
+        return SearchExplainResult(
+            hit=bool(parsed["hit"]),
+            answer=str(parsed["answer"])[:4000],
+            sources=[ExplainSource(**source) for source in sources],
+            confidence=float(parsed["confidence"]),
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    except Exception as exc:
+        logger.exception("Knowledge search-explain failed")
+        return SearchExplainResult(
+            hit=False,
+            answer=f"检索失败: {exc}",
+            sources=[],
+            confidence=0.0,
+            latency_ms=int((time.perf_counter() - started) * 1000),
+        )
 
 
 @router.post("/test-stream")
@@ -876,23 +1435,46 @@ async def receive_webhook(
     from app.services.hermes import _hermes_url
 
     if _hermes_url:
+        total_chunks = len(_chunk_text(doc.content))
         try:
-            doc.status = "processing"
+            doc.status = "ingesting"
             await db.flush()
+            _set_ingest_progress(
+                doc.id,
+                stage="queued",
+                step=0,
+                total=total_chunks,
+                message="Webhook 文档已进入入库队列",
+            )
 
             items, hermes_session_id = await _extract_knowledge_from_document(
                 doc.title,
                 doc.content,
                 system_prompt=KNOWLEDGE_WEBHOOK_SYSTEM_PROMPT,
                 context_label=f"Webhook 来源：{source}",
+                progress_doc_id=doc.id,
             )
 
+            _set_ingest_progress(
+                doc.id,
+                stage="storing",
+                step=total_chunks,
+                total=total_chunks,
+                message="正在写入知识条目",
+            )
             doc.status = "stored"
             doc.hermes_session_id = hermes_session_id or None
             doc.processed_content = json.dumps(items, ensure_ascii=False)[:5000]
             doc.knowledge_id = None
             doc.error_message = None
             await db.flush()
+            _set_ingest_progress(
+                doc.id,
+                stage="done",
+                step=total_chunks,
+                total=total_chunks,
+                message=f"入库完成，共 {len(items)} 条知识条目",
+            )
             logger.info(
                 "Webhook ingested: source={} doc_id={} items={}",
                 source, doc.id, len(items),
@@ -902,6 +1484,14 @@ async def receive_webhook(
             doc.status = "failed"
             doc.error_message = str(exc)[:500]
             await db.flush()
+            _set_ingest_progress(
+                doc.id,
+                stage="failed",
+                step=0,
+                total=total_chunks,
+                message="入库失败",
+                error=str(exc)[:500],
+            )
     else:
         logger.warning("Hermes 未配置，Webhook 文档保持 pending: doc_id={}", doc.id)
 

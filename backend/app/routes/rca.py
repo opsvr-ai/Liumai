@@ -6,6 +6,7 @@ session detail with timeline, and queue status.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import io
 import json
@@ -21,7 +22,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user
+from app.auth import (
+    PERM_RCA_TERMINATE,
+    get_current_user,
+    require_permission,
+)
 from app.config import settings
 from app.models import (
     Alert,
@@ -35,7 +40,8 @@ from app.models import (
 )
 from app.models.database import get_db_session
 from app.services.audit import record_audit
-from app.services.rca_runner import run_rca_session
+from app.services.hermes import HermesClient
+from app.services.rca_runner import _release_slot, run_rca_session
 
 router = APIRouter()
 
@@ -74,6 +80,14 @@ class TriggerRcaResponse(BaseModel):
     session_id: int
     status: str
     position_in_queue: int | None = None
+
+
+class CancelRcaResponse(BaseModel):
+    """Result of manually terminating a queued/running RCA session."""
+
+    session_id: int
+    status: str
+    hermes_stopped: bool = False
 
 
 class RcaSessionSummary(BaseModel):
@@ -685,7 +699,7 @@ async def rerun_session(
     session_id: int,
     background: BackgroundTasks,
     db: AsyncSession = Depends(get_db_session),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_permission(PERM_RCA_TERMINATE)),
 ) -> dict[str, Any]:
     """Re-run analysis for a failed/completed session."""
     session = await _get_scoped_session(db, session_id, user)
@@ -709,9 +723,139 @@ async def rerun_session(
     return {"status": "queued", "session_id": session_id}
 
 
+@router.post("/sessions/{session_id}/cancel", response_model=CancelRcaResponse)
+async def cancel_rca_session(
+    session_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(require_permission(PERM_RCA_TERMINATE)),
+) -> CancelRcaResponse:
+    """Manually terminate a QUEUED/RUNNING RCA session.
+
+    权限与隔离：需要 ``rca_terminate`` 权限位；会话按 ``user.team_id`` 隔离，
+    跨团队 / 不存在的会话按 404 处理（与同文件其他端点一致，不暴露存在性）。
+
+    状态语义：只有 QUEUED/RUNNING 可以终止；终态会话返回 409
+    ``{"detail": "会话已结束"}``。终止后沿用现有枚举置为 ``FAILED``（模型里
+    没有 CANCELLED），同时写 ``completed_at`` 与 ``root_cause_summary``
+    （``【手动终止】`` 前缀，等价 error_message），并追加时间线事件
+    （``metadata.kind = "rca_cancelled"``）与审计记录。
+
+    Hermes 关联：若会话记录了形如 ``run_*`` / ``api-*`` 的
+    ``hermes_session_id``，best-effort 调用 ``POST /v1/runs/{id}/stop``
+    （硬 5s 超时，失败只 warning，不影响终止结果）。Redis 并发槽位随后
+    幂等归还（``_release_slot``），由 TTL 与票据机制防止重复扣减。
+    """
+    session = await _get_scoped_session(db, session_id, user)
+    if session.status not in (RcaStatus.QUEUED, RcaStatus.RUNNING):
+        raise HTTPException(status_code=409, detail="会话已结束")
+
+    previous = session.status
+    hermes_session_id = (session.hermes_session_id or "").strip()
+    now = datetime.now(timezone.utc)
+
+    session.status = RcaStatus.FAILED
+    session.completed_at = now
+    session.root_cause_summary = (
+        f"【手动终止】{user.username} 终止了 RCA 分析"
+        f"（原状态 {previous.value}，终止时间 {_fmt_dt(now)}）"
+    )[:500]
+    db.add(CollaborationEvent(
+        rca_session_id=session_id,
+        event_type=CollaborationEventType.AGENT_PROGRESS,
+        content=(
+            f"【手动终止】{user.username} 终止了 RCA 分析"
+            f"（原状态 {previous.value}）。"
+            "如需继续，可在会话结束后重新分析。"
+        )[:1000],
+        metadata_={
+            "kind": "rca_cancelled",
+            "previous_status": previous.value,
+            "operator": user.username,
+            "hermes_session_id": hermes_session_id or None,
+        },
+    ))
+    await record_audit(
+        db,
+        user.username,
+        "RCA手动终止",
+        detail=(
+            f"session=#{session_id} {previous.value}→FAILED；"
+            f"hermes_session_id={hermes_session_id or '-'}"
+        )[:4000],
+        extra={
+            "session_id": session_id,
+            "previous_status": previous.value,
+            "hermes_session_id": hermes_session_id or None,
+        },
+    )
+    await db.commit()
+
+    # 落库之后再访问外部服务：即使 Hermes 挂起 5s，终止状态也已经持久化。
+    hermes_stopped = False
+    if _is_hermes_run_id(hermes_session_id):
+        hermes_stopped = await _stop_hermes_run_best_effort(hermes_session_id)
+    else:
+        logger.info(
+            "RCA 手动终止：session_id={} 无可用 Hermes run_id（{}），跳过 stop",
+            session_id,
+            hermes_session_id or "empty",
+        )
+
+    # 幂等归还 Redis 并发槽位（票据不存在时不会 DECR）。
+    await _release_slot(session_id, reason="cancel")
+
+    logger.info(
+        "RCA session {} cancelled by {} ({}→FAILED, hermes_stopped={})",
+        session_id,
+        user.username,
+        previous.value,
+        hermes_stopped,
+    )
+    return CancelRcaResponse(
+        session_id=session_id,
+        status=RcaStatus.FAILED.value,
+        hermes_stopped=hermes_stopped,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Internal helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+_HERMES_RUN_STOP_TIMEOUT_SECONDS = 5.0
+
+
+def _is_hermes_run_id(value: str | None) -> bool:
+    """Whether *value* looks like a Hermes Runs API id we can stop."""
+    candidate = (value or "").strip()
+    return candidate.startswith("run_") or candidate.startswith("api-")
+
+
+async def _stop_hermes_run_best_effort(run_id: str) -> bool:
+    """``POST /v1/runs/{id}/stop`` with a hard 5s budget — never raises."""
+    client: HermesClient | None = None
+    try:
+        client = HermesClient(timeout=_HERMES_RUN_STOP_TIMEOUT_SECONDS)
+        await asyncio.wait_for(
+            client.stop_run(run_id),
+            timeout=_HERMES_RUN_STOP_TIMEOUT_SECONDS,
+        )
+        logger.info("RCA 手动终止：已请求 Hermes 停止 run_id={}", run_id)
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — stop 失败只 warning，不能影响终止
+        logger.warning(
+            "RCA 手动终止：Hermes stop 请求失败 run_id={} err={}", run_id, exc,
+        )
+        return False
+    finally:
+        if client is not None:
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def _get_scoped_session(

@@ -9,7 +9,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import create_token, get_current_user, hash_password, require_admin, verify_password
+from app.auth import (
+    PERMISSION_CATALOG,
+    create_token,
+    get_current_user,
+    hash_password,
+    require_admin,
+    role_key,
+    user_permissions,
+    verify_password,
+)
 from app.models import AuthType, User, UserRole
 from app.models.database import get_db_session
 from app.services.ldap import authenticate_ldap, test_ldap_connection
@@ -229,6 +238,36 @@ async def login(
 
     # 4. Neither local nor LDAP matched
     raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+
+# ── Permissions (current user) ─────────────────────────────────────────────
+
+class PermissionItem(BaseModel):
+    key: str
+    label: str
+    description: str
+
+
+class PermissionsResponse(BaseModel):
+    role: str
+    permissions: list[str]
+    catalog: list[PermissionItem]
+
+
+@router.get("/permissions", response_model=PermissionsResponse)
+async def get_permissions(
+    user: User = Depends(get_current_user),
+) -> PermissionsResponse:
+    """Return the current user's permission bits plus the permission catalog.
+
+    Permissions are derived from ``User.role`` (ADMIN/OPERATOR/VIEWER) — no
+    schema change.  Routes should enforce them with ``Depends(require_permission(...))``.
+    """
+    return PermissionsResponse(
+        role=role_key(user),
+        permissions=user_permissions(user),
+        catalog=[PermissionItem(**item) for item in PERMISSION_CATALOG],
+    )
 
 
 class ChangePasswordRequest(BaseModel):

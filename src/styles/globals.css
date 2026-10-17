@@ -40,6 +40,9 @@
   --color-text-secondary:  #6b6b80;
   --color-text-muted:      #8e8ea0;
   --color-text-inverse:    #ffffff;
+  /* Text placed on a solid colored fill (badges, avatars). Theme invariant:
+   * unlike text-inverse it must stay white in dark mode. */
+  --color-text-on-solid:   #ffffff;
 
   /* ── 1c. Interactive (subtle, professional blue-gray) ──────────────────── */
   --color-interactive-primary: #4f6bf7;
@@ -240,4 +243,32 @@ button:focus-visible,
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+
+/* ==========================================================================
+ *  Section 6: Command Palette (⌘K)
+ *
+ *  Lightweight entrance motion for the no-dependency command palette.
+ *  The component uses theme tokens (bg-popover / bg-overlay / border-border);
+ *  only the transform + opacity keyframes live here.
+ * ========================================================================== */
+/* Animate the individual `translate`/`scale` properties (Tailwind v4 uses
+ * them for -translate-x-1/2), so the keyframes never fight the utility class. */
+@keyframes lm-command-panel-in {
+  from { opacity: 0; translate: -50% -6px; scale: 0.985; }
+  to   { opacity: 1; translate: -50% 0; scale: 1; }
+}
+
+@keyframes lm-command-backdrop-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.lm-command-panel {
+  animation: lm-command-panel-in 140ms var(--ease-out);
+}
+
+.lm-command-backdrop {
+  animation: lm-command-backdrop-in 120ms linear;
 }

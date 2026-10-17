@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useNavigate } from "react-router-dom";
 import {
+  ArrowRight,
   BellRing,
   Check,
   Copy,
@@ -15,6 +17,8 @@ import {
   Zap,
 } from "lucide-react";
 import { useAuth } from "@/components/auth/auth-context";
+import { PermissionGate } from "@/components/auth/permission-gate";
+import { usePermissions } from "@/hooks/usePermissions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -24,9 +28,11 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sh
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   alertsApi,
+  rca,
   type AlertOut,
   type AlertPolicy,
   type AlertStats,
+  type QueueStatus,
   type WebhookInfo,
   type WebhookTokenCreated,
   type WebhookTokenItem,
@@ -127,9 +133,12 @@ function PageSkeleton() {
 
 export default function AlertsPage() {
   const { isAdmin } = useAuth();
+  const { has } = usePermissions();
+  const navigate = useNavigate();
   const [tab, setTab] = useState<TabKey>("inbox");
 
   const [stats, setStats] = useState<AlertStats | null>(null);
+  const [rcaQueue, setRcaQueue] = useState<QueueStatus | null>(null);
   const [policy, setPolicy] = useState<AlertPolicy | null>(null);
   const [draft, setDraft] = useState<AlertPolicyExt | null>(null);
   const [webhook, setWebhook] = useState<WebhookInfo | null>(null);
@@ -172,15 +181,17 @@ export default function AlertsPage() {
   const loadCore = useCallback(async () => {
     setLoading(true);
     try {
-      const [s, p, w] = await Promise.all([
+      const [s, p, w, q] = await Promise.all([
         alertsApi.stats(7),
         alertsApi.policy(),
         alertsApi.webhookInfo(),
+        rca.queue().catch(() => null),
       ]);
       setStats(s);
       setPolicy(p);
       setDraft((prev) => prev ?? normalizePolicy(p));
       setWebhook(w);
+      setRcaQueue(q);
     } catch {
       toast.error("加载告警中心数据失败");
     } finally {
@@ -427,23 +438,36 @@ export default function AlertsPage() {
             Webhook 告警接入 · 自动去重 / 应用级合并 · 多信号触发 RCA · 近 7 天共 {stats?.total ?? 0} 条
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <div className="inline-flex rounded-lg border border-border p-0.5">
-            {(["auto", "manual"] as const).map((mode) => (
-              <button
-                key={mode}
-                disabled={busy}
-                onClick={() => void setMode(mode)}
-                className={`px-3 h-7 rounded-md text-xs font-medium transition-colors ${
-                  (draft?.mode ?? "auto") === mode
-                    ? "bg-interactive-primary text-white"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                {mode === "auto" ? "自动触发" : "人工触发"}
-              </button>
-            ))}
-          </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            onClick={() => navigate("/rca?status=running")}
+            title="查看运行中的 RCA 会话"
+          >
+            <PlayCircle className="h-3.5 w-3.5" />
+            进行中事件 {rcaQueue?.active_count ?? 0}
+            <ArrowRight className="h-3.5 w-3.5" />
+          </Button>
+          <PermissionGate perm="policy">
+            <div className="inline-flex rounded-lg border border-border p-0.5">
+              {(["auto", "manual"] as const).map((mode) => (
+                <button
+                  key={mode}
+                  disabled={busy}
+                  onClick={() => void setMode(mode)}
+                  className={`px-3 h-7 rounded-md text-xs font-medium transition-colors ${
+                    (draft?.mode ?? "auto") === mode
+                      ? "bg-interactive-primary text-white"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  {mode === "auto" ? "自动触发" : "人工触发"}
+                </button>
+              ))}
+            </div>
+          </PermissionGate>
           <Button variant="ghostMuted" size="icon-sm" onClick={() => void refreshAll()} aria-label="刷新">
             <RefreshCw className="h-4 w-4" />
           </Button>
@@ -495,12 +519,16 @@ export default function AlertsPage() {
                   {selected.length > 0 && (
                     <div className="flex items-center gap-1.5">
                       <span className="text-xs text-muted-foreground">已选 {selected.length}</span>
-                      <Button size="sm" className="h-7 text-xs" onClick={() => void triggerSelected()} disabled={busy}>
-                        <PlayCircle className="h-3.5 w-3.5" /> 触发 RCA
-                      </Button>
-                      <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => void dismissSelected()} disabled={busy}>
-                        <X className="h-3.5 w-3.5" /> 忽略
-                      </Button>
+                      <PermissionGate perm="trigger_mode">
+                        <Button size="sm" className="h-7 text-xs" onClick={() => void triggerSelected()} disabled={busy}>
+                          <PlayCircle className="h-3.5 w-3.5" /> 触发 RCA
+                        </Button>
+                      </PermissionGate>
+                      <PermissionGate perm="inbox_delete">
+                        <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => void dismissSelected()} disabled={busy}>
+                          <X className="h-3.5 w-3.5" /> 忽略
+                        </Button>
+                      </PermissionGate>
                     </div>
                   )}
                 </div>
@@ -578,9 +606,11 @@ export default function AlertsPage() {
                             </td>
                             <td className="px-3 py-2 text-right whitespace-nowrap">
                               {alert.status === "pending" ? (
-                                <Button variant="ghostMuted" size="icon-sm" title="触发 RCA" onClick={() => void triggerOne(alert)}>
-                                  <PlayCircle className="h-3.5 w-3.5" />
-                                </Button>
+                                <PermissionGate perm="trigger_mode">
+                                  <Button variant="ghostMuted" size="icon-sm" title="触发 RCA" onClick={() => void triggerOne(alert)}>
+                                    <PlayCircle className="h-3.5 w-3.5" />
+                                  </Button>
+                                </PermissionGate>
                               ) : alert.status === "triggered" && alert.rca_session_id ? (
                                 <a href={`/rca?s=${alert.rca_session_id}`} className="text-xs text-interactive-primary hover:underline">
                                   #{alert.rca_session_id}
@@ -590,9 +620,11 @@ export default function AlertsPage() {
                                   合并至 #{alert.rca_session_id}
                                 </a>
                               ) : null}
-                              <Button variant="ghostMuted" size="icon-sm" title="忽略" onClick={() => void dismissOne(alert)}>
-                                <X className="h-3.5 w-3.5" />
-                              </Button>
+                              <PermissionGate perm="inbox_delete">
+                                <Button variant="ghostMuted" size="icon-sm" title="忽略" onClick={() => void dismissOne(alert)}>
+                                  <X className="h-3.5 w-3.5" />
+                                </Button>
+                              </PermissionGate>
                             </td>
                           </tr>
                         ))}
@@ -622,11 +654,11 @@ export default function AlertsPage() {
                     placeholder="搜索"
                     className="h-8 w-40 text-xs"
                   />
-                  {isAdmin && (
+                  <PermissionGate perm="trash_clear">
                     <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => void clearTrash()}>
                       <Trash2 className="h-3.5 w-3.5" /> 清空
                     </Button>
-                  )}
+                  </PermissionGate>
                 </div>
               </div>
             </CardHeader>
@@ -819,13 +851,15 @@ export default function AlertsPage() {
                         <p className="text-[11px] text-muted-foreground leading-relaxed">
                           后台每小时最多自动清理一次（随 webhook / 列表访问惰性触发）。
                         </p>
-                        <Button
-                          variant="outline" size="sm" className="h-7 shrink-0 text-xs"
-                          disabled={!isAdmin || purgeBusy}
-                          onClick={() => void purgeNow()}
-                        >
-                          <Trash2 className="h-3.5 w-3.5" /> 立即清理当前团队
-                        </Button>
+                        <PermissionGate perm="trash_clear">
+                          <Button
+                            variant="outline" size="sm" className="h-7 shrink-0 text-xs"
+                            disabled={purgeBusy}
+                            onClick={() => void purgeNow()}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" /> 立即清理当前团队
+                          </Button>
+                        </PermissionGate>
                       </div>
                     </div>
 
@@ -915,11 +949,13 @@ export default function AlertsPage() {
                       <Button variant="outline" size="sm" onClick={() => setDraft(policy ? normalizePolicy(policy) : null)}>
                         还原
                       </Button>
-                      <Button size="sm" disabled={!isAdmin || busy} onClick={() => void saveDraft()}>
-                        保存策略
-                      </Button>
+                      <PermissionGate perm="policy">
+                        <Button size="sm" disabled={busy} onClick={() => void saveDraft()}>
+                          保存策略
+                        </Button>
+                      </PermissionGate>
                     </div>
-                    {!isAdmin && <p className="text-[11px] text-muted-foreground text-right">仅管理员可修改触发策略</p>}
+                    {!has("policy") && <p className="text-[11px] text-muted-foreground text-right">当前角色缺少「改变触发策略」权限</p>}
                   </>
                 )}
               </CardContent>

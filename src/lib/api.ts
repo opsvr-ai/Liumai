@@ -10,6 +10,58 @@ function token(): string | null {
   }
 }
 
+/**
+ * A non-2xx API response.
+ *
+ * ``status`` lets callers branch on the HTTP semantics (e.g. a 409 from
+ * ``/runs/{id}/steer`` means the run has already finished) instead of matching
+ * substrings in a human-readable message.
+ */
+export class ApiError extends Error {
+  readonly status: number;
+  /** Parsed ``detail`` of a FastAPI error envelope, when the body had one. */
+  readonly detail: unknown;
+
+  constructor(message: string, status: number, detail?: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
+/**
+ * Best-effort message for an error response body.
+ *
+ * FastAPI returns ``{"detail": "…"}``, but platform proxies occasionally wrap
+ * the upstream payload as ``{"detail": {code, message}}``.  We prefer the
+ * human-readable text and fall back to the raw body so nothing is lost.
+ */
+function _errorBody(body: string): { message: string; detail: unknown } {
+  const trimmed = body.trim();
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object") {
+      const envelope = parsed as Record<string, unknown>;
+      const detail = envelope.detail ?? envelope.message;
+      if (typeof detail === "string" && detail) {
+        return { message: detail, detail };
+      }
+      if (detail && typeof detail === "object") {
+        const nested = detail as Record<string, unknown>;
+        const text = nested.message ?? nested.code ?? nested.error;
+        return {
+          message: typeof text === "string" && text ? text : trimmed,
+          detail,
+        };
+      }
+    }
+  } catch {
+    // Not JSON (proxy error page / plain text) — use it verbatim below.
+  }
+  return { message: trimmed, detail: undefined };
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -41,8 +93,13 @@ async function request<T>(
   }
 
   if (!res.ok) {
-    const msg = await res.text().catch(() => res.statusText);
-    throw new Error(msg || `${method} ${path} → ${res.status}`);
+    const raw = await res.text().catch(() => res.statusText);
+    const { message, detail } = _errorBody(raw);
+    throw new ApiError(
+      message || `${method} ${path} → ${res.status}`,
+      res.status,
+      detail,
+    );
   }
 
   if (res.status === 204) return undefined as T;
@@ -151,10 +208,15 @@ export const rca = {
       params,
     );
   },
-  list(page = 1, pageSize = 20) {
+  list(page = 1, pageSize = 20, status?: string) {
+    const qs = new URLSearchParams({
+      page: String(page),
+      page_size: String(pageSize),
+    });
+    if (status) qs.set("status", status);
     return request<Paginated<RcaSessionSummary>>(
       "GET",
-      `/rca/sessions?page=${page}&page_size=${pageSize}`,
+      `/rca/sessions?${qs.toString()}`,
     );
   },
   detail(sessionId: number) {
@@ -181,7 +243,17 @@ export const rca = {
   rerun(sessionId: number) {
     return request<{ status: string; session_id: number }>("POST", `/rca/sessions/${sessionId}/rerun`);
   },
+  /** Manually terminate a QUEUED/RUNNING session (requires `rca_terminate`). */
+  cancel(sessionId: number) {
+    return request<{ session_id: number; status: string; hermes_stopped: boolean }>(
+      "POST",
+      `/rca/sessions/${sessionId}/cancel`,
+    );
+  },
 };
+
+/** Backwards-compatible alias used by newer call sites. */
+export const rcaApi = rca;
 
 /* ── Report files (download) ─────────────────────── */
 
@@ -579,6 +651,8 @@ export interface ChatRunStatus {
 export interface ChatApprovalRequest {
   /** Hermes ``request_id`` used to resolve this exact prompt ("" if absent). */
   approvalId: string;
+  /** Tool the agent wants to run (``tool`` / ``tool_name`` on the wire). */
+  tool?: string;
   command?: string;
   description?: string;
   /** Choices the server allows: once / session / always / deny. */
@@ -608,7 +682,7 @@ export const chatRuns = {
     );
   },
   steer(runId: string, input: string) {
-    return request<{ run_id?: string; accepted?: boolean }>(
+    return request<{ run_id?: string; accepted?: boolean; status?: string }>(
       "POST",
       `/chat/runs/${encodeURIComponent(runId)}/steer`,
       { input },
@@ -817,6 +891,11 @@ function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
             _runStr(raw.approval_id) ||
             _runStr(raw.id) ||
             _runStr(raw.tool_call_id),
+          tool:
+            _runStr(raw.tool) ||
+            _runStr(raw.tool_name) ||
+            _runStr(raw.name) ||
+            undefined,
           command: _runStr(raw.command) || undefined,
           description: _runStr(raw.description) || undefined,
           choices: choices.length > 0 ? choices : ["once", "deny"],
@@ -891,6 +970,18 @@ export interface LlmConfig {
   welcome_prompt: string;
 }
 
+export interface PermissionCatalogItem {
+  key: string;
+  label: string;
+  description: string;
+}
+
+export interface PermissionsResponse {
+  role: string;
+  permissions: string[];
+  catalog: PermissionCatalogItem[];
+}
+
 export const authApi = {
   setupStatus() {
     return request<SetupStatus>("GET", "/auth/setup/status");
@@ -900,6 +991,10 @@ export const authApi = {
   },
   login(username: string, password: string) {
     return request<{ token: string; username: string; role: string }>("POST", "/auth/login", { username, password });
+  },
+  /** Effective permission bits for the current user (derived from their role). */
+  permissions() {
+    return request<PermissionsResponse>("GET", "/auth/permissions");
   },
   changePassword(old_password: string, new_password: string) {
     return request<void>("POST", "/auth/change-password", { old_password, new_password });
@@ -1137,6 +1232,34 @@ export interface KnowledgeTestResult {
   confidence: number;
 }
 
+/** In-process ingestion heartbeat from GET /knowledge/documents/{id}/status. */
+export interface KnowledgeDocStatus {
+  status: string;
+  progress: {
+    stage: string;
+    step: number;
+    total: number;
+    message: string;
+  };
+  error: string | null;
+  updated_at: string | null;
+}
+
+/** One explainable-search source; doc_id is filled by title matching (not vectors). */
+export interface KnowledgeExplainSource {
+  title: string;
+  doc_id: number | null;
+  score: number | null;
+}
+
+export interface KnowledgeSearchExplainResult {
+  hit: boolean;
+  answer: string;
+  sources: KnowledgeExplainSource[];
+  confidence: number;
+  latency_ms: number;
+}
+
 export const knowledgeApi = {
   list(params?: { search?: string; status?: string; source_type?: string; page?: number; page_size?: number }) {
     const qs = new URLSearchParams();
@@ -1168,11 +1291,25 @@ export const knowledgeApi = {
   delete(id: number) {
     return request<void>("DELETE", `/knowledge/documents/${id}`);
   },
+  batchDelete(ids: number[]) {
+    return request<{ deleted: number; requested: number; missing: number[] }>(
+      "POST",
+      "/knowledge/documents/batch-delete",
+      { ids },
+    );
+  },
+  status(id: number) {
+    return request<KnowledgeDocStatus>("GET", `/knowledge/documents/${id}/status`);
+  },
   ingest(id: number) {
     return request<{ ok: boolean; status: string; hermes_session_id?: string; message: string }>("POST", `/knowledge/documents/${id}/ingest`);
   },
   test(question: string) {
     return request<KnowledgeTestResult>("POST", "/knowledge/test", { question });
+  },
+  searchExplain(question: string) {
+    const qs = new URLSearchParams({ question });
+    return request<KnowledgeSearchExplainResult>("GET", `/knowledge/search-explain?${qs.toString()}`);
   },
   feedback(question: string, hit: boolean) {
     return request<{ ok: boolean }>("POST", "/knowledge/feedback", { question, hit });
@@ -1271,6 +1408,14 @@ export interface ChatSessionSummary {
   created_at: string;
   updated_at: string;
   message_count: number;
+  /**
+   * Hermes agent session bound to this chat (continuity token).  When present
+   * the next turn continues the same agent context instead of replaying the
+   * whole transcript.
+   */
+  hermes_session_id?: string | null;
+  /** Hermes run still executing for this chat (reattach after a reload). */
+  active_run_id?: string | null;
 }
 
 export interface ChatSessionDetail extends ChatSessionSummary {
@@ -1314,6 +1459,18 @@ export const chatModes = {
   hermesInfo() {
     return request<HermesInfo>("GET", "/chat/hermes-info");
   },
+  /** Capability bits only — readable by every signed-in user (no admin needed). */
+  hermesCapabilities() {
+    return request<{
+      run_submission?: boolean;
+      run_stop?: boolean;
+      run_steer?: boolean;
+      run_approval_response?: boolean;
+      tool_progress_events?: boolean;
+      chat_completions_streaming?: boolean;
+      session_continuity_header?: string | null;
+    }>("GET", "/chat/hermes-capabilities");
+  },
 };
 
 /** Capability self-report surfaced by ``GET /api/chat/hermes-info``. */
@@ -1355,10 +1512,19 @@ export const chatHistory = {
     sessionId: number,
     messages: Array<{ role: string; content: string; tool_calls?: unknown }>,
     title?: string,
+    /**
+     * Hermes linkage persisted in the same write.  Omit a key to leave the
+     * stored value untouched; send ``null`` to clear it.
+     */
+    links?: {
+      hermes_session_id?: string | null;
+      active_run_id?: string | null;
+    },
   ) {
     return request<void>("POST", `/chat/sessions/${sessionId}/messages`, {
       messages,
       title,
+      ...(links ?? {}),
     });
   },
   delete(sessionId: number) {

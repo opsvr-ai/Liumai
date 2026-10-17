@@ -34,8 +34,9 @@ import {
   Square,
   ShieldAlert,
   ArrowDown,
+  Check,
 } from "lucide-react";
-import { useChat } from "@/hooks/useChat";
+import { useChat, type ChatApprovalDecision } from "@/hooks/useChat";
 import { ChatMessage } from "@/components/chat/ChatMessage";
 import { LiumaiLogo } from "@/components/liumai-logo";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -61,14 +62,31 @@ function relativeTime(iso: string): string {
   return d.toLocaleDateString("zh-CN");
 }
 
-/* ── Tool-approval choice labels (Runs API) ───────────────── */
+/* ── Tool-approval choices (Runs API) ─────────────────────── */
 
-const APPROVAL_LABELS: Record<string, string> = {
-  once: "允许一次",
-  session: "本会话允许",
-  always: "始终允许",
-  deny: "拒绝",
-};
+/**
+ * The four decisions the approval endpoint accepts, in display order.
+ * Fixed (rather than derived from ``pendingApproval.choices``) so the banner
+ * always offers the full vocabulary; an unsupported choice surfaces as a
+ * retryable error instead of silently disappearing.
+ */
+const APPROVAL_ACTIONS: ReadonlyArray<{
+  decision: ChatApprovalDecision;
+  label: string;
+}> = [
+  { decision: "once", label: "允许一次" },
+  { decision: "session", label: "本会话" },
+  { decision: "always", label: "始终" },
+  { decision: "deny", label: "拒绝" },
+];
+
+/** Human label for an approval decision (banner + 已响应 note). */
+function approvalLabel(decision: string): string {
+  return (
+    APPROVAL_ACTIONS.find((action) => action.decision === decision)?.label ??
+    decision
+  );
+}
 
 /* ── Welcome message cache (P1-17) ────────────────────────── */
 
@@ -109,6 +127,14 @@ export const ChatPanel: FC = () => {
   } = useChat();
 
   const [input, setInput] = useState("");
+  /** "正在提交…" / "已响应 · 允许一次" note under the approval banner. */
+  const [approvalNotice, setApprovalNotice] = useState<string | null>(null);
+  /** request_id currently in flight — blocks the same banner's double click. */
+  const approvalRequestRef = useRef<string | null>(null);
+  /** Text queued because a steer hit a run that had already ended. */
+  const [pendingResend, setPendingResend] = useState<string | null>(null);
+  /** Steer request in flight — Enter must not submit twice. */
+  const steerInFlightRef = useRef(false);
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [welcomeText, setWelcomeText] = useState("");       // start empty — no flash
@@ -130,6 +156,19 @@ export const ChatPanel: FC = () => {
       }
     };
   }, []);
+
+  // A fresh approval prompt supersedes the previous "已响应" note.
+  useEffect(() => {
+    if (pendingApproval) setApprovalNotice(null);
+  }, [pendingApproval]);
+
+  // Dismiss the success note after a moment (the in-flight note is transient
+  // until respondApproval settles).
+  useEffect(() => {
+    if (!approvalNotice || approvalNotice.startsWith("正在")) return;
+    const timer = setTimeout(() => setApprovalNotice(null), 4000);
+    return () => clearTimeout(timer);
+  }, [approvalNotice]);
 
   // Typewriter — exposed as a stable callback
   const startTypewriter = useCallback((text: string) => {
@@ -305,19 +344,25 @@ export const ChatPanel: FC = () => {
 
   // Probe Hermes capabilities once: the Runs path needs to know whether a stop
   // really interrupts the agent server-side, and whether steer/approval exist.
-  // On failure the optimistic defaults stay — the Runs path degrades on its own.
+  // A failed probe never errors the chat: approval/steer are treated as absent
+  // (their UI stays hidden) while runs/stop keep their optimistic defaults.
   useEffect(() => {
-    chatModes.hermesInfo()
-      .then((info) => {
-        const features = info.features || {};
+    // Non-admin endpoint: capability bits only.  The admin-only hermes-info
+    // call used to 403 for normal users and could clobber the probed values.
+    chatModes.hermesCapabilities()
+      .then((caps) => {
         configureRunCapabilities({
-          runs: features.run_submission !== false,
-          stop: features.run_stop === true,
-          steer: features.run_steer === true,
-          approval: features.run_approval_response === true,
+          runs: caps.run_submission !== false,
+          stop: caps.run_stop === true,
+          steer: caps.run_steer === true,
+          approval: caps.run_approval_response === true,
         });
       })
-      .catch(() => { /* older backend / offline — keep defaults */ });
+      .catch(() => {
+        // Older / non-admin backend or offline — capability is unknown, so do
+        // not guess: hide approval & steer instead of showing dead controls.
+        configureRunCapabilities({ approval: false, steer: false });
+      });
   }, [configureRunCapabilities]);
 
   // Poll Hermes health every 30s; force-switch to general if offline
@@ -475,13 +520,105 @@ export const ChatPanel: FC = () => {
   // becomes a "supplementary instruction" box instead of being disabled.
   const canSteer = isStreaming && Boolean(activeRunId) && runCapabilities.steer;
 
+  /**
+   * Send the current input as a supplementary instruction to the running run.
+   *
+   * Success clears the box.  A 409 (the run already finished) must not lose
+   * the text: it is queued and resent as a normal turn once the run settles.
+   */
   const handleSteer = useCallback(async () => {
     const text = input.trim();
-    if (!text || !canSteer) return;
-    setInput("");
-    const accepted = await steerMessage(text);
-    if (!accepted) toast.error("补充指令未被接受（运行可能已结束）");
+    if (!text || !canSteer || steerInFlightRef.current) return;
+    steerInFlightRef.current = true;
+    try {
+      const result = await steerMessage(text);
+      if (result.ok) {
+        setInput("");
+        toast.success("已发送补充指令");
+      } else if (result.reason === "ended" || result.reason === "unavailable") {
+        setInput("");
+        setPendingResend(text);
+        toast.error("本轮已结束，指令未发送");
+      } else {
+        toast.error("补充指令发送失败，请重试");
+      }
+    } finally {
+      steerInFlightRef.current = false;
+    }
   }, [input, canSteer, steerMessage]);
+
+  /** Answer the pending approval prompt (the hook clears/restores it). */
+  const handleApprovalResponse = useCallback(
+    async (decision: ChatApprovalDecision) => {
+      if (!pendingApproval) return;
+      const requestId = pendingApproval.approvalId;
+      // Never submit two decisions at once.  The hook additionally dedupes the
+      // same request_id; this also covers prompts with no id at all.
+      if (approvalRequestRef.current !== null) return;
+      approvalRequestRef.current = requestId;
+      setApprovalNotice("正在提交审批…");
+      try {
+        const ok = await respondApproval({ decision });
+        if (ok) {
+          setApprovalNotice(`已响应 · ${approvalLabel(decision)}`);
+        } else {
+          // The prompt is restored by the hook so the user can retry.
+          setApprovalNotice(null);
+          toast.error("审批响应失败，请重试");
+        }
+      } finally {
+        approvalRequestRef.current = null;
+      }
+    },
+    [pendingApproval, respondApproval],
+  );
+
+  /**
+   * Send a normal turn, applying mode-specific extras (RCA window, inlined
+   * attachment, model pick).  Shared by Enter and the steer→normal fallback.
+   */
+  const submitTurn = useCallback(
+    async (rawText: string) => {
+      let text = rawText;
+      const isGeneralMode =
+        activeMode === "system:general" ||
+        Boolean(activeMode?.startsWith("user:"));
+      const isRcaMode = activeMode === "system:rca";
+      // General mode: inline attached document content
+      if (isGeneralMode && attachedContent) {
+        const fileName = attachedFile?.name ?? "文档";
+        text = `[上传文档: ${fileName}]\n\n${attachedContent}\n\n[用户问题]\n${text}`;
+        clearAttachment();
+      }
+      const twStart = isRcaMode ? (rcaTimeStart || new Date(Date.now() - 15 * 60000).toISOString()) : undefined;
+      const twEnd = isRcaMode ? (rcaTimeEnd || new Date().toISOString()) : undefined;
+      // The mode's config picks the engine: direct-LLM modes stay on
+      // /chat/stream, agent modes (default/hermes) go through the Runs API.
+      const activeModeMeta = modes.find((m) => m.slug === activeMode);
+      const provider = activeModeMeta
+        ? ((activeModeMeta.config?.provider as string | undefined) ??
+          (activeMode?.startsWith("system:") ? "hermes" : "llm"))
+        : "hermes";
+      await sendMessage(text, {
+        mode: activeMode ?? undefined,
+        provider,
+        timeWindowStart: twStart,
+        timeWindowEnd: twEnd,
+        model: isGeneralMode ? (selectedModel || undefined) : undefined,
+      });
+    },
+    [
+      activeMode,
+      modes,
+      rcaTimeStart,
+      rcaTimeEnd,
+      attachedContent,
+      attachedFile,
+      clearAttachment,
+      selectedModel,
+      sendMessage,
+    ],
+  );
 
   const handleSend = useCallback(async () => {
     if (!input.trim()) return;
@@ -490,33 +627,19 @@ export const ChatPanel: FC = () => {
       if (canSteer) await handleSteer();
       return;
     }
-    let text = input;
+    const text = input;
     setInput("");
-    const isGeneralMode = activeMode === "system:general" || activeMode?.startsWith("user:");
-    const isRcaMode = activeMode === "system:rca";
-    // General mode: inline attached document content
-    if (isGeneralMode && attachedContent) {
-      const fileName = attachedFile?.name ?? "文档";
-      text = `[上传文档: ${fileName}]\n\n${attachedContent}\n\n[用户问题]\n${text}`;
-      clearAttachment();
-    }
-    const twStart = isRcaMode ? (rcaTimeStart || new Date(Date.now() - 15 * 60000).toISOString()) : undefined;
-    const twEnd = isRcaMode ? (rcaTimeEnd || new Date().toISOString()) : undefined;
-    // The mode's config picks the engine: direct-LLM modes stay on
-    // /chat/stream, agent modes (default/hermes) go through the Runs API.
-    const activeModeMeta = modes.find((m) => m.slug === activeMode);
-    const provider = activeModeMeta
-      ? ((activeModeMeta.config?.provider as string | undefined) ??
-        (activeMode?.startsWith("system:") ? "hermes" : "llm"))
-      : "hermes";
-    await sendMessage(text, {
-      mode: activeMode ?? undefined,
-      provider,
-      timeWindowStart: twStart,
-      timeWindowEnd: twEnd,
-      model: isGeneralMode ? (selectedModel || undefined) : undefined,
-    });
-  }, [input, isStreaming, canSteer, handleSteer, sendMessage, activeMode, modes, rcaTimeStart, rcaTimeEnd, attachedContent, attachedFile, clearAttachment, selectedModel]);
+    await submitTurn(text);
+  }, [input, isStreaming, canSteer, handleSteer, submitTurn]);
+
+  // A steer hit an already-finished run: once the local run settles, send the
+  // queued text as a normal turn.
+  useEffect(() => {
+    if (isStreaming || !pendingResend) return;
+    const text = pendingResend;
+    setPendingResend(null);
+    void submitTurn(text);
+  }, [isStreaming, pendingResend, submitTurn]);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -562,6 +685,9 @@ export const ChatPanel: FC = () => {
   const handleNewSession = useCallback(() => {
     clearMessages();
     setActiveMode(null);
+    // Anything queued for the previous run must not leak into a new chat.
+    setPendingResend(null);
+    setApprovalNotice(null);
     // The welcome text is already loaded for this mount (and cached in
     // sessionStorage for later mounts) — never request it again (P1-17).
     nearBottomRef.current = true;
@@ -571,6 +697,9 @@ export const ChatPanel: FC = () => {
 
   const handleLoadSession = useCallback(
     async (id: number) => {
+      // Switching chats abandons any queued steer fallback.
+      setPendingResend(null);
+      setApprovalNotice(null);
       try {
         await loadSession(id);
         // Restored transcripts should open at the newest message.
@@ -813,15 +942,34 @@ export const ChatPanel: FC = () => {
               </div>
             )}
 
-            {/* ── Tool approval prompt (Runs API) ── */}
-            {pendingApproval && (
-              <div className="rounded-xl border border-amber-300/60 bg-amber-50/90 px-3 py-2 shadow-sm space-y-2">
+            {/* ── Tool approval prompt (Runs API) ──
+                Only rendered when the probed backend supports approval
+                responses; old Hermes / failed probes stay hidden. */}
+            {runCapabilities.approval && pendingApproval && (
+              <div
+                className="rounded-xl border border-amber-300/60 bg-amber-50/90 px-3 py-2 shadow-sm space-y-2"
+                role="alertdialog"
+                aria-label="工具调用审批"
+              >
                 <div className="flex items-start gap-2">
                   <ShieldAlert className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
                   <div className="min-w-0 flex-1">
                     <p className="text-[12px] font-medium text-amber-900">
-                      工具调用需要审批{pendingApproval.description ? `：${pendingApproval.description}` : ""}
+                      工具调用需要审批
+                      {pendingApproval.tool && (
+                        <>
+                          {" · "}
+                          <span className="font-mono text-[11px]">
+                            {pendingApproval.tool}
+                          </span>
+                        </>
+                      )}
                     </p>
+                    {pendingApproval.description && (
+                      <p className="mt-0.5 text-[11px] leading-snug text-amber-800/90 break-words">
+                        {pendingApproval.description}
+                      </p>
+                    )}
                     {pendingApproval.command && (
                       <pre className="mt-1 max-h-28 overflow-auto rounded bg-white/70 px-2 py-1 text-[11px] leading-snug text-text-secondary whitespace-pre-wrap break-all">
                         {pendingApproval.command}
@@ -830,22 +978,38 @@ export const ChatPanel: FC = () => {
                   </div>
                 </div>
                 <div className="flex flex-wrap justify-end gap-1.5">
-                  {pendingApproval.choices.map((choice) => (
+                  {APPROVAL_ACTIONS.map(({ decision, label }) => (
                     <button
-                      key={choice}
+                      key={decision}
                       type="button"
-                      onClick={() => { void respondApproval(choice); }}
+                      onClick={() => { void handleApprovalResponse(decision); }}
                       className={cn(
                         "px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors",
-                        choice === "deny"
+                        decision === "deny"
                           ? "bg-status-active/10 text-status-active hover:bg-status-active/20"
                           : "bg-interactive-primary/10 text-interactive-primary hover:bg-interactive-primary/20",
                       )}
                     >
-                      {APPROVAL_LABELS[choice] || choice}
+                      {label}
                     </button>
                   ))}
                 </div>
+              </div>
+            )}
+
+            {/* Outcome of the last approval decision ("正在提交…" / "已响应"). */}
+            {runCapabilities.approval && !pendingApproval && approvalNotice && (
+              <div
+                className="ml-auto flex w-fit items-center gap-1.5 px-1 text-[11px] text-status-resolved"
+                role="status"
+                aria-live="polite"
+              >
+                {approvalNotice.startsWith("正在") ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Check className="h-3 w-3" />
+                )}
+                {approvalNotice}
               </div>
             )}
 
@@ -945,7 +1109,22 @@ export const ChatPanel: FC = () => {
 
                 {/* Bottom bar */}
                 <div className="flex items-center justify-between px-3 pb-3 gap-2">
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    {/* Run indicator — the stop button on the right interrupts
+                        the same run (POST /runs/{id}/stop when supported). */}
+                    {isStreaming && (
+                      <span
+                        className="inline-flex min-w-0 items-center gap-1 rounded-full bg-interactive-primary/8 px-2 py-0.5 text-[10px] font-medium text-interactive-primary"
+                        role="status"
+                        aria-live="polite"
+                        title={activeRunId ? `运行中：${activeRunId}` : "正在执行"}
+                      >
+                        <Loader2 className="h-2.5 w-2.5 shrink-0 animate-spin" />
+                        <span className="truncate max-w-[170px]">
+                          {activeRunId ? `执行中 · ${activeRunId}` : "执行中"}
+                        </span>
+                      </span>
+                    )}
                     {(activeMode === "system:general" || activeMode?.startsWith("user:")) && (
                       <>
                         <input ref={fileInputRef} type="file" onChange={handleFileSelect} className="hidden"
