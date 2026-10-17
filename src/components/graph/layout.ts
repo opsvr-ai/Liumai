@@ -643,6 +643,35 @@ export function computeLayout(
     }
   }
 
+  // ── 最终铺开：小图放大到画布（只放大，不会引入新的重叠） ──────────────
+  let minX = Number.POSITIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
+  let maxRadius = MIN_NODE_RADIUS;
+  for (const node of placed) {
+    minX = Math.min(minX, node.x);
+    maxX = Math.max(maxX, node.x);
+    minY = Math.min(minY, node.y);
+    maxY = Math.max(maxY, node.y);
+    maxRadius = Math.max(maxRadius, node.r);
+  }
+  const boundsWidth = Math.max(1, maxX - minX);
+  const boundsHeight = Math.max(1, maxY - minY);
+  const availWidth = W - 2 * PAD - 2 * maxRadius;
+  const availHeight = H - 2 * PAD - 2 * maxRadius;
+  let scaleX = clamp(availWidth / boundsWidth, 1, 2.2);
+  let scaleY = clamp(availHeight / boundsHeight, 1, 2.2);
+  // 限制纵横比失真，让簇保持接近圆形
+  if (scaleX / scaleY > 1.7) scaleX = scaleY * 1.7;
+  else if (scaleY / scaleX > 1.7) scaleY = scaleX * 1.7;
+  const middleX = (minX + maxX) / 2;
+  const middleY = (minY + maxY) / 2;
+  for (const node of placed) {
+    node.x = cx + (node.x - middleX) * scaleX;
+    node.y = cy + (node.y - middleY) * scaleY;
+  }
+
   // ── 输出 ──────────────────────────────────────────────────────────────
   const positioned: PositionedNode[] = placed.map((node) => ({
     id: node.id,
