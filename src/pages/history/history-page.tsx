@@ -8,25 +8,60 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { historyApi, type RcaSessionSummary } from "@/lib/api";
 import { toast } from "sonner";
 
-const statusLabel: Record<string, string> = { completed: "完成", failed: "失败", running: "运行中", queued: "排队中" };
+const statusLabel: Record<string, string> = {
+  completed: "完成", failed: "失败", running: "运行中", queued: "排队中",
+  COMPLETED: "完成", FAILED: "失败", RUNNING: "运行中", QUEUED: "排队中",
+};
+
+/** Rows shown per page (client-side pagination). */
+const PAGE_SIZE = 20;
+/** Page size used when pulling rows from the API (backend max is 100). */
+const FETCH_PAGE_SIZE = 100;
+/** Safety cap so a huge history can never fan out into unbounded requests. */
+const MAX_FETCH_PAGES = 10;
 
 export default function HistoryPage() {
   const navigate = useNavigate();
   const [items, setItems] = useState<RcaSessionSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  const [page, setPage] = useState(1);
 
-  const refresh = useCallback(() => {
+  const refresh = useCallback(async () => {
     setLoading(true);
-    historyApi.rcaList(1, 50).then((r) => setItems(r.items)).catch(() => toast.error("加载历史失败")).finally(() => setLoading(false));
+    try {
+      // Load the history once and paginate entirely on the client. More than
+      // one request is only needed once the backend holds >100 sessions; the
+      // cap keeps the worst case bounded.
+      const first = await historyApi.rcaList(1, FETCH_PAGE_SIZE);
+      const loaded = [...first.items];
+      const pages = Math.min(
+        Math.max(1, Math.ceil(first.total / FETCH_PAGE_SIZE)),
+        MAX_FETCH_PAGES,
+      );
+      for (let p = 2; p <= pages; p++) {
+        const res = await historyApi.rcaList(p, FETCH_PAGE_SIZE);
+        if (res.items.length === 0) break;
+        loaded.push(...res.items);
+      }
+      setItems(loaded);
+    } catch {
+      toast.error("加载历史失败");
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
   useEffect(() => { refresh(); }, [refresh]);
 
+  const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const pagedItems = items.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+
   const stats = useMemo(() => ({
     total: items.length,
-    completed: items.filter((i) => i.status === "completed").length,
-    failed: items.filter((i) => i.status === "failed").length,
-    running: items.filter((i) => i.status === "running" || i.status === "queued").length,
+    completed: items.filter((i) => i.status?.toUpperCase() === "COMPLETED").length,
+    failed: items.filter((i) => i.status?.toUpperCase() === "FAILED").length,
+    running: items.filter((i) => ["RUNNING", "QUEUED"].includes(i.status?.toUpperCase() ?? "")).length,
   }), [items]);
 
   return (
@@ -60,22 +95,31 @@ export default function HistoryPage() {
           ) : items.length === 0 ? (
             <p className="text-sm text-muted-foreground py-8 text-center">暂无历史记录</p>
           ) : (
-            <table className="w-full text-sm">
-              <thead><tr className="border-b border-border text-muted-foreground text-xs">
-                <th className="text-left px-4 py-2 font-medium">ID</th><th className="text-left px-4 py-2 font-medium">类型</th><th className="text-left px-4 py-2 font-medium">状态</th><th className="text-left px-4 py-2 font-medium">规则</th><th className="text-left px-4 py-2 font-medium">根因</th><th className="text-left px-4 py-2 font-medium">时间</th><th className="text-right px-4 py-2 font-medium">操作</th>
-              </tr></thead>
-              <tbody>{items.map((r) => (
-                <tr key={r.id} className="border-b border-border/50 hover:bg-muted/50">
-                  <td className="px-4 py-2.5 font-mono text-xs">#{r.id}</td>
-                  <td className="px-4 py-2.5 text-xs">{r.trigger_type === "manual" ? "手动" : "被动"}</td>
-                  <td className="px-4 py-2.5"><Badge variant={r.status === "completed" ? "success" : r.status === "failed" ? "destructive" : r.status === "running" ? "info" : "secondary"} className="text-[11px]">{statusLabel[r.status] || r.status}</Badge></td>
-                  <td className="px-4 py-2.5">{r.rule_name || "—"}</td>
-                  <td className="px-4 py-2.5 max-w-xs truncate">{r.root_cause_summary || "—"}</td>
-                  <td className="px-4 py-2.5 text-xs text-muted-foreground">{r.created_at ? new Date(r.created_at).toLocaleString() : ""}</td>
-                  <td className="px-4 py-2.5 text-right"><Button variant="ghostMuted" size="icon-sm" onClick={() => navigate(`/rca?s=${r.id}`)}><Eye className="h-3.5 w-3.5" /></Button></td>
-                </tr>
-              ))}</tbody>
-            </table>
+            <>
+              <table className="w-full text-sm">
+                <thead><tr className="border-b border-border text-muted-foreground text-xs">
+                  <th className="text-left px-4 py-2 font-medium">ID</th><th className="text-left px-4 py-2 font-medium">类型</th><th className="text-left px-4 py-2 font-medium">状态</th><th className="text-left px-4 py-2 font-medium">规则</th><th className="text-left px-4 py-2 font-medium">根因</th><th className="text-left px-4 py-2 font-medium">时间</th><th className="text-right px-4 py-2 font-medium">操作</th>
+                </tr></thead>
+                <tbody>{pagedItems.map((r) => (
+                  <tr key={r.id} className="border-b border-border/50 hover:bg-muted/50">
+                    <td className="px-4 py-2.5 font-mono text-xs">#{r.id}</td>
+                    <td className="px-4 py-2.5 text-xs">{r.trigger_type?.toUpperCase() === "ACTIVE" ? "手动" : "告警"}</td>
+                    <td className="px-4 py-2.5"><Badge variant={r.status?.toUpperCase() === "COMPLETED" ? "success" : r.status?.toUpperCase() === "FAILED" ? "destructive" : r.status?.toUpperCase() === "RUNNING" ? "info" : "secondary"} className="text-[11px]">{statusLabel[r.status] || r.status}</Badge></td>
+                    <td className="px-4 py-2.5">{r.rule_name || "—"}</td>
+                    <td className="px-4 py-2.5 max-w-xs truncate">{r.root_cause_summary || "—"}</td>
+                    <td className="px-4 py-2.5 text-xs text-muted-foreground">{r.created_at ? new Date(r.created_at).toLocaleString() : ""}</td>
+                    <td className="px-4 py-2.5 text-right"><Button variant="ghostMuted" size="icon-sm" onClick={() => navigate(`/rca?s=${r.id}`)}><Eye className="h-3.5 w-3.5" /></Button></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+              <div className="flex items-center justify-between px-4 py-2.5 border-t border-border text-xs text-muted-foreground">
+                <span>共 {items.length} 条 · 第 {currentPage}/{totalPages} 页</span>
+                <div className="flex gap-1.5">
+                  <Button variant="outline" size="sm" className="h-7 text-xs" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}>上一页</Button>
+                  <Button variant="outline" size="sm" className="h-7 text-xs" disabled={currentPage >= totalPages} onClick={() => setPage(currentPage + 1)}>下一页</Button>
+                </div>
+              </div>
+            </>
           )}
         </CardContent>
       </Card>

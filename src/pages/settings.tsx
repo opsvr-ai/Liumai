@@ -19,7 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { authApi, chatModes, hermesDiscovery, type ChatModeOut, type HermesConfig, type LdapConfig, type LdapStatus, type LlmConfig } from "@/lib/api";
+import { authApi, chatModes, hermesDiscovery, type ChatModeOut, type HermesConfig, type HermesInfo, type LdapConfig, type LdapStatus, type LlmConfig } from "@/lib/api";
 import { useAuth } from "@/components/auth/auth-context";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -36,6 +36,23 @@ const CATEGORIES: SettingsCategory[] = [
   { key: "auth", label: "认证安全", icon: Shield },
   { key: "general", label: "通用", icon: Settings },
 ];
+
+/** Human labels for the Hermes capability flags shown in the settings panel. */
+const FEATURE_LABELS: Record<string, string> = {
+  chat_completions_streaming: "对话流式",
+  responses_api: "Responses",
+  run_submission: "Runs 任务",
+  run_stop: "可停止",
+  run_steer: "可干预",
+  run_approval_response: "工具审批",
+  tool_progress_events: "工具进度",
+  reasoning_streaming: "推理流",
+  session_chat_streaming: "会话流式",
+  session_fork: "会话分叉",
+  skills_api: "技能接口",
+  jobs_admin: "定时任务",
+  memory_write_api: "记忆写入",
+};
 
 export default function SettingsPage() {
   const { username, role } = useAuth();
@@ -57,6 +74,8 @@ export default function SettingsPage() {
   const [hermesSaving, setHermesSaving] = useState(false);
   const [hermesExpanded, setHermesExpanded] = useState(true);
   const [hermesTesting, setHermesTesting] = useState(false);
+  /** Rich capability report from GET /chat/hermes-info. */
+  const [hermesInfo, setHermesInfo] = useState<HermesInfo | null>(null);
 
   /* ── Mode prompt editing ───────────────────────────────── */
   const [modes, setModes] = useState<ChatModeOut[]>([]);
@@ -114,6 +133,9 @@ export default function SettingsPage() {
 
   useEffect(() => { loadLdapStatus(); loadLdapConfig(); loadHermesConfig(); loadLlmConfig(); }, [loadLdapStatus, loadLdapConfig, loadHermesConfig, loadLlmConfig]);
 
+  // Capability self-report is optional — never block the settings page on it.
+  useEffect(() => { chatModes.hermesInfo().then(setHermesInfo).catch(() => {}); }, []);
+
   useEffect(() => {
     hermesDiscovery.getCacheInterval().then((r) => setCacheInterval(r.refresh_secs)).catch(() => {});
     chatModes.list().then(setModes).catch(() => {});
@@ -148,8 +170,13 @@ export default function SettingsPage() {
   async function handleTestHermes() {
     setHermesTesting(true);
     try {
-      const result = await authApi.testHermes();
-      (result.ok ? toast.success : toast.error)(result.message);
+      const info = await chatModes.hermesInfo();
+      setHermesInfo(info);
+      if (info.ok) {
+        toast.success(`Hermes ${info.version ?? ""} 运行正常 · ${info.latency_ms ?? "?"}ms`);
+      } else {
+        toast.error(info.error ?? "Hermes 未就绪");
+      }
     } catch (e: any) { toast.error(`测试失败: ${e.message}`); }
     finally { setHermesTesting(false); }
   }
@@ -257,6 +284,116 @@ export default function SettingsPage() {
                 </CardContent>
               )}
             </Card>
+
+            {/* Hermes capability / health report */}
+            {hermesInfo && (
+              <Card>
+                <CardHeader className="pb-3">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-sm font-medium flex items-center gap-2">
+                      <Wifi className={cn("h-4 w-4", hermesInfo.ok ? "text-status-resolved" : "text-status-active")} />
+                      连接与能力
+                    </CardTitle>
+                    <div className="flex items-center gap-2">
+                      <Badge variant={hermesInfo.ok ? "secondary" : "destructive"} className="text-[10px]">
+                        {hermesInfo.ok ? "正常" : "异常"}
+                      </Badge>
+                      <Button variant="ghostMuted" size="icon-sm" onClick={handleTestHermes} disabled={hermesTesting} aria-label="刷新状态">
+                        <RefreshCw className={cn("h-3.5 w-3.5", hermesTesting && "animate-spin")} />
+                      </Button>
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {hermesInfo.error ? (
+                    <p className="text-xs text-status-active">{hermesInfo.error}</p>
+                  ) : (
+                    <>
+                      <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+                        {([
+                          ["版本", hermesInfo.version ?? "—"],
+                          ["延迟", hermesInfo.latency_ms != null ? `${hermesInfo.latency_ms}ms` : "—"],
+                          ["网关", hermesInfo.gateway_state ?? "—"],
+                          ["运行时", hermesInfo.runtime?.mode ?? "—"],
+                        ] as const).map(([k, v]) => (
+                          <div key={k} className="rounded-lg border border-border/60 px-2.5 py-1.5">
+                            <div className="text-[10px] text-muted-foreground">{k}</div>
+                            <div className="font-medium text-text-primary truncate" title={String(v)}>{v}</div>
+                          </div>
+                        ))}
+                      </div>
+
+                      {hermesInfo.current_model?.provider && (
+                        <div className="flex items-center gap-1.5 text-xs">
+                          <span className="text-muted-foreground">当前模型</span>
+                          <Badge variant="secondary" className="text-[10px]">{hermesInfo.current_model.provider}</Badge>
+                          {hermesInfo.current_model.models.slice(0, 3).map((m) => (
+                            <span key={m} className="rounded bg-surface-secondary px-1.5 py-0.5 text-[10px] text-text-secondary">{m}</span>
+                          ))}
+                        </div>
+                      )}
+
+                      {hermesInfo.features && Object.keys(hermesInfo.features).length > 0 && (
+                        <div className="space-y-1.5">
+                          <div className="text-[10px] text-muted-foreground">能力</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {Object.entries(hermesInfo.features).map(([key, value]) => {
+                              const on = Boolean(value);
+                              return (
+                                <span
+                                  key={key}
+                                  className={cn(
+                                    "rounded-md border px-1.5 py-0.5 text-[10px]",
+                                    on
+                                      ? "border-status-resolved/30 bg-status-resolved/10 text-status-resolved"
+                                      : "border-border text-muted-foreground/60 line-through",
+                                  )}
+                                  title={on ? "已启用" : "未启用"}
+                                >
+                                  {FEATURE_LABELS[key] ?? key}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+
+                      {hermesInfo.checks && Object.keys(hermesInfo.checks).length > 0 && (
+                        <div className="space-y-1.5">
+                          <div className="text-[10px] text-muted-foreground">就绪检查</div>
+                          <div className="flex flex-wrap gap-1.5">
+                            {Object.entries(hermesInfo.checks).map(([key, status]) => (
+                              <span
+                                key={key}
+                                className={cn(
+                                  "rounded-md border px-1.5 py-0.5 text-[10px]",
+                                  status === "ok"
+                                    ? "border-border bg-surface-secondary text-text-secondary"
+                                    : "border-status-active/30 bg-status-active/10 text-status-active",
+                                )}
+                              >
+                                {key} · {status}
+                              </span>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {hermesInfo.platforms && Object.keys(hermesInfo.platforms).length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
+                          平台连接：
+                          {Object.entries(hermesInfo.platforms).map(([name, state]) => (
+                            <span key={name} className={state === "connected" ? "text-status-resolved" : ""}>
+                              {name}({state})
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </CardContent>
+              </Card>
+            )}
 
             {/* LLM model config */}
             <Card>

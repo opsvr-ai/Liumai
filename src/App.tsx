@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { Activity, BookOpen, Clock, Database, HelpCircle, History, Home, Layers, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
+import { Activity, BellRing, BookOpen, Clock, Database, HelpCircle, History, Home, Layers, MessageCircle, Settings, Shield, Users, Wrench } from "lucide-react";
 import { AuthProvider, useAuth } from "@/components/auth/auth-context";
 import { DashboardShell, type SidebarItem } from "@/components/layout/dashboard-shell";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
@@ -9,6 +9,7 @@ import { Toaster } from "sonner";
 
 import LoginPage from "@/pages/login";
 import DashboardPage from "@/pages/dashboard";
+import AlertsPage from "@/pages/alerts";
 import ChatPage from "@/pages/chat/chat-page";
 import RcaPage from "@/pages/rca/rca-page";
 import RulesPage from "@/pages/rules/rules-page";
@@ -44,6 +45,7 @@ function Shell({ children }: { children: React.ReactNode }) {
   const sidebarItems = useMemo<SidebarItem[]>(() => {
     const items: SidebarItem[] = [
       { id: "home", label: "概览", icon: <Home className="h-4 w-4" />, isActive: location.pathname === "/", onClick: () => navigate("/") },
+      { id: "alerts", label: "告警中心", icon: <BellRing className="h-4 w-4" />, isActive: location.pathname.startsWith("/alerts"), onClick: () => navigate("/alerts") },
       { id: "chat", label: "智能对话", icon: <MessageCircle className="h-4 w-4" />, isActive: location.pathname.startsWith("/chat"), onClick: () => navigate("/chat") },
       { id: "rca", label: "RCA 分析", icon: <Activity className="h-4 w-4" />, isActive: location.pathname.startsWith("/rca"), onClick: () => navigate("/rca") },
       { id: "rules", label: "告警规则", icon: <Shield className="h-4 w-4" />, isActive: location.pathname.startsWith("/rules"), onClick: () => navigate("/rules") },
@@ -91,6 +93,7 @@ export default function App() {
                 <Shell>
                   <Routes>
                     <Route path="/" element={<DashboardPage />} />
+                    <Route path="/alerts" element={<AlertsPage />} />
                     <Route path="/chat" element={<ChatPage />} />
                     <Route path="/rca" element={<RcaPage />} />
                     <Route path="/rules" element={<RulesPage />} />

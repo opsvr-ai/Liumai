@@ -32,8 +32,17 @@ function formatAge(secs: number): string {
   return `${Math.round(mins / 60)}小时前`;
 }
 
+/** Matches one leading pictographic emoji (variation selector / ZWJ sequence /
+ *  skin-tone modifier included), plus regional-indicator flag pairs.
+ *
+ *  Deliberately not ``\p{Emoji}``: ASCII digits (0-9) and other plain ASCII
+ *  characters carry the Unicode Emoji property, which used to make labels such
+ *  as "10 tools" render a bogus icon and lose their leading characters. */
+const EMOJI_ICON_RE =
+  /^(?:\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?\p{Emoji_Modifier}?(?:\u200D\p{Extended_Pictographic}(?:\uFE0F|\uFE0E)?\p{Emoji_Modifier}?)*|[\u{1F1E6}-\u{1F1FF}]{2})/u;
+
 function extractIcon(label: string): string {
-  const emoji = label.match(/^[\p{Emoji}]/u);
+  const emoji = label.match(EMOJI_ICON_RE);
   return emoji ? emoji[0] : "";
 }
 
@@ -41,6 +50,7 @@ export default function SkillsPage() {
   const [skills, setSkills] = useState<HermesSkill[]>([]);
   const [toolsets, setToolsets] = useState<HermesToolset[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [tab, setTab] = useState<"toolsets" | "skills">("toolsets");
   const [filter, setFilter] = useState("all"); // all | enabled | configured
@@ -56,12 +66,39 @@ export default function SkillsPage() {
       setToolsets(t); setSkills(s);
       setCacheAge(formatAge(status.age_secs));
       setNextRefresh(status.refresh_secs);
-    } catch { if (!silent) toast.error("加载失败"); }
-    finally { setLoading(false); }
+      setError(null);
+    } catch (e) {
+      // Only surface a full error state for foreground loads; a failed silent
+      // refresh keeps the last good data on screen instead of blanking it.
+      if (!silent) {
+        setError(e instanceof Error ? e.message : "未知错误");
+        toast.error("加载失败");
+      }
+    } finally { if (!silent) setLoading(false); }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
-  useEffect(() => { const t = setInterval(() => load(true), 60000); return () => clearInterval(t); }, [load]);
+  // 60s auto-refresh, paused while the tab is hidden.
+  useEffect(() => {
+    load();
+    let timer: number | null = null;
+    const stop = () => {
+      if (timer !== null) { window.clearInterval(timer); timer = null; }
+    };
+    const start = () => {
+      stop();
+      timer = window.setInterval(() => load(true), 60000);
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") { load(true); start(); }
+      else stop();
+    };
+    if (document.visibilityState === "visible") start();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [load]);
 
   const filteredToolsets = useMemo(() => {
     let list = toolsets;
@@ -137,7 +174,7 @@ export default function SkillsPage() {
           ))}
         </div>
         {tab === "toolsets" && (
-          <Select value={filter} onValueChange={setFilter}>
+          <Select value={filter} onValueChange={(value) => setFilter(value ?? "all")}>
             <SelectTrigger className="w-24 h-8 text-xs"><SelectValue /></SelectTrigger>
             <SelectContent>
               <SelectItem value="all">全部</SelectItem>
@@ -153,10 +190,22 @@ export default function SkillsPage() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           {Array.from({ length: 8 }).map((_, i) => <Card key={i}><CardContent className="py-4"><Skeleton className="h-5 w-32 mb-2" /><Skeleton className="h-4 w-48 mb-2" /><Skeleton className="h-3 w-24" /></CardContent></Card>)}
         </div>
+      ) : error ? (
+        <Card>
+          <CardContent className="py-12 flex flex-col items-center gap-2 text-center">
+            <p className="text-sm font-medium text-status-active">加载技能与工具集失败</p>
+            <p className="text-xs text-muted-foreground max-w-md break-words">{error}</p>
+            <Button variant="outline" size="sm" className="mt-2" onClick={() => load(false)}>
+              <RefreshCw className="h-3.5 w-3.5 mr-1" />重试
+            </Button>
+          </CardContent>
+        </Card>
       ) : tab === "toolsets" ? (
         <>
           {filteredToolsets.length === 0 ? (
-            <p className="text-sm text-muted-foreground text-center py-12">没有匹配的工具集</p>
+            <p className="text-sm text-muted-foreground text-center py-12">
+              {toolsets.length === 0 ? "暂无工具集数据" : "没有匹配的工具集"}
+            </p>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
               {filteredToolsets.map((t) => <ToolsetCard key={t.name} toolset={t} />)}
@@ -166,7 +215,11 @@ export default function SkillsPage() {
       ) : (
         <div className="space-y-4">
           {groupedSkills.map(([category, items]) => <SkillGroup key={category} category={category} skills={items} />)}
-          {groupedSkills.length === 0 && <p className="text-sm text-muted-foreground text-center py-12">没有匹配的技能</p>}
+          {groupedSkills.length === 0 && (
+            <p className="text-sm text-muted-foreground text-center py-12">
+              {skills.length === 0 ? "暂无技能数据" : "没有匹配的技能"}
+            </p>
+          )}
         </div>
       )}
     </div>
@@ -178,7 +231,7 @@ export default function SkillsPage() {
 function ToolsetCard({ toolset: t }: { toolset: HermesToolset }) {
   const [expanded, setExpanded] = useState(false);
   const icon = extractIcon(t.label);
-  const displayLabel = icon ? t.label.replace(/^\p{Emoji}\s*/u, "") : t.label;
+  const displayLabel = icon ? t.label.slice(icon.length).replace(/^\s+/, "") : t.label;
 
   return (
     <Card className={cn("hover:shadow-md transition-all duration-200 hover:-translate-y-0.5", !t.enabled && "opacity-60")}>

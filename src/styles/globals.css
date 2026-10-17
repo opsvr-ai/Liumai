@@ -11,6 +11,21 @@
 
 
 /* ==========================================================================
+ *  Section 0: base-ui orientation variants
+ * ========================================================================== */
+/* base-ui 组件（Tabs / Separator / ScrollArea …）通过
+ *   data-orientation="horizontal" | "vertical"
+ * 表达朝向。shadcn 上游在 globals 里声明了这两个变体，本项目此前缺失，
+ * 导致所有 `data-horizontal:` / `data-vertical:` 工具类**静默失效**：
+ *   - Tabs Root 少了 flex-col → TabList 与面板并排、被拉伸到内容高度
+ *     （数据越多竖条越高，告警中心 / RCA 分析两个页面的主要视觉问题）
+ *   - Separator 横线不显示、ScrollArea 滚动条方向错误
+ * 补上后无需改动任何组件代码。 */
+@custom-variant data-horizontal (&[data-orientation="horizontal"]);
+@custom-variant data-vertical (&[data-orientation="vertical"]);
+
+
+/* ==========================================================================
  *  Section 1: Semantic Design Tokens
  * ========================================================================== */
 @theme {

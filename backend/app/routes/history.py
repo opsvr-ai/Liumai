@@ -79,8 +79,21 @@ async def list_rca_history(
 
     This endpoint provides the audit trail for completed and failed
     RCA investigations (D-06).
+
+    Results are always scoped to the caller's team. An explicit ``team_id``
+    filter may only narrow that scope — asking for another team is rejected.
     """
-    query = select(RcaSession).order_by(RcaSession.created_at.desc())
+    if team_id is not None and team_id != user.team_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="无权访问其他团队的 RCA 会话",
+        )
+
+    query = (
+        select(RcaSession)
+        .where(RcaSession.team_id == user.team_id)
+        .order_by(RcaSession.created_at.desc())
+    )
 
     if date_from:
         try:
@@ -101,9 +114,6 @@ async def list_rca_history(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid 'to' date: {date_to!r}",
             )
-
-    if team_id is not None:
-        query = query.where(RcaSession.team_id == team_id)
 
     if status_filter:
         query = query.where(RcaSession.status == status_filter)
@@ -153,14 +163,15 @@ async def list_collaboration_events(
     member joins, agent progress reports, manual findings, bot mentions,
     and completion signals. Paginated to avoid unbounded response size.
     """
-    # Verify session exists
+    # Verify the session exists and belongs to the caller's team
     sess_result = await db.execute(
         select(RcaSession).where(RcaSession.id == rca_session_id)
     )
-    if not sess_result.scalar_one_or_none():
+    session = sess_result.scalar_one_or_none()
+    if session is None or session.team_id != user.team_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"RCA session {rca_session_id} not found",
+            detail="RCA 会话不存在",
         )
 
     total_q = select(func.count()).where(

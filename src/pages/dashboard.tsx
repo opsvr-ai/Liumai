@@ -13,7 +13,7 @@ import { LiumaiLogo } from "@/components/liumai-logo";
 import { rca, historyApi, ruleApi, type QueueStatus, type RcaSessionSummary, hermesDiscovery } from "@/lib/api";
 
 const statusVariant = (s: string) =>
-  s === "completed" ? "success" : s === "failed" ? "destructive" : s === "running" ? "info" : "secondary";
+  s?.toUpperCase() === "COMPLETED" ? "success" : s?.toUpperCase() === "FAILED" ? "destructive" : s?.toUpperCase() === "RUNNING" ? "info" : "secondary";
 
 export default function DashboardPage() {
   const navigate = useNavigate();
@@ -50,8 +50,8 @@ export default function DashboardPage() {
   const stats = useMemo(() => ({
     active: queue?.active_count ?? 0,
     queued: queue?.queued_count ?? 0,
-    completed: recent.filter(r => r.status === "completed").length,
-    failed: recent.filter(r => r.status === "failed").length,
+    completed: recent.filter(r => r.status?.toUpperCase() === "COMPLETED").length,
+    failed: recent.filter(r => r.status?.toUpperCase() === "FAILED").length,
   }), [queue, recent]);
 
   const shortcuts = [
@@ -185,10 +185,10 @@ export default function DashboardPage() {
                   {recent.map((r) => (
                     <tr key={r.id} className="hover:bg-surface-secondary/30 transition-colors">
                       <td className="px-4 py-2.5 font-mono text-xs text-muted-foreground">#{r.id}</td>
-                      <td className="px-4 py-2.5 text-xs">{r.trigger_type === "manual" ? "手动" : "被动"}</td>
+                      <td className="px-4 py-2.5 text-xs">{r.trigger_type?.toUpperCase() === "ACTIVE" ? "手动" : "告警"}</td>
                       <td className="px-4 py-2.5">
                         <Badge variant={statusVariant(r.status)} className="text-[11px]">
-                          {r.status === "completed" ? "完成" : r.status === "failed" ? "失败" : r.status === "running" ? "运行中" : r.status}
+                          {r.status?.toUpperCase() === "COMPLETED" ? "完成" : r.status?.toUpperCase() === "FAILED" ? "失败" : r.status?.toUpperCase() === "RUNNING" ? "运行中" : r.status}
                         </Badge>
                       </td>
                       <td className="px-4 py-2.5 text-xs text-text-secondary max-w-[280px] truncate">

@@ -31,6 +31,9 @@ import {
   BookOpen,
   Sparkles,
   ChevronDown,
+  Square,
+  ShieldAlert,
+  ArrowDown,
 } from "lucide-react";
 import { useChat } from "@/hooks/useChat";
 import { ChatMessage } from "@/components/chat/ChatMessage";
@@ -58,6 +61,33 @@ function relativeTime(iso: string): string {
   return d.toLocaleDateString("zh-CN");
 }
 
+/* ── Tool-approval choice labels (Runs API) ───────────────── */
+
+const APPROVAL_LABELS: Record<string, string> = {
+  once: "允许一次",
+  session: "本会话允许",
+  always: "始终允许",
+  deny: "拒绝",
+};
+
+/* ── Welcome message cache (P1-17) ────────────────────────── */
+
+/**
+ * sessionStorage key prefix for the generated welcome text.  The username is
+ * appended in {@link fetchWelcome} so two accounts sharing a tab never see each
+ * other's greeting.
+ */
+const WELCOME_CACHE_PREFIX = "liumai:welcome:";
+
+/** Fallback greeting when the LLM is unavailable. */
+const DEFAULT_WELCOME =
+  "你好！我是六脉智能运维助手。我可以帮你实时监控、追踪故障根因、分析历史数据、协调应急响应。随时向我提问，一起保障系统稳定运行。";
+
+/* ── Scroll-follow behaviour (P1-6) ───────────────────────── */
+
+/** Auto-follow only while the viewport is within this distance of the bottom. */
+const BOTTOM_FOLLOW_THRESHOLD_PX = 120;
+
 /* ═══════════════════════════════════════════════════════════ */
 
 export const ChatPanel: FC = () => {
@@ -66,7 +96,14 @@ export const ChatPanel: FC = () => {
     isStreaming,
     error,
     sessionId,
+    activeRunId,
+    pendingApproval,
+    runCapabilities,
     sendMessage,
+    stopStreaming,
+    steerMessage,
+    respondApproval,
+    configureRunCapabilities,
     clearMessages,
     loadSession,
   } = useChat();
@@ -74,12 +111,13 @@ export const ChatPanel: FC = () => {
   const [input, setInput] = useState("");
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const defaultWelcome = "你好！我是六脉智能运维助手。我可以帮你实时监控、追踪故障根因、分析历史数据、协调应急响应。随时向我提问，一起保障系统稳定运行。";
   const [welcomeText, setWelcomeText] = useState("");       // start empty — no flash
   const [welcomeLoading, setWelcomeLoading] = useState(true); // shimmer while waiting
   const [welcomeTyping, setWelcomeTyping] = useState(false);
   const welcomeIndexRef = useRef(0);
-  const welcomeTargetRef = useRef(defaultWelcome);
+  const welcomeTargetRef = useRef(DEFAULT_WELCOME);
+  /** Guards the one-and-only welcome generation request per mount. */
+  const welcomeRequestedRef = useRef(false);
 
   const typewriterTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -95,7 +133,7 @@ export const ChatPanel: FC = () => {
 
   // Typewriter — exposed as a stable callback
   const startTypewriter = useCallback((text: string) => {
-    if (!text || text === welcomeTargetRef.current) return;
+    if (!text) return;
     welcomeTargetRef.current = text;
     welcomeIndexRef.current = 0;
     setWelcomeText("");
@@ -196,7 +234,14 @@ export const ChatPanel: FC = () => {
     if (fileInputRef.current) fileInputRef.current.value = "";
   }, []);
 
-  const bottomRef = useRef<HTMLDivElement>(null);
+  /* ── Scroll follow / 回到底部 (P1-6) ─────────────────── */
+  const messagesRootRef = useRef<HTMLDivElement>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const nearBottomRef = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
+  const prevMessageCountRef = useRef(0);
+  const [isNearBottom, setIsNearBottom] = useState(true);
+  const [hasUnread, setHasUnread] = useState(false);
 
   const reloadSessions = useCallback(async () => {
     try {
@@ -206,26 +251,74 @@ export const ChatPanel: FC = () => {
 
   useEffect(() => { reloadSessions(); }, [reloadSessions]);
 
-  // Fetch personalised welcome text (re-fetch on new session)
+  // Personalised welcome text.  Generated **once per browser session per user**
+  // on first mount and cached in sessionStorage; 新对话 must never hit the LLM
+  // again (P1-17).  The username is part of the key so switching accounts in
+  // the same tab never shows another user's greeting.
   const fetchWelcome = useCallback(() => {
+    if (welcomeRequestedRef.current) return; // React StrictMode double-invoke
+    welcomeRequestedRef.current = true;
+
+    const username = localStorage.getItem("liumai_user") || "用户";
+    const cacheKey = `${WELCOME_CACHE_PREFIX}${username}`;
+
+    let cached: string | null = null;
+    try {
+      cached = sessionStorage.getItem(cacheKey);
+    } catch {
+      /* storage unavailable (private mode) — fall through to the API */
+    }
+    if (cached) {
+      // Already generated earlier this browser session: show it instantly.
+      welcomeTargetRef.current = cached;
+      setWelcomeText(cached);
+      setWelcomeLoading(false);
+      return;
+    }
+
     setWelcomeLoading(true);
     setWelcomeText("");
-    const username = localStorage.getItem("liumai_user") || "用户";
     authApi.generateWelcome(username)
-      .then((r) => { startTypewriter(r.text); })
+      .then((r) => {
+        const text = r.text?.trim();
+        if (!text) throw new Error("欢迎语为空");
+        try {
+          sessionStorage.setItem(cacheKey, text);
+        } catch {
+          /* non-fatal — the greeting still renders */
+        }
+        startTypewriter(text);
+      })
       .catch(() => {
         // AI unavailable — use the (richer) default text directly, no typewriter
-        setWelcomeText(defaultWelcome);
+        setWelcomeText(DEFAULT_WELCOME);
       })
       .finally(() => setWelcomeLoading(false));
-  }, [startTypewriter, defaultWelcome]);
+  }, [startTypewriter]);
 
-  useEffect(() => { fetchWelcome(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { fetchWelcome(); }, [fetchWelcome]);
 
   // Load modes
   useEffect(() => {
     chatModes.list().then(setModes).catch(() => {});
   }, []);
+
+  // Probe Hermes capabilities once: the Runs path needs to know whether a stop
+  // really interrupts the agent server-side, and whether steer/approval exist.
+  // On failure the optimistic defaults stay — the Runs path degrades on its own.
+  useEffect(() => {
+    chatModes.hermesInfo()
+      .then((info) => {
+        const features = info.features || {};
+        configureRunCapabilities({
+          runs: features.run_submission !== false,
+          stop: features.run_stop === true,
+          steer: features.run_steer === true,
+          approval: features.run_approval_response === true,
+        });
+      })
+      .catch(() => { /* older backend / offline — keep defaults */ });
+  }, [configureRunCapabilities]);
 
   // Poll Hermes health every 30s; force-switch to general if offline
   useEffect(() => {
@@ -248,20 +341,126 @@ export const ChatPanel: FC = () => {
     return () => clearInterval(timer);
   }, []); // intentionally no activeMode dep — only check on mount
 
-  // Load available LLM models + default model
+  // Load available LLM models (P1-14).
+  //
+  // `GET /api/chat/llm-models` is readable by every signed-in user, unlike the
+  // admin-only `/auth/llm-config` the panel used to call — a normal user's 403
+  // was swallowed and the picker rendered blank.  The endpoint only echoes the
+  // configured default when model discovery fails, so an unambiguous single
+  // model is auto-selected; with several models we keep "" ("默认模型") and the
+  // backend continues to apply its configured default.
   useEffect(() => {
-    hermesDiscovery.listLlmModels().then((models) => {
-      setAvailableModels(models);
-    }).catch(() => {});
-    authApi.getLlmConfig().then((cfg) => {
-      if (cfg.model) setSelectedModel(cfg.model);
-    }).catch(() => {});
+    let cancelled = false;
+    hermesDiscovery.listLlmModels()
+      .then((models) => {
+        if (cancelled) return;
+        const list = models ?? [];
+        setAvailableModels(list);
+        // Keep a still-valid manual choice, otherwise fall back to the default.
+        setSelectedModel((prev) => {
+          if (prev && list.some((m) => m.id === prev)) return prev;
+          return list.length === 1 ? list[0].id : "";
+        });
+      })
+      .catch(() => {
+        // Offline / empty — hide the picker rather than render a blank select.
+        if (!cancelled) {
+          setAvailableModels([]);
+          setSelectedModel("");
+        }
+      });
+    return () => { cancelled = true; };
   }, []);
 
-  // Auto-scroll to bottom
+  /* ── Auto-follow only while the user is near the bottom (P1-6) ────── */
+
+  const scrollToBottom = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    // Coalesce bursts into one scroll per frame; the callback reads the
+    // freshest scrollHeight, so it always lands on the true bottom.
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      viewport.scrollTop = viewport.scrollHeight;
+    });
+  }, []);
+
+  const handleViewportScroll = useCallback(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const distanceFromBottom =
+      viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    const near = distanceFromBottom < BOTTOM_FOLLOW_THRESHOLD_PX;
+    nearBottomRef.current = near;
+    setIsNearBottom(near);
+    if (near) setHasUnread(false);
+  }, []);
+
+  // Our ScrollArea wrapper does not forward a viewport ref, so find the Base UI
+  // scroll viewport inside the message area and observe real user scrolling.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "instant" });
-  }, [messages]);
+    const viewport = messagesRootRef.current?.querySelector<HTMLDivElement>(
+      '[data-slot="scroll-area-viewport"]',
+    ) ?? null;
+    viewportRef.current = viewport;
+    if (!viewport) return;
+    viewport.addEventListener("scroll", handleViewportScroll, { passive: true });
+    handleViewportScroll();
+    return () => {
+      viewport.removeEventListener("scroll", handleViewportScroll);
+      viewportRef.current = null;
+    };
+  }, [handleViewportScroll]);
+
+  // Cancel a pending scroll frame on unmount.
+  useEffect(
+    () => () => {
+      if (scrollRafRef.current !== null) cancelAnimationFrame(scrollRafRef.current);
+    },
+    [],
+  );
+
+  const handleScrollToBottom = useCallback(() => {
+    nearBottomRef.current = true;
+    setIsNearBottom(true);
+    setHasUnread(false);
+    scrollToBottom();
+  }, [scrollToBottom]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    // Cleared transcript (new conversation / deleted session): reset follow state.
+    if (messages.length === 0) {
+      prevMessageCountRef.current = 0;
+      nearBottomRef.current = true;
+      setIsNearBottom(true);
+      setHasUnread(false);
+      return;
+    }
+
+    const previousCount = prevMessageCountRef.current;
+    prevMessageCountRef.current = messages.length;
+
+    const lastMessage = messages[messages.length - 1];
+    // A freshly sent turn or a restored transcript always lands at bottom.
+    const forceBottom =
+      (previousCount === 0 && messages.length > 0) ||
+      (messages.length > previousCount && lastMessage?.role === "user");
+
+    if (nearBottomRef.current || forceBottom) {
+      nearBottomRef.current = true;
+      setIsNearBottom(true);
+      setHasUnread(false);
+      scrollToBottom();
+    } else {
+      // Content arrived while the user is reading history: never yank the
+      // viewport back — show the 回到底部 pill instead.
+      setHasUnread(true);
+    }
+  }, [messages, scrollToBottom]);
 
   // Refresh session list after streaming finishes
   const prevStreaming = useRef(isStreaming);
@@ -272,26 +471,52 @@ export const ChatPanel: FC = () => {
     prevStreaming.current = isStreaming;
   }, [isStreaming, reloadSessions]);
 
+  // While an agent run is active and Hermes supports steer, the input box
+  // becomes a "supplementary instruction" box instead of being disabled.
+  const canSteer = isStreaming && Boolean(activeRunId) && runCapabilities.steer;
+
+  const handleSteer = useCallback(async () => {
+    const text = input.trim();
+    if (!text || !canSteer) return;
+    setInput("");
+    const accepted = await steerMessage(text);
+    if (!accepted) toast.error("补充指令未被接受（运行可能已结束）");
+  }, [input, canSteer, steerMessage]);
+
   const handleSend = useCallback(async () => {
-    if (!input.trim() || isStreaming) return;
+    if (!input.trim()) return;
+    if (isStreaming) {
+      // Mid-run input is a steer instruction, not a new turn.
+      if (canSteer) await handleSteer();
+      return;
+    }
     let text = input;
     setInput("");
+    const isGeneralMode = activeMode === "system:general" || activeMode?.startsWith("user:");
+    const isRcaMode = activeMode === "system:rca";
     // General mode: inline attached document content
-    if (activeMode === "general" && attachedContent) {
+    if (isGeneralMode && attachedContent) {
       const fileName = attachedFile?.name ?? "文档";
       text = `[上传文档: ${fileName}]\n\n${attachedContent}\n\n[用户问题]\n${text}`;
       clearAttachment();
     }
-    const twStart = activeMode === "rca" ? (rcaTimeStart || new Date(Date.now() - 15 * 60000).toISOString()) : undefined;
-    const twEnd = activeMode === "rca" ? (rcaTimeEnd || new Date().toISOString()) : undefined;
-    const realMode = activeMode?.startsWith("system:") ? activeMode.replace("system:", "") : activeMode;
+    const twStart = isRcaMode ? (rcaTimeStart || new Date(Date.now() - 15 * 60000).toISOString()) : undefined;
+    const twEnd = isRcaMode ? (rcaTimeEnd || new Date().toISOString()) : undefined;
+    // The mode's config picks the engine: direct-LLM modes stay on
+    // /chat/stream, agent modes (default/hermes) go through the Runs API.
+    const activeModeMeta = modes.find((m) => m.slug === activeMode);
+    const provider = activeModeMeta
+      ? ((activeModeMeta.config?.provider as string | undefined) ??
+        (activeMode?.startsWith("system:") ? "hermes" : "llm"))
+      : "hermes";
     await sendMessage(text, {
       mode: activeMode ?? undefined,
+      provider,
       timeWindowStart: twStart,
       timeWindowEnd: twEnd,
-      model: (activeMode === "system:general" || activeMode?.startsWith("user:")) ? (selectedModel || undefined) : undefined,
+      model: isGeneralMode ? (selectedModel || undefined) : undefined,
     });
-  }, [input, isStreaming, sendMessage, activeMode, rcaTimeStart, rcaTimeEnd, attachedContent, attachedFile, clearAttachment]);
+  }, [input, isStreaming, canSteer, handleSteer, sendMessage, activeMode, modes, rcaTimeStart, rcaTimeEnd, attachedContent, attachedFile, clearAttachment, selectedModel]);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -308,6 +533,9 @@ export const ChatPanel: FC = () => {
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      // IME composition (pinyin etc.): Enter confirms the candidate, it must
+      // never send the message.
+      if (e.nativeEvent.isComposing) return;
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         handleSend();
@@ -334,14 +562,25 @@ export const ChatPanel: FC = () => {
   const handleNewSession = useCallback(() => {
     clearMessages();
     setActiveMode(null);
-    fetchWelcome();
-  }, [clearMessages, fetchWelcome]);
+    // The welcome text is already loaded for this mount (and cached in
+    // sessionStorage for later mounts) — never request it again (P1-17).
+    nearBottomRef.current = true;
+    setIsNearBottom(true);
+    setHasUnread(false);
+  }, [clearMessages]);
 
   const handleLoadSession = useCallback(
     async (id: number) => {
-      try { await loadSession(id); } catch { /* 404 */ }
+      try {
+        await loadSession(id);
+        // Restored transcripts should open at the newest message.
+        nearBottomRef.current = true;
+        setIsNearBottom(true);
+        setHasUnread(false);
+        scrollToBottom();
+      } catch { /* 404 */ }
     },
-    [loadSession],
+    [loadSession, scrollToBottom],
   );
 
   const handleDeleteSession = useCallback(
@@ -455,7 +694,13 @@ export const ChatPanel: FC = () => {
         <div className="shrink-0 h-2" />
 
         {/* Messages — flex-1 when chatting, auto-height when empty */}
-        <div className={cn(messages.length === 0 ? "shrink-0" : "flex-1 min-h-0")}>
+        <div
+          ref={messagesRootRef}
+          className={cn(
+            "relative",
+            messages.length === 0 ? "shrink-0" : "flex-1 min-h-0",
+          )}
+        >
           <ScrollArea className="h-full">
             <div
               className="flex flex-col gap-4 px-4 py-2"
@@ -468,9 +713,22 @@ export const ChatPanel: FC = () => {
                   {error}
                 </div>
               )}
-              <div ref={bottomRef} />
             </div>
           </ScrollArea>
+
+          {/* 回到底部 — appears only after the user scrolled up and missed content */}
+          {messages.length > 0 && hasUnread && !isNearBottom && (
+            <button
+              type="button"
+              onClick={handleScrollToBottom}
+              className="absolute bottom-3 right-5 z-10 flex items-center gap-1 rounded-full bg-white/95 px-3 py-1.5 text-[11px] font-medium text-text-secondary shadow-lg ring-1 ring-black/[0.06] backdrop-blur transition-all duration-150 hover:text-text-primary hover:shadow-xl"
+              aria-label="回到底部"
+              title="回到底部"
+            >
+              <ArrowDown className="h-3.5 w-3.5" />
+              回到底部
+            </button>
+          )}
         </div>
 
         {/* ── Unified input area — centered when empty, bottom when chatting ── */}
@@ -555,11 +813,48 @@ export const ChatPanel: FC = () => {
               </div>
             )}
 
+            {/* ── Tool approval prompt (Runs API) ── */}
+            {pendingApproval && (
+              <div className="rounded-xl border border-amber-300/60 bg-amber-50/90 px-3 py-2 shadow-sm space-y-2">
+                <div className="flex items-start gap-2">
+                  <ShieldAlert className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[12px] font-medium text-amber-900">
+                      工具调用需要审批{pendingApproval.description ? `：${pendingApproval.description}` : ""}
+                    </p>
+                    {pendingApproval.command && (
+                      <pre className="mt-1 max-h-28 overflow-auto rounded bg-white/70 px-2 py-1 text-[11px] leading-snug text-text-secondary whitespace-pre-wrap break-all">
+                        {pendingApproval.command}
+                      </pre>
+                    )}
+                  </div>
+                </div>
+                <div className="flex flex-wrap justify-end gap-1.5">
+                  {pendingApproval.choices.map((choice) => (
+                    <button
+                      key={choice}
+                      type="button"
+                      onClick={() => { void respondApproval(choice); }}
+                      className={cn(
+                        "px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors",
+                        choice === "deny"
+                          ? "bg-status-active/10 text-status-active hover:bg-status-active/20"
+                          : "bg-interactive-primary/10 text-interactive-primary hover:bg-interactive-primary/20",
+                      )}
+                    >
+                      {APPROVAL_LABELS[choice] || choice}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* ── Input card ── */}
             <div className="rounded-2xl bg-white shadow-lg ring-1 ring-black/[0.04] overflow-hidden transition-all duration-200 focus-within:shadow-xl">
-              {/* Tab bar — underline style */}
+              {/* Tab bar — underline style.  Narrow viewports scroll
+                  horizontally instead of wrapping labels into a vertical stack. */}
               {modes.length > 0 && (
-                <div className="flex items-center gap-0 px-3 pt-2.5">
+                <div className="flex items-center gap-0 px-3 pt-2.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
                   {modes.map((m) => {
                     const isUser = m.slug.startsWith("user:");
                     const slug = m.slug;
@@ -573,14 +868,14 @@ export const ChatPanel: FC = () => {
                     const disabled = needsHermes && !hermesOnline;
 
                     return (
-                      <div key={slug} className="relative group flex items-center">
+                      <div key={slug} className="relative group flex items-center shrink-0">
                         <button
                           type="button"
                           disabled={disabled}
                           onClick={() => { if (!disabled) setActiveMode(isActive ? null : slug); }}
                           title={disabled ? "Hermes 服务不可用" : undefined}
                           className={cn(
-                            "relative flex items-center gap-1.5 px-2.5 py-2 text-[12px] font-medium transition-colors duration-200",
+                            "relative flex shrink-0 items-center gap-1.5 whitespace-nowrap px-2.5 py-2 text-[12px] font-medium transition-colors duration-200",
                             disabled ? "opacity-35 cursor-not-allowed" : "",
                             isActive && !disabled ? "text-text-primary" : disabled ? "text-muted-foreground/40" : "text-muted-foreground/60 hover:text-text-secondary",
                           )}
@@ -630,7 +925,10 @@ export const ChatPanel: FC = () => {
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
                   placeholder={
-                    isStreaming ? "等待回复中…"
+                    isStreaming
+                      ? canSteer
+                        ? "运行中… 可输入补充指令（Enter 发送），点 ■ 停止运行"
+                        : "等待回复中…"
                     : activeMode === "system:general" ? "通用模型智能问答，支持多格式文档上传… Enter 发送，Shift+Enter 换行"
                     : activeMode === "system:default" ? "智能运维助理，具备工具调用与自主执行能力… Enter 发送，Shift+Enter 换行"
                     : activeMode === "system:knowledge" ? "遵循 LLM-WIKI V2 协议，从知识库进行知识检索与问答… Enter 发送，Shift+Enter 换行"
@@ -638,7 +936,7 @@ export const ChatPanel: FC = () => {
                     : activeMode?.startsWith("user:") ? `与 ${cmName || "自定义助理"} 对话… Enter 发送，Shift+Enter 换行`
                     : "输入消息，Enter 发送，Shift+Enter 换行"
                   }
-                  disabled={isStreaming}
+                  disabled={isStreaming && !canSteer}
                   rows={1}
                   className="w-full bg-transparent pl-5 pr-5 py-3.5 text-[14px] text-text-primary placeholder:text-muted-foreground/35 disabled:opacity-40 resize-none leading-relaxed outline-none focus-visible:outline-0"
                   style={{ minHeight: "52px" }}
@@ -661,7 +959,11 @@ export const ChatPanel: FC = () => {
                     )}
                     {(activeMode === "system:general" || activeMode?.startsWith("user:")) && availableModels.length > 0 && (
                       <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)}
+                        title="选择模型（默认跟随后台配置）"
                         className="h-7 rounded-lg border-0 bg-transparent px-1.5 text-[11px] text-muted-foreground/60 focus:outline-none cursor-pointer max-w-[130px] truncate hover:text-text-secondary">
+                        {/* Never render a blank <select>: "" means the backend's
+                            configured default model is used (P1-14). */}
+                        <option value="">默认模型</option>
                         {availableModels.map((m) => (
                           <option key={m.id} value={m.id}>{m.id}</option>
                         ))}
@@ -669,19 +971,48 @@ export const ChatPanel: FC = () => {
                     )}
                   </div>
 
-                  <button
-                    onClick={handleSend}
-                    disabled={!input.trim() || isStreaming}
-                    className={cn(
-                      "flex items-center justify-center h-8 w-8 rounded-full transition-all duration-200 shrink-0",
-                      input.trim() && !isStreaming
-                        ? "bg-text-primary text-white shadow-md shadow-black/10 hover:bg-text-primary/90 hover:shadow-lg hover:scale-[1.04]"
-                        : "bg-black/[0.04] text-muted-foreground/30 cursor-not-allowed",
-                    )}
-                    aria-label="发送"
-                  >
-                    {isStreaming ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-3.5 w-3.5" />}
-                  </button>
+                  {isStreaming ? (
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {canSteer && (
+                        <button
+                          onClick={handleSteer}
+                          disabled={!input.trim()}
+                          className={cn(
+                            "flex items-center justify-center h-8 w-8 rounded-full transition-all duration-200",
+                            input.trim()
+                              ? "bg-interactive-primary text-white shadow-md shadow-black/10 hover:bg-interactive-primary/90"
+                              : "bg-black/[0.04] text-muted-foreground/30 cursor-not-allowed",
+                          )}
+                          aria-label="发送补充指令"
+                          title="发送补充指令（Steer）"
+                        >
+                          <Send className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      <button
+                        onClick={stopStreaming}
+                        className="flex items-center justify-center h-8 w-8 rounded-full transition-all duration-200 shrink-0 bg-text-primary text-white shadow-md shadow-black/10 hover:bg-text-primary/90 hover:shadow-lg"
+                        aria-label="停止生成"
+                        title="停止生成"
+                      >
+                        <Square className="h-3 w-3 fill-current" />
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={handleSend}
+                      disabled={!input.trim()}
+                      className={cn(
+                        "flex items-center justify-center h-8 w-8 rounded-full transition-all duration-200 shrink-0",
+                        input.trim()
+                          ? "bg-text-primary text-white shadow-md shadow-black/10 hover:bg-text-primary/90 hover:shadow-lg hover:scale-[1.04]"
+                          : "bg-black/[0.04] text-muted-foreground/30 cursor-not-allowed",
+                      )}
+                      aria-label="发送"
+                    >
+                      <Send className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
             </div>

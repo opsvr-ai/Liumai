@@ -9,6 +9,7 @@ Each adapter knows how to:
 from __future__ import annotations
 
 import json
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,6 +27,143 @@ from loguru import logger
 class QueryResult:
     rows: list[dict[str, Any]] = field(default_factory=list)
     raw: Any = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Read-only SQL policy
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Path C (business-volume fluctuation) runs operator-supplied SQL against a
+# ClickHouse data source, so it is deliberately conservative: exactly one
+# statement, and it must start with SELECT (or a WITH ... SELECT CTE).  String
+# literals / comments are stripped before keyword inspection so a literal such
+# as ``'delete'`` cannot trip the guard, and a ``--``/``/* */`` comment cannot
+# hide a second statement.  The ClickHouse adapter additionally asks the server
+# for ``readonly=2`` so even a validation bypass cannot write data.
+
+MAX_READONLY_SQL_LENGTH = 8000
+
+# Statement keywords that are never part of a read-only SELECT.
+_FORBIDDEN_SQL_KEYWORDS = re.compile(
+    r"\b(?:insert|update|delete|drop|alter|create|truncate|rename|attach|"
+    r"detach|replace|merge|grant|revoke|optimize|kill|use|set|call|execute)\b",
+    re.IGNORECASE,
+)
+# SELECT ... INTO OUTFILE/DUMPFILE writes to the server filesystem.
+_FORBIDDEN_SQL_CLAUSE = re.compile(r"\binto\s+(?:outfile|dumpfile)\b", re.IGNORECASE)
+# ClickHouse table functions that can read the filesystem / network / external DBs.
+_FORBIDDEN_SQL_FUNCTIONS = re.compile(
+    r"\b(?:url|file|remote|remotesecure|hdfs|s3|azureblobstorage|gcs|mysql|"
+    r"postgresql|jdbc|odbc|sqlite|mongodb|redis|executable|input)\s*\(",
+    re.IGNORECASE,
+)
+
+
+class ReadOnlyQueryError(ValueError):
+    """Raised when SQL violates the single-statement read-only policy."""
+
+
+def _strip_sql_literals_and_comments(sql: str) -> str:
+    """Return *sql* with literals/comments blanked, preserving structure.
+
+    This is a small lexer rather than a regex so quotes, doubled quotes,
+    backslash escapes, ``--`` comments and ``/* ... */`` comments are handled
+    correctly.  Raises :class:`ReadOnlyQueryError` for an unterminated block
+    comment (which could otherwise hide the rest of the query).
+    """
+    out: list[str] = []
+    i = 0
+    length = len(sql)
+    while i < length:
+        char = sql[i]
+        if char in ("'", '"', "`"):
+            quote = char
+            i += 1
+            while i < length:
+                current = sql[i]
+                if current == "\\":
+                    i += 2
+                    continue
+                if current == quote:
+                    if i + 1 < length and sql[i + 1] == quote:
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+            out.append("''")
+            continue
+        if char == "-" and i + 1 < length and sql[i + 1] == "-":
+            newline = sql.find("\n", i)
+            i = length if newline < 0 else newline + 1
+            out.append(" ")
+            continue
+        if char == "/" and i + 1 < length and sql[i + 1] == "*":
+            end = sql.find("*/", i + 2)
+            if end < 0:
+                raise ReadOnlyQueryError("SQL 包含未闭合的块注释")
+            i = end + 2
+            out.append(" ")
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
+
+
+def validate_readonly_sql(sql: str) -> str:
+    """Validate and return a single read-only SELECT statement.
+
+    Rules:
+      * non-empty, at most :data:`MAX_READONLY_SQL_LENGTH` characters;
+      * exactly one statement (one optional trailing ``;`` is allowed);
+      * first keyword is ``SELECT`` or ``WITH`` (a CTE must contain ``SELECT``);
+      * no DDL/DML statement keywords, no ``SELECT ... INTO OUTFILE``, and no
+        filesystem/network/external-DB ClickHouse table functions.
+
+    Raises :class:`ReadOnlyQueryError` on violation.  The returned value never
+    contains a trailing semicolon, so it cannot be interpreted as multiple
+    statements by the HTTP endpoint.
+    """
+    if not isinstance(sql, str):
+        raise ReadOnlyQueryError("SQL 必须是字符串")
+    text = sql.strip()
+    if not text:
+        raise ReadOnlyQueryError("SQL 为空")
+    if "\x00" in text:
+        raise ReadOnlyQueryError("SQL 包含非法 NUL 字符")
+    if len(text) > MAX_READONLY_SQL_LENGTH:
+        raise ReadOnlyQueryError(
+            f"SQL 过长（>{MAX_READONLY_SQL_LENGTH} 字符）"
+        )
+
+    structure = _strip_sql_literals_and_comments(text).strip()
+    while structure.endswith(";"):
+        structure = structure[:-1].rstrip()
+    if ";" in structure:
+        raise ReadOnlyQueryError("只允许单条 SQL 语句（检测到多语句）")
+
+    first = re.match(r"([A-Za-z]+)", structure)
+    if first is None:
+        raise ReadOnlyQueryError("SQL 必须以 SELECT 开头")
+    leading = first.group(1).lower()
+    if leading not in ("select", "with"):
+        raise ReadOnlyQueryError("只允许 SELECT 查询")
+    if leading == "with" and not re.search(r"\bselect\b", structure, re.IGNORECASE):
+        raise ReadOnlyQueryError("WITH 子句必须包含 SELECT")
+
+    attack = _FORBIDDEN_SQL_KEYWORDS.search(structure)
+    if attack is not None:
+        raise ReadOnlyQueryError(f"SQL 包含被禁止的关键字: {attack.group(0)}")
+    if _FORBIDDEN_SQL_CLAUSE.search(structure):
+        raise ReadOnlyQueryError("SQL 不允许 INTO OUTFILE / DUMPFILE")
+    function = _FORBIDDEN_SQL_FUNCTIONS.search(structure)
+    if function is not None:
+        raise ReadOnlyQueryError(f"SQL 不允许外部读写函数: {function.group(0)}")
+
+    cleaned = text.rstrip()
+    while cleaned.endswith(";"):
+        cleaned = cleaned[:-1].rstrip()
+    return cleaned
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -230,6 +368,38 @@ class ClickHouseAdapter(BaseAdapter):
             r = await c.post(url, params=qp)
         r.raise_for_status()
         rows = [json.loads(line) for line in r.text.strip().split("\n") if line]
+        return QueryResult(rows=rows, raw=rows)
+
+    async def execute_readonly(
+        self, query: str, *, timeout_seconds: float = 3.0,
+    ) -> QueryResult:
+        """Execute one validated read-only SELECT with a hard timeout.
+
+        Used by the Path C trigger (business-volume fluctuation), never by the
+        generic admin query route.  Three layers of protection apply:
+
+        * :func:`validate_readonly_sql` — single statement, SELECT-only, no
+          DDL/DML and no external-read table functions;
+        * ClickHouse ``readonly=2`` — the server rejects data modification even
+          if validation were bypassed (2, not 1, so ``max_execution_time`` may
+          be supplied as a setting);
+        * both an ``httpx`` timeout and server-side ``max_execution_time``.
+        """
+        sql = validate_readonly_sql(query)
+        timeout = max(0.1, float(timeout_seconds))
+        qp = self._auth_params()
+        qp.update({
+            "query": sql,
+            "default_format": "JSONEachRow",
+            "readonly": "2",
+            "max_execution_time": str(max(1, int(round(timeout)))),
+        })
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=min(2.0, timeout)),
+        ) as client:
+            r = await client.post(self._base_url(), params=qp)
+        r.raise_for_status()
+        rows = [json.loads(line) for line in r.text.strip().split("\n") if line.strip()]
         return QueryResult(rows=rows, raw=rows)
 
 

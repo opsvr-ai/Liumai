@@ -13,7 +13,6 @@ to a browser client via Server-Sent Events.
 from __future__ import annotations
 
 import json
-import uuid
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -24,6 +23,30 @@ from app.config import settings
 # ── Runtime config (reloadable from DB, starts from env vars) ─────────────────
 _hermes_url: str = settings.HERMES_GATEWAY_URL
 _hermes_api_key: str | None = settings.HERMES_API_KEY
+
+# ── RCA output budget ────────────────────────────────────────────────────────
+# 旧值固定 4096，长 JSON 报告会在 finish_reason=length 处被截断，落库后变成
+# 无法解析的“半截 JSON”。默认提高到 8192，并允许用环境变量覆盖（不新增
+# settings 字段，避免动 config.py / 数据库结构）。
+RCA_DEFAULT_MAX_TOKENS = 8192
+
+
+def _rca_max_tokens() -> int:
+    """RCA 请求的 ``max_tokens``：``RCA_MAX_TOKENS`` 环境变量 > 默认 8192。
+
+    越界值会被收敛到 [512, 32768]，避免误配导致请求被 Hermes 拒绝或费用失控。
+    """
+    import os
+
+    raw: Any = os.getenv("RCA_MAX_TOKENS") or getattr(
+        settings, "RCA_MAX_TOKENS", None
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return RCA_DEFAULT_MAX_TOKENS
+    return max(512, min(value, 32768))
+
 
 # ── Skills / toolsets cache ─────────────────────────────────────────────────
 _cached_skills: list[dict[str, Any]] = []
@@ -120,6 +143,56 @@ RCA_SYSTEM_PROMPT = """你是一个专业的故障根因分析（RCA）助手。
 注意：仅返回 JSON，不要包含任何其他文字或解释。"""
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Runs API errors
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class HermesRunError(RuntimeError):
+    """An error returned by (or raised while reaching) the Hermes Runs API.
+
+    ``status_code`` mirrors the upstream HTTP status when there is one, and is
+    ``503`` for connection failures / ``502`` for malformed upstream payloads.
+    Routes translate this into an ``HTTPException`` so the browser sees a
+    meaningful status instead of a generic 500.
+    """
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = message
+
+
+def _hermes_error_message(body: bytes | str) -> str:
+    """Best-effort human-readable message from a Hermes error body.
+
+    Hermes uses the OpenAI envelope (``{"error": {"message": ...}}``) on most
+    surfaces, but a few handlers return ``{"error": "..."}`` or ``{"detail":
+    ...}``.  Plain text bodies are truncated and passed through.
+    """
+    if isinstance(body, bytes):
+        text = body.decode("utf-8", "replace")
+    else:
+        text = body
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return text.strip()[:500] or "Hermes 运行接口返回了错误"
+    if isinstance(parsed, dict):
+        err = parsed.get("error")
+        if isinstance(err, dict):
+            message = err.get("message") or err.get("code")
+            if message:
+                return str(message)
+        if isinstance(err, str) and err:
+            return err
+        for key in ("detail", "message"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return text.strip()[:500] or "Hermes 运行接口返回了错误"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Client
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -127,17 +200,19 @@ RCA_SYSTEM_PROMPT = """你是一个专业的故障根因分析（RCA）助手。
 class HermesClient:
     """Async HTTP client for the Hermes OpenAI-compatible API server.
 
-    Uses a shared ``httpx.AsyncClient`` with 600s timeout (RCA analysis
-    can take minutes).  Instantiate once per application scope.
+    Uses a shared ``httpx.AsyncClient`` with a configurable timeout (600s
+    default — RCA analysis can take minutes).  Instantiate once per
+    application scope.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, timeout: float = 600.0) -> None:
         # base_url should end with ``/v1``, e.g.
         # ``http://<host>:8642/v1``
         self.base_url = _hermes_url.rstrip("/")
         self.api_key = _hermes_api_key
+        self.timeout = timeout
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(600.0, connect=30.0),
+            timeout=httpx.Timeout(timeout, connect=30.0),
             headers=self._headers(),
         )
 
@@ -173,7 +248,6 @@ class HermesClient:
 
         Args:
             skill_name: Hermes skill name (e.g. ``"rca-fault-delimitation"``).
-                Included in ``session_id`` for traceability.
             params: RCA parameters.  Expected keys include
                 ``service_name``, ``time_window_start``,
                 ``time_window_end``, plus any additional context.
@@ -182,19 +256,23 @@ class HermesClient:
             A dict with the standard envelope::
 
                 {
-                    "session_id": "<uuid>",
+                    "session_id": "<Hermes 响应头 X-Hermes-Session-Id，取不到为 ''>",
                     "status": "completed",
+                    "finish_reason": "stop" | "length" | ...,
                     "result": {
                         "output": "<JSON string from Hermes>"
                     }
                 }
+
+            ``session_id`` 只取 Hermes 真实回传的会话 id，绝不在本地拼
+            ``skill--uuid`` 伪造（伪造值与 Hermes 侧会话对不上，写进
+            ``rca_sessions.hermes_session_id`` 只会误导排查）。
 
         Raises:
             RuntimeError: If the API call fails or returns an unexpected
                 status.
         """
         params = params or {}
-        session_id = f"{skill_name}--{uuid.uuid4().hex}"
 
         # Build a user message from the params dict
         user_message_lines = [f"技能名称: {skill_name}"]
@@ -203,6 +281,7 @@ class HermesClient:
         user_message = "\n".join(user_message_lines)
 
         url = f"{self.base_url}/chat/completions"
+        max_tokens = _rca_max_tokens()
         payload: dict[str, Any] = {
             "model": "hermes-agent",
             "messages": [
@@ -210,14 +289,14 @@ class HermesClient:
                 {"role": "user", "content": user_message},
             ],
             "temperature": 0.1,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
         }
 
         logger.info(
-            "Hermes RCA request: skill={!r} session_id={} params_keys={}",
+            "Hermes RCA request: skill={!r} params_keys={} max_tokens={}",
             skill_name,
-            session_id,
             list(params.keys()),
+            max_tokens,
         )
 
         try:
@@ -233,26 +312,48 @@ class HermesClient:
                 f"Hermes API Server request failed: {exc}"
             ) from exc
 
+        # 真实会话 id 只来自响应头（Hermes 在 SSE / 响应头里回传）；取不到就留空。
+        session_id = (resp.headers.get("x-hermes-session-id") or "").strip()
+
         data = resp.json()
 
         # Extract the assistant's reply from OpenAI-compatible response
         try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError) as exc:
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(
                 f"Unexpected Hermes response format: missing choices/content: {data}"
             ) from exc
 
-        logger.info(
-            "Hermes RCA completed: session_id={} input_tokens={} output_tokens={}",
-            session_id,
-            data.get("usage", {}).get("prompt_tokens", "?"),
-            data.get("usage", {}).get("completion_tokens", "?"),
+        finish_reason = (
+            choice.get("finish_reason") if isinstance(choice, dict) else None
         )
+        usage = data.get("usage") if isinstance(data, dict) else None
+        usage = usage if isinstance(usage, dict) else {}
+
+        logger.info(
+            "Hermes RCA completed: session_id={} finish_reason={} "
+            "input_tokens={} output_tokens={}",
+            session_id or "-",
+            finish_reason,
+            usage.get("prompt_tokens", "?"),
+            usage.get("completion_tokens", "?"),
+        )
+
+        # 截断是静默数据损坏：finish_reason=length 时 JSON 报告大概率不完整，
+        # 必须留痕，方便按日志调大 RCA_MAX_TOKENS 后重跑。
+        if finish_reason == "length":
+            logger.warning(
+                "Hermes RCA 输出被截断（finish_reason=length, max_tokens={}）"
+                "— 报告 JSON 可能不完整，可通过环境变量 RCA_MAX_TOKENS 调大后重跑",
+                max_tokens,
+            )
 
         return {
             "session_id": session_id,
             "status": "completed",
+            "finish_reason": finish_reason,
             "result": {"output": content},
         }
 
@@ -265,6 +366,7 @@ class HermesClient:
         model: str = "hermes-agent",
         temperature: float = 0.7,
         max_tokens: int = 4096,
+        session_id: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """Stream a chat completion via Hermes API Server with SSE.
 
@@ -272,13 +374,21 @@ class HermesClient:
         parsed delta events one at a time.  Each yielded dict has the shape::
 
             {
-                "type": "delta" | "tool_call" | "done" | "error",
-                "content": str | None,       # text chunk (type=delta)
+                "type": "delta" | "reasoning" | "tool_call" | "session"
+                        | "ping" | "status" | "done" | "error",
+                "content": str | None,       # text chunk (type=delta/reasoning)
                 "tool_call": dict | None,    # tool-call delta (type=tool_call)
                 "finish_reason": str | None, # stop / tool_calls / length (type=done)
                 "usage": dict | None,        # token counts (type=done, may be absent)
                 "error": str | None,         # error message (type=error)
+                "status": dict | None,       # forwarded Hermes status payload
             }
+
+        ``type=ping`` 对应 Hermes 的 SSE 注释行（``: keepalive``）。Hermes 在
+        工具执行/长思考期间按固定间隔（当前源码常量
+        ``CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS`` = 30s）写注释行保活；注释
+        不是 ``data:`` 行，必须显式转发，否则长工具执行时浏览器收不到任何
+        字节，容易被反向代理按空闲超时切断。
 
         Args:
             messages: List of message dicts with ``role`` and ``content`` keys
@@ -286,6 +396,10 @@ class HermesClient:
             model: Model identifier (default ``"hermes-agent"``).
             temperature: Sampling temperature (0-2, default 0.7).
             max_tokens: Maximum tokens to generate (default 4096).
+            session_id: Hermes session to continue (sent as
+                ``X-Hermes-Session-Id``).  Hermes then keeps the agent's
+                server-side context across turns instead of treating every
+                request as a brand-new conversation.
 
         Yields:
             Parsed delta events as described above.
@@ -307,18 +421,61 @@ class HermesClient:
 
         # We use a fresh client for streaming to avoid blocking the shared
         # client on long-lived connections.
+        stream_headers = self._headers()
+        if session_id and self.api_key:
+            # Hermes continues an existing server-side agent session.
+            stream_headers["X-Hermes-Session-Id"] = session_id
+        elif session_id:
+            # Hermes 0.22.x rejects this header with 403 when the API server has
+            # no API key configured, so it must only ride along with auth.
+            logger.info(
+                "Hermes API key not configured — omitting X-Hermes-Session-Id "
+                "(Hermes rejects it without auth)"
+            )
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(600.0, connect=30.0),
-            headers=self._headers(),
+            headers=stream_headers,
         ) as stream_client:
             try:
                 async with stream_client.stream("POST", url, json=payload) as resp:
                     resp.raise_for_status()
 
+                    # Hermes echoes (or mints) the session id here; the chat
+                    # layer forwards it to the browser so the next turn can
+                    # reuse the same agent session.
+                    hermes_session_id = resp.headers.get("x-hermes-session-id") or session_id
+                    if hermes_session_id:
+                        yield {
+                            "type": "session",
+                            "session_id": hermes_session_id,
+                            "content": None,
+                            "tool_call": None,
+                            "finish_reason": None,
+                            "usage": None,
+                            "error": None,
+                        }
+
                     tool_call_buf: dict[int, dict[str, Any]] = {}
                     current_sse_event: str | None = None
 
                     async for line in resp.aiter_lines():
+                        # ── SSE 注释行（`: keepalive`）─────────────────────
+                        # Hermes 在工具执行/长思考的空档写 `: keepalive` 注释；
+                        # 注释既不是 `event:` 也不是 `data:`，旧实现直接丢弃，
+                        # 导致最长几分钟的“静默期”里浏览器和反代都看不到任何
+                        # 字节。这里转成 ping 事件，由 chat 层包成 `event: ping`。
+                        if line.startswith(":"):
+                            logger.debug("Hermes SSE keepalive: {!r}", line[:80])
+                            yield {
+                                "type": "ping",
+                                "content": None,
+                                "tool_call": None,
+                                "finish_reason": None,
+                                "usage": None,
+                                "error": None,
+                            }
+                            continue
+
                         # ── Track SSE event: lines ──────────────────────────
                         if line.startswith("event: "):
                             current_sse_event = line[7:].strip()
@@ -354,6 +511,26 @@ class HermesClient:
                         # ── Hermes tool progress events ─────────────────────
                         if sse_event == "hermes.tool.progress":
                             yield _parse_hermes_tool_progress(chunk, tool_call_buf)
+                            continue
+
+                        # ── Hermes agent status events ──────────────────────
+                        # 部分 Hermes 版本 / 代理层会额外发 `event: hermes.status`
+                        # （例如阶段切换、排队、审批等待）。原样转发为 status，
+                        # 前端不认识也不会被误当成正文内容。
+                        if sse_event in ("hermes.status", "status"):
+                            logger.info(
+                                "Hermes SSE → status: {}",
+                                json.dumps(chunk, ensure_ascii=False)[:300],
+                            )
+                            yield {
+                                "type": "status",
+                                "content": None,
+                                "tool_call": None,
+                                "finish_reason": None,
+                                "usage": None,
+                                "error": None,
+                                "status": chunk,
+                            }
                             continue
 
                         # ── Multi-format delta extraction ───────────────────
@@ -395,6 +572,23 @@ class HermesClient:
                                 "error": None,
                             }
 
+                        # ── Reasoning / thinking deltas ──────────────────────
+                        # Hermes streams the model's chain-of-thought as
+                        # ``delta.reasoning_content`` (see /v1/capabilities →
+                        # features.reasoning_streaming).  Forward it separately so
+                        # the UI can collapse it instead of mixing it into the
+                        # answer text.
+                        reasoning = _find_reasoning(delta)
+                        if reasoning:
+                            yield {
+                                "type": "reasoning",
+                                "content": reasoning,
+                                "tool_call": None,
+                                "finish_reason": None,
+                                "usage": None,
+                                "error": None,
+                            }
+
                         # ── Text content ────────────────────────────────────
                         content = _find_content(delta)
                         if content:
@@ -411,22 +605,44 @@ class HermesClient:
                         if finish_reason is not None:
                             if finish_reason == "tool_calls":
                                 tool_call_buf.clear()
+                            # Hermes attaches diagnostics to abnormal finish
+                            # chunks (``error`` / ``hermes``); dropping them made
+                            # a truncated turn look like a clean stop.
+                            finish_error = chunk.get("error")
+                            if finish_error is not None and not isinstance(
+                                finish_error, str
+                            ):
+                                finish_error = json.dumps(
+                                    finish_error, ensure_ascii=False
+                                )
+                            hermes_extra = chunk.get("hermes")
+                            if finish_error:
+                                logger.warning(
+                                    "Hermes SSE → done with error: {}",
+                                    finish_error[:300],
+                                )
                             logger.info(
-                                "Hermes SSE → done: finish_reason={}", finish_reason
+                                "Hermes SSE → done: finish_reason={} has_error={}",
+                                finish_reason,
+                                bool(finish_error),
                             )
-                            yield {
+                            done_event: dict[str, Any] = {
                                 "type": "done",
                                 "content": None,
                                 "tool_call": None,
                                 "finish_reason": finish_reason,
                                 "usage": chunk.get("usage"),
-                                "error": None,
+                                "error": finish_error or None,
                             }
+                            if hermes_extra:
+                                done_event["hermes"] = hermes_extra
+                            yield done_event
 
                         # ── Catch-all for unknown shapes ────────────────────
                         if (
                             not raw_tool_calls
                             and not _find_content(delta)
+                            and not reasoning
                             and finish_reason is None
                         ):
                             logger.info(
@@ -458,6 +674,183 @@ class HermesClient:
                     "usage": None,
                     "error": f"无法连接到 Hermes 服务: {exc}",
                 }
+
+    # ── Runs API (structured agent runs) ──────────────────────────────────
+    #
+    # The Runs API decouples "submit" from "watch": ``POST /v1/runs`` returns a
+    # ``run_id`` immediately, progress arrives on ``GET /v1/runs/{id}/events``
+    # (SSE), and the run can be stopped / steered / approved through dedicated
+    # control endpoints.  Unlike ``/v1/chat/completions`` streaming, the run
+    # keeps executing on the Hermes side when the client disconnects, which is
+    # what makes a real "stop" possible.
+
+    def _run_url(self, run_id: str, suffix: str = "") -> str:
+        return f"{self.base_url}/runs/{run_id}{suffix}"
+
+    async def _run_request(
+        self,
+        method: str,
+        url: str,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Call a Runs API endpoint and return the decoded JSON object.
+
+        Raises:
+            HermesRunError: on connection failures, non-2xx responses, or a
+                body that is not a JSON object.
+        """
+        try:
+            resp = await self._client.request(
+                method, url, json=payload, headers=self._headers()
+            )
+        except httpx.RequestError as exc:
+            logger.warning("Hermes Runs API request failed: {} {}", method, url)
+            raise HermesRunError(503, f"无法连接 Hermes 服务: {exc}") from exc
+
+        if resp.status_code >= 400:
+            message = _hermes_error_message(resp.content)
+            logger.warning(
+                "Hermes Runs API HTTP {}: {} {} → {}",
+                resp.status_code,
+                method,
+                url,
+                message[:200],
+            )
+            raise HermesRunError(resp.status_code, message)
+
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise HermesRunError(502, "Hermes 运行接口返回了非 JSON 响应") from exc
+        return data if isinstance(data, dict) else {"data": data}
+
+    async def create_run(
+        self,
+        *,
+        input: str,
+        session_id: str | None = None,
+        instructions: str | None = None,
+        model: str | None = None,
+        conversation_history: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Submit ``POST /v1/runs`` and return ``{run_id, status, replayed?}``.
+
+        Args:
+            input: The user message for this turn.
+            session_id: Hermes agent session to continue.  When omitted Hermes
+                keys the run by its own ``run_id``, so callers that want
+                multi-turn continuity must pass the session id back.
+            instructions: Ephemeral system prompt for this turn (Hermes passes
+                it as the agent's system prompt; it is not persisted).
+            model: Optional model override.
+            conversation_history: Optional prior messages in OpenAI format.
+        """
+        payload: dict[str, Any] = {"input": input}
+        if session_id:
+            payload["session_id"] = session_id
+        if instructions:
+            payload["instructions"] = instructions
+        if model:
+            payload["model"] = model
+        if conversation_history:
+            payload["conversation_history"] = conversation_history
+
+        logger.info(
+            "Hermes run create: session_id={} has_instructions={} model={!r}",
+            session_id,
+            bool(instructions),
+            model,
+        )
+        return await self._run_request("POST", f"{self.base_url}/runs", payload)
+
+    async def get_run(self, run_id: str) -> dict[str, Any]:
+        """Fetch ``GET /v1/runs/{run_id}`` — pollable status for reconnect."""
+        return await self._run_request("GET", self._run_url(run_id))
+
+    async def stop_run(self, run_id: str) -> dict[str, Any]:
+        """Ask Hermes to interrupt a run (``POST /v1/runs/{id}/stop``)."""
+        logger.info("Hermes run stop: run_id={}", run_id)
+        return await self._run_request("POST", self._run_url(run_id, "/stop"))
+
+    async def steer_run(self, run_id: str, input: str) -> dict[str, Any]:
+        """Inject guidance into a running agent (``POST …/steer``)."""
+        logger.info("Hermes run steer: run_id={} chars={}", run_id, len(input))
+        return await self._run_request(
+            "POST", self._run_url(run_id, "/steer"), {"input": input}
+        )
+
+    async def respond_approval(
+        self,
+        run_id: str,
+        decision: str,
+        approval_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a pending tool approval (``POST …/approval``).
+
+        Hermes names the decision field ``choice`` and accepts
+        ``once``/``session``/``always``/``deny`` (``approve`` is aliased to
+        ``once`` upstream, but we normalise here so either vocabulary works).
+        """
+        choice = _normalize_approval_choice(decision)
+        payload: dict[str, Any] = {"choice": choice}
+        if approval_id:
+            payload["request_id"] = approval_id
+        logger.info(
+            "Hermes run approval: run_id={} choice={} has_request_id={}",
+            run_id,
+            choice,
+            bool(approval_id),
+        )
+        return await self._run_request(
+            "POST", self._run_url(run_id, "/approval"), payload
+        )
+
+    async def stream_run_events(
+        self,
+        run_id: str,
+        *,
+        last_event_id: str | int | None = None,
+    ) -> AsyncGenerator[bytes, None]:
+        """Proxy ``GET /v1/runs/{run_id}/events`` as raw SSE bytes.
+
+        Hermes writes SSE frames as ``id: <seq>`` + ``data: <json>`` (the event
+        *name* lives inside the JSON ``event`` field — there is no ``event:``
+        line) and uses comment frames (``: open``, ``: keepalive``,
+        ``: stream closed``) as keepalives.  We therefore forward the raw byte
+        chunks byte-for-byte instead of re-encoding them.
+
+        Args:
+            run_id: The Hermes run to stream.
+            last_event_id: Value of the client's ``Last-Event-ID`` header
+                (or ``?last_seq=``), forwarded so Hermes replays missed frames
+                after a dropped connection.
+
+        Yields:
+            Raw SSE byte chunks exactly as Hermes sent them.
+
+        Raises:
+            HermesRunError: if Hermes rejects the subscription (unknown run,
+                run not owned, …) before any bytes are streamed.
+        """
+        headers = self._headers()
+        headers["Accept"] = "text/event-stream"
+        if last_event_id not in (None, ""):
+            headers["Last-Event-ID"] = str(last_event_id)
+
+        # Long-lived connection: run events can idle for minutes while the agent
+        # waits on a tool approval, so keep the read timeout generous (Hermes
+        # emits a keepalive comment every ~10s anyway).
+        timeout = httpx.Timeout(600.0, connect=30.0)
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            async with client.stream("GET", self._run_url(run_id, "/events")) as resp:
+                if resp.status_code >= 400:
+                    body = await resp.aread()
+                    raise HermesRunError(
+                        resp.status_code, _hermes_error_message(body)
+                    )
+                async for chunk in resp.aiter_raw():
+                    if chunk:
+                        yield chunk
 
     # ── Skills & toolsets discovery ────────────────────────────────────
 
@@ -509,6 +902,57 @@ class HermesClient:
             logger.warning("Hermes /v1/toolsets request failed: {}", exc)
             return []
 
+    # ── Capabilities / health / model discovery ───────────────────────────
+
+    def _root_url(self) -> str:
+        """Base URL with any trailing ``/v1`` removed (root-level endpoints)."""
+        base = self.base_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        return base
+
+    async def get_capabilities(self) -> dict[str, Any]:
+        """Fetch ``GET /v1/capabilities``.
+
+        The server advertises the exact API surface it supports (runs,
+        session continuity headers, reasoning streaming, jobs admin, …), so the
+        UI can adapt instead of guessing.  Returns ``{}`` when unavailable —
+        older Hermes builds predate this endpoint.
+        """
+        try:
+            resp = await self._client.get(f"{self.base_url}/capabilities")
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else {}
+        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
+            logger.warning("Hermes /v1/capabilities unavailable: {}", exc)
+            return {}
+
+    async def get_health_detailed(self) -> dict[str, Any]:
+        """Fetch ``GET /health/detailed`` (root-level, not under /v1)."""
+        try:
+            resp = await self._client.get(f"{self._root_url()}/health/detailed")
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else {}
+        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
+            logger.warning("Hermes /health/detailed unavailable: {}", exc)
+            return {}
+
+    async def get_model_options(self) -> dict[str, Any]:
+        """Fetch ``GET /api/model/options`` — providers/models the agent can use.
+
+        Returns ``{}`` when the endpoint is absent (older builds).
+        """
+        try:
+            resp = await self._client.get(f"{self._root_url()}/api/model/options")
+            resp.raise_for_status()
+            data = resp.json()
+            return data if isinstance(data, dict) else {}
+        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
+            logger.warning("Hermes /api/model/options unavailable: {}", exc)
+            return {}
+
     # ── Legacy methods (deprecated) ───────────────────────────────────────
 
     async def get_session_status(self, session_id: str) -> str:
@@ -545,6 +989,30 @@ class HermesClient:
 # ═══════════════════════════════════════════════════════════════════════════════
 # Format-agnostic SSE helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _normalize_approval_choice(decision: str) -> str:
+    """Map a UI decision onto the ``choice`` vocabulary Hermes accepts.
+
+    Hermes accepts ``once`` / ``session`` / ``always`` / ``deny`` (and aliases
+    ``approve`` → ``once``).  The platform API speaks ``decision``, callers may
+    send either vocabulary, so normalise here.  Unknown values pass through
+    unchanged and Hermes answers 400 with a descriptive message.
+    """
+    value = (decision or "").strip().lower()
+    aliases = {
+        "approve": "once",
+        "approved": "once",
+        "allow": "once",
+        "yes": "once",
+        "ok": "once",
+        "reject": "deny",
+        "rejected": "deny",
+        "denied": "deny",
+        "no": "deny",
+        "cancel": "deny",
+    }
+    return aliases.get(value, value)
 
 
 def _parse_hermes_tool_progress(
@@ -670,6 +1138,28 @@ def _find_tool_calls(delta: dict[str, Any]) -> list[dict[str, Any]]:
         }]
 
     return []
+
+
+def _find_reasoning(delta: dict[str, Any]) -> str | None:
+    """Extract a reasoning/thinking delta, if the server streams one.
+
+    Hermes emits ``delta.reasoning_content`` (OpenAI-compatible reasoning
+    field).  A few providers use ``reasoning``, ``thinking`` or a content-block
+    list instead, so all variants are accepted here.
+    """
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value: Any = delta.get(key)
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(value, list):
+            parts = [
+                str(block.get("text", ""))
+                for block in value
+                if isinstance(block, dict) and block.get("text")
+            ]
+            if parts:
+                return "".join(parts)
+    return None
 
 
 def _find_content(delta: dict[str, Any]) -> str | None:

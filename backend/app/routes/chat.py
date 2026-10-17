@@ -13,7 +13,7 @@ from typing import Any
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user, require_admin
 from app.models import ChatMessage, ChatSession, User
 from app.models.database import get_db_session
-from app.services.hermes import HermesClient
+from app.services.hermes import HermesClient, HermesRunError
 
 
 # ── LLM config helper ──────────────────────────────────────────────────────────
@@ -71,9 +71,13 @@ class ChatRequest(BaseModel):
         default=None,
         description="Chat mode slug (rca, knowledge, etc.)",
     )
-    model: str = Field(
-        default="hermes-agent",
-        description="Hermes model to use",
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Model to use. Omit to let the server pick: Hermes agent for agent "
+            "modes, the configured LLM for direct-LLM modes. Sending the "
+            "'hermes-agent' literal to an external LLM endpoint breaks it."
+        ),
     )
     temperature: float = Field(
         default=0.7,
@@ -84,6 +88,13 @@ class ChatRequest(BaseModel):
     # RCA mode extras
     time_window_start: str | None = None
     time_window_end: str | None = None
+    hermes_session_id: str | None = Field(
+        default=None,
+        description=(
+            "Hermes agent session to continue. Sent upstream as "
+            "X-Hermes-Session-Id so the agent keeps its server-side context."
+        ),
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -156,6 +167,10 @@ async def chat_stream_endpoint(
 
     * ``delta`` — a text chunk from the assistant
     * ``tool_call`` — an assembled tool-call snapshot (incremental)
+    * ``reasoning`` — chain-of-thought chunk (shown collapsed in the UI)
+    * ``session`` — Hermes agent session id (for multi-turn continuity)
+    * ``ping`` — keepalive, emitted during long tool runs; carries no data
+    * ``status`` — forwarded ``hermes.status`` event, if Hermes sends one
     * ``done`` — stream finished, may include ``usage`` info
     * ``error`` — an unrecoverable error; the stream is terminated
     """
@@ -195,8 +210,11 @@ async def chat_stream_endpoint(
             # Prepend system prompt only if not already present
             if not messages or messages[0].get("role") != "system":
                 messages.insert(0, {"role": "system", "content": mode.system_prompt})
-            # RCA mode: inject time window into user message
-            if body.mode == "rca" and (body.time_window_start or body.time_window_end):
+            # RCA mode: inject time window into user message.
+            # ``body.mode`` arrives as ``system:rca`` (older code compared it to
+            # a bare ``rca``, so the window was never injected).
+            mode_slug = body.mode.replace("system:", "", 1)
+            if mode_slug == "rca" and (body.time_window_start or body.time_window_end):
                 tw_info = f"\n[时间窗口: {body.time_window_start or '?'} → {body.time_window_end or '?'}]"
                 last_user = None
                 for m in reversed(messages):
@@ -206,7 +224,8 @@ async def chat_stream_endpoint(
                 if last_user:
                     last_user["content"] += tw_info
             # RCA mode: lower temperature for deterministic output
-            body.temperature = 0.3
+            if mode_slug == "rca":
+                body.temperature = 0.3
 
     # ── LLM direct path (mode with provider=llm) ─────────────────────────
     if mode and mode_config.get("provider") == "llm":
@@ -243,14 +262,32 @@ async def chat_stream_endpoint(
         try:
             async for event in hermes.chat_stream(
                 messages,
-                model=body.model,
+                model=body.model or "hermes-agent",
                 temperature=body.temperature,
+                session_id=body.hermes_session_id,
             ):
                 event_type: str = event.get("type", "unknown")
+
+                # ── 心跳：不发 data 行 ──────────────────────────────────
+                # Hermes 的 `: keepalive` 注释被 hermes.chat_stream 转成 ping
+                # 事件。这里必须继续输出 SSE 帧（哪怕没有 data），否则长工具
+                # 执行期间连接会被 nginx / 网关按空闲超时切断。不带 data 的
+                # `event:`（含注释）不会触发浏览器 EventSource 的 message，
+                # 现有前端解析器只会跳过它，不影响既有事件兼容性。
+                if event_type == "ping":
+                    yield "event: ping\n\n"
+                    continue
+
                 payload: dict[str, Any] = {"type": event_type}
 
                 if event_type == "delta":
                     payload["content"] = event.get("content", "")
+                elif event_type == "reasoning":
+                    payload["content"] = event.get("content", "")
+                elif event_type == "session":
+                    payload["session_id"] = event.get("session_id")
+                elif event_type == "status":
+                    payload["status"] = event.get("status")
                 elif event_type == "tool_call":
                     raw_calls = event.get("tool_calls", [])
                     for tc in raw_calls:
@@ -263,6 +300,15 @@ async def chat_stream_endpoint(
                     usage = event.get("usage")
                     if usage:
                         payload["usage"] = usage
+                    # Abnormal finishes (context overflow, provider error, …)
+                    # carry diagnostics on the finish chunk.  Forward them so the
+                    # UI can say "任务中断" instead of rendering a clean stop.
+                    finish_error = event.get("error")
+                    if finish_error:
+                        payload["error"] = finish_error
+                    hermes_extra = event.get("hermes")
+                    if hermes_extra:
+                        payload["hermes"] = hermes_extra
                 elif event_type == "error":
                     payload["error"] = event.get("error", "未知错误")
 
@@ -286,6 +332,374 @@ async def chat_stream_endpoint(
             "X-Accel-Buffering": "no",  # disable nginx buffering
         },
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Runs API proxy (structured agent runs: real stop / steer / approval / resume)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class ChatRunRequest(BaseModel):
+    """Payload for ``POST /api/chat/runs`` (agent-mode turn)."""
+
+    input: str = Field(..., min_length=1, description="User message for this turn")
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Hermes agent session to continue.  When omitted Hermes keys the run "
+            "by run_id, so callers wanting multi-turn continuity must pass it back."
+        ),
+    )
+    instructions: str | None = Field(
+        default=None,
+        description="Ephemeral system prompt for this turn (not persisted)",
+    )
+    model: str | None = Field(default=None, description="Optional model override")
+    conversation_history: list[ChatMessageIn] | None = Field(
+        default=None,
+        description=(
+            "Prior turns to replay when there is no Hermes session yet (e.g. "
+            "after switching modes).  The newest user message travels as "
+            "``input``, not here."
+        ),
+    )
+    mode: str | None = Field(
+        default=None,
+        description=(
+            "Chat mode slug (system:default, user:3, …).  Its system prompt is "
+            "used as ``instructions`` when the caller sends none.  Direct-LLM "
+            "modes (provider=llm) are rejected — they belong on /chat/stream."
+        ),
+    )
+
+
+class ChatRunSteerRequest(BaseModel):
+    """Payload for ``POST /api/chat/runs/{run_id}/steer``."""
+
+    input: str = Field(..., min_length=1, description="Supplementary instruction")
+
+
+class ChatRunApprovalRequest(BaseModel):
+    """Payload for ``POST /api/chat/runs/{run_id}/approval``."""
+
+    approval_id: str | None = Field(
+        default=None,
+        description=(
+            "Hermes approval request id (the ``request_id`` reported by an "
+            "``approval.request`` event).  Omit to resolve the oldest pending one."
+        ),
+    )
+    decision: str = Field(
+        ...,
+        min_length=1,
+        description="once / session / always / deny (approve is aliased to once)",
+    )
+
+
+def _raise_for_run_error(exc: HermesRunError) -> None:
+    """Translate a :class:`HermesRunError` into an ``HTTPException``.
+
+    Keeps the semantics the UI needs: 404 → run expired/unknown, 409 → the run
+    is not in a state that accepts the control, 400 → bad input, everything else
+    → 502 (upstream failure) instead of a bare 500.
+    """
+    code = exc.status_code
+    if code == 404:
+        raise HTTPException(status_code=404, detail="运行不存在或已过期")
+    if code == 409:
+        raise HTTPException(status_code=409, detail=exc.detail or "当前运行状态不允许该操作")
+    if code == 400:
+        raise HTTPException(status_code=400, detail=exc.detail or "运行请求参数无效")
+    if code == 503:
+        raise HTTPException(status_code=503, detail=exc.detail or "无法连接 Hermes 服务")
+    raise HTTPException(status_code=502, detail=f"Hermes 运行接口错误: {exc.detail}")
+
+
+async def _resolve_run_mode(
+    db: AsyncSession,
+    mode_slug: str | None,
+    user: User,
+) -> tuple[Any, dict[str, Any]]:
+    """Resolve a chat-mode slug to ``(mode_row, config)`` for the Runs path.
+
+    Read-only mirror of the lookup in :func:`chat_stream_endpoint`; used to
+    detect direct-LLM modes and to reuse the mode's system prompt as the run's
+    ephemeral ``instructions``.
+    """
+    if not mode_slug:
+        return None, {}
+
+    if mode_slug.startswith("user:"):
+        from app.models import UserChatMode
+
+        try:
+            mode_id = int(mode_slug.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return None, {}
+        row = await db.get(UserChatMode, mode_id)
+        if row and row.user_id == user.id and row.enabled:
+            return row, {"provider": row.provider, "icon": row.icon, "user_mode": True}
+        return None, {}
+
+    from app.models import ChatMode as ChatModeModel
+
+    slug = mode_slug.replace("system:", "", 1)
+    result = await db.execute(
+        select(ChatModeModel).where(
+            ChatModeModel.slug == slug,
+            ChatModeModel.enabled == True,  # noqa: E712
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row:
+        return row, dict(row.config or {})
+    return None, {}
+
+
+@router.post(
+    "/runs",
+    summary="Start a structured Hermes agent run",
+    description=(
+        "Proxies ``POST /v1/runs`` on Hermes: returns a ``run_id`` immediately, "
+        "then stream progress from ``/api/chat/runs/{run_id}/events``.  Unlike "
+        "``/chat/stream`` the run keeps executing server-side, so it can be "
+        "stopped, steered and approved, and reattached after a disconnect."
+    ),
+)
+async def create_chat_run(
+    body: ChatRunRequest,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Create a Hermes run for an agent-mode turn."""
+    hermes = _get_hermes()
+    if not hermes.base_url:
+        raise HTTPException(status_code=503, detail="Hermes 未配置 — 请在系统设置中配置 Hermes 连接")
+
+    mode, mode_config = await _resolve_run_mode(db, body.mode, user)
+    if mode is not None and mode_config.get("provider") == "llm":
+        # Direct-LLM modes have no agent loop: keep them on /chat/stream.
+        raise HTTPException(
+            status_code=400,
+            detail="该模式使用直连模型，请使用 /api/chat/stream",
+        )
+
+    instructions = body.instructions
+    if not instructions and mode is not None:
+        system_prompt = getattr(mode, "system_prompt", None)
+        if system_prompt:
+            instructions = system_prompt
+
+    try:
+        result = await hermes.create_run(
+            input=body.input,
+            session_id=body.session_id,
+            instructions=instructions,
+            model=body.model,
+            conversation_history=(
+                [{"role": m.role, "content": m.content} for m in body.conversation_history]
+                if body.conversation_history
+                else None
+            ),
+        )
+    except HermesRunError as exc:
+        _raise_for_run_error(exc)
+
+    run_id = str(result.get("run_id") or "")
+    if not run_id:
+        raise HTTPException(status_code=502, detail="Hermes 未返回 run_id")
+
+    # Hermes keys a session-less run by its run_id (session_id = run_id), so that
+    # value is the continuity token for the next turn.
+    session_id = body.session_id or result.get("session_id") or run_id
+
+    logger.info(
+        "Chat run created: run_id={} session_id={} mode={!r} status={}",
+        run_id,
+        session_id,
+        body.mode,
+        result.get("status"),
+    )
+    return {
+        "run_id": run_id,
+        "status": result.get("status") or "queued",
+        "session_id": session_id,
+        "replayed": bool(result.get("replayed")),
+    }
+
+
+@router.get(
+    "/runs/{run_id}",
+    summary="Poll a Hermes run's status",
+    description=(
+        "Proxies ``GET /v1/runs/{run_id}`` — the reconnect/refresh path.  The "
+        "payload carries ``status``, ``session_id``, ``output``, ``usage`` and "
+        "any ``pending_controls``."
+    ),
+)
+async def get_chat_run(
+    run_id: str,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Return the pollable status of a run."""
+    hermes = _get_hermes()
+    if not hermes.base_url:
+        raise HTTPException(status_code=503, detail="Hermes 未配置")
+    try:
+        return await hermes.get_run(run_id)
+    except HermesRunError as exc:
+        _raise_for_run_error(exc)
+        raise  # unreachable — keeps type-checkers happy
+
+
+@router.get(
+    "/runs/{run_id}/events",
+    summary="Stream a Hermes run's SSE events (raw proxy)",
+    description=(
+        "Proxies ``GET /v1/runs/{run_id}/events``.  Frames are forwarded "
+        "byte-for-byte (including ``:`` keepalive comments).  The client's "
+        "``Last-Event-ID`` header is passed through so Hermes replays missed "
+        "frames after a reconnect."
+    ),
+)
+async def stream_chat_run_events(
+    run_id: str,
+    request: Request,
+    user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    """Stream run events to the browser as ``text/event-stream``."""
+    hermes = _get_hermes()
+    if not hermes.base_url:
+        raise HTTPException(status_code=503, detail="Hermes 未配置")
+
+    last_event_id = request.headers.get("last-event-id") or request.headers.get(
+        "Last-Event-ID"
+    )
+
+    # Fail fast (before the SSE headers go out) when the run is unknown/expired,
+    # so the browser gets a real 404 instead of an empty stream.
+    try:
+        await hermes.get_run(run_id)
+    except HermesRunError as exc:
+        if exc.status_code == 404:
+            _raise_for_run_error(exc)
+        logger.warning(
+            "Run event pre-check failed for {} (HTTP {}): {} — streaming anyway",
+            run_id,
+            exc.status_code,
+            exc.detail,
+        )
+
+    async def event_proxy():
+        """Forward upstream chunks; close the upstream stream on disconnect."""
+        stream = hermes.stream_run_events(run_id, last_event_id=last_event_id)
+        try:
+            async for chunk in stream:
+                if await request.is_disconnected():
+                    logger.info("Run event client disconnected: run_id={}", run_id)
+                    break
+                yield chunk
+        except HermesRunError as exc:
+            logger.warning(
+                "Run event upstream error: run_id={} HTTP {}: {}",
+                run_id,
+                exc.status_code,
+                exc.detail,
+            )
+            payload = json.dumps(
+                {"event": "error", "run_id": run_id, "error": exc.detail},
+                ensure_ascii=False,
+            )
+            yield f"data: {payload}\n\n".encode()
+        except Exception as exc:
+            logger.exception("Run event proxy error: run_id={}", run_id)
+            payload = json.dumps(
+                {"event": "error", "run_id": run_id, "error": f"事件流中断: {exc}"},
+                ensure_ascii=False,
+            )
+            yield f"data: {payload}\n\n".encode()
+        finally:
+            # Explicit close: ``async for`` does not close an async generator on
+            # break, and the upstream HTTP connection must be released.
+            await stream.aclose()
+
+    return StreamingResponse(
+        event_proxy(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+        },
+    )
+
+
+@router.post(
+    "/runs/{run_id}/stop",
+    summary="Stop a Hermes run",
+    description="Proxies ``POST /v1/runs/{run_id}/stop`` — a cooperative interrupt.",
+)
+async def stop_chat_run(
+    run_id: str,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Ask Hermes to interrupt the run."""
+    hermes = _get_hermes()
+    if not hermes.base_url:
+        raise HTTPException(status_code=503, detail="Hermes 未配置")
+    try:
+        return await hermes.stop_run(run_id)
+    except HermesRunError as exc:
+        _raise_for_run_error(exc)
+        raise  # unreachable
+
+
+@router.post(
+    "/runs/{run_id}/steer",
+    summary="Steer a running Hermes run",
+    description="Proxies ``POST /v1/runs/{run_id}/steer`` with supplementary guidance.",
+)
+async def steer_chat_run(
+    run_id: str,
+    body: ChatRunSteerRequest,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Inject supplementary instructions into a running agent."""
+    hermes = _get_hermes()
+    if not hermes.base_url:
+        raise HTTPException(status_code=503, detail="Hermes 未配置")
+    try:
+        return await hermes.steer_run(run_id, body.input)
+    except HermesRunError as exc:
+        _raise_for_run_error(exc)
+        raise  # unreachable
+
+
+@router.post(
+    "/runs/{run_id}/approval",
+    summary="Answer a pending tool approval",
+    description=(
+        "Proxies ``POST /v1/runs/{run_id}/approval``.  Platform callers send "
+        "``{approval_id, decision}``; Hermes expects ``{request_id, choice}``, "
+        "so both are translated (approve → once)."
+    ),
+)
+async def approve_chat_run(
+    run_id: str,
+    body: ChatRunApprovalRequest,
+    user: User = Depends(get_current_user),
+) -> dict:
+    """Resolve a pending approval for the run."""
+    hermes = _get_hermes()
+    if not hermes.base_url:
+        raise HTTPException(status_code=503, detail="Hermes 未配置")
+    try:
+        return await hermes.respond_approval(
+            run_id, body.decision, approval_id=body.approval_id
+        )
+    except HermesRunError as exc:
+        _raise_for_run_error(exc)
+        raise  # unreachable
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -843,6 +1257,10 @@ ALLOWED_EXTENSIONS = {
     ".yaml", ".yml", ".ini", ".cfg", ".env", ".css", ".rss",
 }
 
+# 附件链路上限：避免超大文件把内存 / MarkItDown / 后续 prompt 打爆。
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024      # 上传文件 20MB
+MAX_ATTACHMENT_CHARS = 200_000               # 转换后正文 200k 字符
+
 
 @router.post("/convert-file")
 async def convert_file(
@@ -853,6 +1271,11 @@ async def convert_file(
 
     Supports PDF, Word, Excel, PPT, images (OCR), HTML, CSV, JSON, code,
     Jupyter notebooks, ZIP archives, and more.
+
+    约束（P1-13）：
+    * 上传大小 ≤ 20MB，超出返回 413；
+    * 转换后正文 ≤ 200k 字符，超出截断并在正文末尾标注；
+    * 转换失败返回 4xx，绝不把 `[错误: 文件名]` 之类的错误文本当正文。
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="未提供文件名")
@@ -864,12 +1287,22 @@ async def convert_file(
             detail=f"不支持的文件类型: {ext}。支持: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
 
+    # 多读 1 字节即可判断是否超限，避免把超大文件整个读进内存。
+    raw = await file.read(MAX_ATTACHMENT_BYTES + 1)
+    if len(raw) > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件超过 {MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB 上限",
+        )
+    if not raw:
+        raise HTTPException(status_code=400, detail="文件为空")
+
     # Save to a temp file (markitdown needs a real file path for binary formats)
     suffix = ext if ext else ".txt"
     tmp_path = ""
     try:
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(await file.read())
+            tmp.write(raw)
             tmp_path = tmp.name
 
         # Convert using markitdown
@@ -879,21 +1312,44 @@ async def convert_file(
         text = result.text_content.strip()
 
         if not text:
-            return {
-                "ok": True,
-                "filename": file.filename,
-                "content": f"[文件 {file.filename} 内容为空或无法提取文本]",
-            }
+            # 提取不到正文属于转换失败，返回 4xx，由前端展示错误状态。
+            raise HTTPException(
+                status_code=422,
+                detail=f"文件 {file.filename} 内容为空或无法提取文本",
+            )
+
+        original_chars = len(text)
+        truncated = original_chars > MAX_ATTACHMENT_CHARS
+        if truncated:
+            text = (
+                text[:MAX_ATTACHMENT_CHARS]
+                + f"\n\n[内容超长已截断：原文 {original_chars} 字符，"
+                  f"仅保留前 {MAX_ATTACHMENT_CHARS} 字符]"
+            )
+            logger.warning(
+                "Attached file truncated: filename={!r} chars={} limit={}",
+                file.filename,
+                original_chars,
+                MAX_ATTACHMENT_CHARS,
+            )
 
         return {
             "ok": True,
             "filename": file.filename,
             "content": text,
+            "truncated": truncated,
+            "original_chars": original_chars,
         }
+    except HTTPException:
+        raise
     except ImportError:
         raise HTTPException(status_code=500, detail="markitdown 未安装")
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"文件转换失败: {exc}")
+        # 转换失败（损坏/加密的文件等）→ 422，调用方按错误处理，不写正文。
+        logger.warning(
+            "convert-file failed: filename={!r} error={}", file.filename, exc
+        )
+        raise HTTPException(status_code=422, detail=f"文件转换失败: {exc}")
     finally:
         if tmp_path and os.path.exists(tmp_path):
             try:
@@ -993,3 +1449,111 @@ async def hermes_health(
     except Exception:
         latency_ms = round((time.monotonic() - t0) * 1000)
         return {"ok": False, "status_code": 0, "latency_ms": latency_ms}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Hermes capability self-report (settings → 智能引擎)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/hermes-info")
+async def hermes_info(
+    _admin: User = Depends(require_admin),
+) -> dict:
+    """Rich Hermes self-report for the settings screen.
+
+    Combines ``/health/detailed``, ``/v1/capabilities`` and ``/api/model/options``
+    into one payload so the UI can show version, runtime mode, feature flags and
+    the active model instead of dumping a raw JSON blob into a toast.
+
+    Admin-only: this is the settings screen's engine inspector.
+    """
+    from app.services.hermes import _hermes_url, _hermes_api_key, HermesClient
+
+    base = {"url": _hermes_url, "ok": False}
+
+    import time
+    t0 = time.monotonic()
+    # Short timeout: a half-dead Hermes must not hang the settings page for the
+    # default 600s agent timeout.
+    client = HermesClient(timeout=15.0)
+    try:
+        health = await client.get_health_detailed()
+        latency_ms = round((time.monotonic() - t0) * 1000)
+
+        if not health:
+            return {**base, "latency_ms": latency_ms, "error": "无法获取 /health/detailed"}
+
+        caps = await client.get_capabilities()
+        models = await client.get_model_options() if caps.get("endpoints", {}).get("model_options") else {}
+
+        readiness = health.get("readiness") or {}
+        checks: dict[str, str] = {}
+        for key, value in (readiness.get("checks") or {}).items():
+            # Individual checks are usually {"status": "ok"} but some builds
+            # report a bare string — never assume the shape.
+            checks[key] = value.get("status", "unknown") if isinstance(value, dict) else str(value)
+
+        features = caps.get("features") or {}
+        # Only the flags a platform UI can act on — keeps the payload small.
+        feature_flags = {
+            key: features.get(key)
+            for key in (
+                "chat_completions_streaming",
+                "responses_api",
+                "run_submission",
+                "run_stop",
+                "run_steer",
+                "run_approval_response",
+                "tool_progress_events",
+                "reasoning_streaming",
+                "session_chat_streaming",
+                "session_fork",
+                "skills_api",
+                "jobs_admin",
+                "memory_write_api",
+            )
+            if key in features
+        }
+
+        current_model = None
+        for prov in (models.get("providers") or []):
+            if not isinstance(prov, dict):
+                continue
+            if prov.get("is_current"):
+                model_ids = [
+                    m.get("id") if isinstance(m, dict) else str(m)
+                    for m in (prov.get("models") or [])
+                ]
+                current_model = {
+                    "provider": prov.get("name") or prov.get("slug"),
+                    "models": [m for m in model_ids if m][:20],
+                }
+                break
+
+        return {
+            **base,
+            "ok": readiness.get("status", "ok") == "ok",
+            "latency_ms": latency_ms,
+            "version": health.get("version") or caps.get("platform"),
+            "platform": health.get("platform"),
+            "gateway_state": health.get("gateway_state"),
+            "runtime": caps.get("runtime") or {},
+            "features": feature_flags,
+            "session_continuity_header": features.get("session_continuity_header"),
+            "checks": checks,
+            "platforms": {
+                name: (state.get("state") if isinstance(state, dict) else state)
+                for name, state in (health.get("platforms") or {}).items()
+            },
+            "current_model": current_model,
+            "disk_used_percent": (
+                (((readiness.get("checks") or {}).get("disk") or {}).get("used_percent"))
+                if isinstance((readiness.get("checks") or {}).get("disk"), dict)
+                else None
+            ),
+        }
+    except Exception as exc:  # never 500 the settings page on a shape change
+        logger.exception("hermes-info failed")
+        return {**base, "error": f"读取 Hermes 能力信息失败: {exc}"}
+    finally:
+        await client.close()

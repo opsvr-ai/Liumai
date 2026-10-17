@@ -125,9 +125,10 @@ async def setup(
     if row.scalar() > 0:
         raise HTTPException(status_code=409, detail="系统已初始化")
 
-    if await db.execute(
+    existing = await db.execute(
         select(User).where(User.username == body.username)
-    ).scalar_one_or_none():
+    )
+    if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="用户名已存在")
 
     # Ensure default team exists (needed for FK constraint)
@@ -357,6 +358,24 @@ def _mask_key(key: str) -> str:
     return f"{key[:4]}...{key[-3:]}"
 
 
+def _resolve_secret(incoming: str | None, stored: str | None) -> str:
+    """Decide which secret to persist.
+
+    The settings form shows a **masked** key (``sk-1...9fa``).  Saving the form
+    untouched used to write that mask back into the database, silently breaking
+    every Hermes call with 401 while ``/health`` (public) still looked green.
+    An empty or unchanged-mask value therefore keeps the stored secret; only a
+    genuinely new value replaces it.
+    """
+    incoming = (incoming or "").strip()
+    stored = (stored or "").strip()
+    if not incoming:
+        return stored
+    if stored and incoming == _mask_key(stored):
+        return stored
+    return incoming
+
+
 # ── Hermes config ──────────────────────────────────────────────────────────
 
 class HermesConfigOut(BaseModel):
@@ -391,9 +410,10 @@ async def save_hermes_config(
     """Save Hermes Gateway configuration. Changes take effect for new connections."""
     from app.models import SystemConfig
 
+    current = {r.key: r.value for r in (await db.execute(select(SystemConfig))).scalars()}
     entries = {
         "hermes_url": body.url,
-        "hermes_api_key": body.api_key,
+        "hermes_api_key": _resolve_secret(body.api_key, current.get("hermes_api_key")),
     }
     for key, value in entries.items():
         row = await db.get(SystemConfig, key)
@@ -408,7 +428,7 @@ async def save_hermes_config(
     from app.services.hermes import reload_hermes_config
     reload_hermes_config(entries)
 
-    return body
+    return HermesConfigOut(url=body.url, api_key=_mask_key(entries["hermes_api_key"]))
 
 
 class HermesTestResult(BaseModel):
@@ -424,7 +444,14 @@ async def test_hermes_connection(
     from app.services.hermes import _hermes_url, _hermes_api_key
 
     import httpx
-    url = f"{_hermes_url.rstrip('/')}/health/detailed"
+    # The stored URL is the OpenAI-compatible base (``http://host:8642/v1``),
+    # but /health/detailed lives at the server root — strip the /v1 suffix
+    # (same as chat.py:hermes_health).  Without this the probe 404s even
+    # when Hermes is perfectly healthy.
+    health_base = _hermes_url.rstrip("/")
+    if health_base.endswith("/v1"):
+        health_base = health_base[:-3]
+    url = f"{health_base}/health/detailed"
     headers: dict[str, str] = {}
     if _hermes_api_key:
         headers["Authorization"] = f"Bearer {_hermes_api_key}"
@@ -432,7 +459,7 @@ async def test_hermes_connection(
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
             resp = await client.get(url, headers=headers)
-        if resp.status_code < 500:
+        if 200 <= resp.status_code < 400:
             detail = ""
             try:
                 body = resp.json()
@@ -440,6 +467,11 @@ async def test_hermes_connection(
             except Exception:
                 detail = ""
             return HermesTestResult(ok=True, message=f"Hermes 服务正常 (HTTP {resp.status_code}){detail}")
+        elif resp.status_code in (401, 403):
+            return HermesTestResult(
+                ok=False,
+                message=f"Hermes 认证失败 (HTTP {resp.status_code}) — API Key 不正确或未配置",
+            )
         else:
             return HermesTestResult(ok=False, message=f"Hermes 返回 {resp.status_code}: {resp.text[:200]}")
     except httpx.ConnectError:
@@ -487,7 +519,13 @@ async def save_llm_config(
 ) -> LlmConfigOut:
     """Save platform LLM settings."""
     from app.models import SystemConfig
-    entries = {"llm_base_url": body.base_url, "llm_api_key": body.api_key, "llm_model": body.model, "welcome_prompt": body.welcome_prompt}
+    current = {r.key: r.value for r in (await db.execute(select(SystemConfig))).scalars()}
+    entries = {
+        "llm_base_url": body.base_url,
+        "llm_api_key": _resolve_secret(body.api_key, current.get("llm_api_key")),
+        "llm_model": body.model,
+        "welcome_prompt": body.welcome_prompt,
+    }
     for key, value in entries.items():
         row = await db.get(SystemConfig, key)
         if row:
@@ -496,7 +534,12 @@ async def save_llm_config(
         else:
             db.add(SystemConfig(key=key, value=value))
     await db.flush()
-    return body
+    return LlmConfigOut(
+        base_url=body.base_url,
+        api_key=_mask_key(entries["llm_api_key"]),
+        model=body.model,
+        welcome_prompt=body.welcome_prompt,
+    )
 
 
 # ── Welcome message generation ──────────────────────────────────────────────
@@ -557,10 +600,23 @@ async def generate_welcome(
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        base = base_url.rstrip("/")
-        url = f"{base}/chat/completions" if not base.endswith("/v1") else f"{base}/chat/completions"
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
+        # URL 拼接规则（与 Hermes / 直连 LLM 的约定一致）：
+        #   * 已以 /chat/completions 结尾 → 原样使用；
+        #   * 已含 /v1（如 http://host:8642/v1）→ 拼 /chat/completions；
+        #   * 其它（如 http://host:8642）→ 补 /v1/chat/completions。
+        # 旧实现两个分支完全相同，base 不带 /v1 时会请求 /chat/completions，
+        # 必然 404，欢迎语永远落到兜底文案。
+        base = base_url.rstrip("/")
+        if base.endswith("/chat/completions"):
+            url = base
+        elif base.endswith("/v1") or "/v1/" in base:
+            url = f"{base}/chat/completions"
+        else:
+            url = f"{base}/v1/chat/completions"
+
+        # 欢迎语只是装饰，用较短超时（15s）避免拖慢登录后的首屏。
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
             resp = await client.post(
                 url,
                 json={

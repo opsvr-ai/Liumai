@@ -56,6 +56,9 @@ export interface RcaSessionSummary {
   trigger_type: string;
   status: string;
   rule_name: string | null;
+  service_name?: string | null;
+  alert_count?: number | null;
+  trigger_reason?: string | null;
   time_window_start: string | null;
   time_window_end: string | null;
   created_at: string;
@@ -73,10 +76,52 @@ export interface RcaSessionDetail extends RcaSessionSummary {
 }
 
 export interface RcaTimelineEntry {
-  timestamp: string;
-  event: string;
-  source: string;
+  id?: number;
+  timestamp?: string;
+  created_at?: string;
+  event_type?: string;
+  event?: string;
+  content?: string;
+  source?: string;
   detail?: string;
+  metadata?: unknown;
+}
+
+export interface RcaReport {
+  id: number;
+  session_id: number;
+  service_name: string | null;
+  alert_count: number;
+  category: string | null;
+  root_cause: string | null;
+  confidence: number | null;
+  evidence: unknown[];
+  impacted_services: unknown[];
+  recommended_actions: unknown[];
+  created_at: string;
+  session_status?: string;
+  trigger_reason?: string | null;
+  time_window_start?: string | null;
+  time_window_end?: string | null;
+  alerts?: RcaReportAlert[];
+  /** Top3 root causes (persisted with the session; derived when absent). */
+  top3?: string[];
+}
+
+export interface RcaReportAlert {
+  id: number;
+  alert_uid: string | null;
+  source: string | null;
+  ip: string | null;
+  ci_name: string | null;
+  ci_application: string | null;
+  content: string | null;
+  severity: string | null;
+  severity_level: number | null;
+  alert_type: string | null;
+  status: string;
+  alert_time: string | null;
+  raw_payload?: Record<string, unknown>;
 }
 
 export interface QueueStatus {
@@ -118,22 +163,185 @@ export const rca = {
   queue() {
     return request<QueueStatus>("GET", "/rca/queue");
   },
+  reports(params?: { page?: number; page_size?: number; search?: string; service?: string }) {
+    const qs = new URLSearchParams();
+    if (params?.page) qs.set("page", String(params.page));
+    if (params?.page_size) qs.set("page_size", String(params.page_size));
+    if (params?.search) qs.set("search", params.search);
+    if (params?.service) qs.set("service", params.service);
+    const q = qs.toString();
+    return request<Paginated<RcaReport>>("GET", `/rca/reports${q ? `?${q}` : ""}`);
+  },
+  report(sessionId: number) {
+    return request<RcaReport>("GET", `/rca/sessions/${sessionId}/report`);
+  },
+  sessionAlerts(sessionId: number) {
+    return request<RcaReportAlert[]>("GET", `/rca/sessions/${sessionId}/alerts`);
+  },
+  rerun(sessionId: number) {
+    return request<{ status: string; session_id: number }>("POST", `/rca/sessions/${sessionId}/rerun`);
+  },
+};
+
+/* ── Report files (download) ─────────────────────── */
+
+/** Extract the attachment filename from a Content-Disposition header. */
+function _attachmentFilename(header: string | null): string | null {
+  if (!header) return null;
+  const utf8 = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  if (utf8?.[1]) {
+    try {
+      return decodeURIComponent(utf8[1].trim().replace(/^"|"$/g, ""));
+    } catch {
+      // fall through to the ASCII filename
+    }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(header);
+  return plain?.[1]?.trim() || null;
+}
+
+export const reportApi = {
+  /**
+   * Download a session report as Markdown or standalone HTML.
+   *
+   * The endpoint requires the bearer token, so a plain `<a href>` cannot be
+   * used (tokens must not leak into URLs).  Fetch as a blob, then let the
+   * caller trigger a client-side save with the server-provided filename.
+   */
+  async download(
+    sessionId: number,
+    format: "md" | "html" = "md",
+  ): Promise<{ blob: Blob; filename: string }> {
+    const headers: Record<string, string> = {};
+    const tok = token();
+    if (tok) headers["Authorization"] = `Bearer ${tok}`;
+
+    const res = await fetch(
+      `${BASE}/rca/sessions/${sessionId}/report/download?format=${format}`,
+      { headers },
+    );
+
+    if (res.status === 401) {
+      localStorage.removeItem("liumai_token");
+      localStorage.removeItem("liumai_user");
+      localStorage.removeItem("liumai_role");
+      localStorage.removeItem("liumai_auth_type");
+      if (window.location.pathname !== "/login") window.location.href = "/login";
+      throw new Error("登录已过期，请重新登录");
+    }
+    if (!res.ok) {
+      const msg = await res.text().catch(() => res.statusText);
+      throw new Error(msg || `下载报告失败（${res.status}）`);
+    }
+
+    const blob = await res.blob();
+    const filename =
+      _attachmentFilename(res.headers.get("content-disposition")) ||
+      `liumai-rca-${sessionId}.${format}`;
+    return { blob, filename };
+  },
+
+  /**
+   * Bulk-export many session reports as one ZIP archive.
+   *
+   * Session IDs travel in the JSON body (never the query string) and the
+   * bearer token stays in the Authorization header.  Resolves with the blob,
+   * the server-provided attachment filename, and the number of sessions the
+   * backend skipped (also listed in the archive's README.txt).
+   */
+  async exportZip(
+    sessionIds: number[],
+    format: "md" | "html" = "md",
+  ): Promise<{ blob: Blob; filename: string; skipped: number }> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const tok = token();
+    if (tok) headers["Authorization"] = `Bearer ${tok}`;
+
+    const res = await fetch(`${BASE}/rca/reports/export`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ session_ids: sessionIds, format }),
+    });
+
+    if (res.status === 401) {
+      localStorage.removeItem("liumai_token");
+      localStorage.removeItem("liumai_user");
+      localStorage.removeItem("liumai_role");
+      localStorage.removeItem("liumai_auth_type");
+      if (window.location.pathname !== "/login") window.location.href = "/login";
+      throw new Error("登录已过期，请重新登录");
+    }
+    if (!res.ok) {
+      const msg = await res.text().catch(() => res.statusText);
+      throw new Error(msg || `批量导出失败（${res.status}）`);
+    }
+
+    const blob = await res.blob();
+    const filename =
+      _attachmentFilename(res.headers.get("content-disposition")) ||
+      "liumai-rca-reports.zip";
+    const skipped = Number.parseInt(res.headers.get("x-skipped-count") ?? "0", 10) || 0;
+    return { blob, filename, skipped };
+  },
 };
 
 /* ── Rules ───────────────────────────────────────── */
 
+/** Matching fields accepted by the backend rule engine. */
+export type RuleConditionField =
+  | "severity"
+  | "severity_level"
+  | "ci_name"
+  | "ci_application"
+  | "service_name"
+  | "ip"
+  | "source"
+  | "metric"
+  | "content";
+
+/** Matching operators accepted by the backend rule engine. */
+export type RuleConditionOp =
+  | "eq"
+  | "neq"
+  | "contains"
+  | "in"
+  | "gte"
+  | "lte"
+  | "regex";
+
+/** One condition row; multiple rows are combined with AND. */
+export interface RuleCondition {
+  field: RuleConditionField | string;
+  op: RuleConditionOp | string;
+  value: string | string[];
+}
+
+/** Minimal action descriptors (e.g. `{ coalesce_window: 900 }`). */
+export type RuleAction = Record<string, unknown>;
+
 export interface AlertRule {
   id: number;
+  team_id: number;
   name: string;
   description: string | null;
-  severity: string;
-  source: string;
-  condition_expr: string;
-  team_id: number;
+  /** Structured condition rows (AND semantics). */
+  conditions: RuleCondition[];
+  actions: RuleAction[];
+  /** Legacy free-text condition expression — read-only for display. */
+  condition_expr?: string | null;
   created_by: number | null;
   enabled: boolean;
   created_at: string;
   updated_at: string;
+}
+
+/** Payload accepted by `POST/PUT /api/rules` (structured conditions only). */
+export interface AlertRuleInput {
+  name: string;
+  description?: string;
+  conditions: RuleCondition[];
+  actions?: RuleAction[];
+  enabled?: boolean;
 }
 
 export const ruleApi = {
@@ -142,13 +350,13 @@ export const ruleApi = {
     if (teamId) params.set("team_id", String(teamId));
     return request<Paginated<AlertRule>>("GET", `/rules?${params}`);
   },
-  create(data: Partial<AlertRule>) {
+  create(data: AlertRuleInput) {
     return request<AlertRule>("POST", "/rules", data);
   },
   get(ruleId: number) {
     return request<AlertRule>("GET", `/rules/${ruleId}`);
   },
-  update(ruleId: number, data: Partial<AlertRule>) {
+  update(ruleId: number, data: Partial<AlertRuleInput>) {
     return request<AlertRule>("PUT", `/rules/${ruleId}`, data);
   },
   delete(ruleId: number) {
@@ -202,8 +410,18 @@ export interface ToolCallDelta {
 /** Parsed SSE event from the chat stream endpoint. */
 export type ChatStreamEvent =
   | { type: "delta"; content: string }
+  | { type: "reasoning"; content: string }
+  | { type: "session"; session_id: string }
   | { type: "tool_call"; tool_calls: ToolCallDelta[] }
-  | { type: "done"; finish_reason: string | null; usage?: { prompt_tokens: number; completion_tokens: number } }
+  | {
+      type: "done";
+      finish_reason: string | null;
+      usage?: { prompt_tokens: number; completion_tokens: number };
+      /** Present when the turn ended abnormally (context overflow, provider error…). */
+      error?: string;
+      /** Raw Hermes diagnostics attached to the finish chunk. */
+      hermes?: unknown;
+    }
   | { type: "error"; error: string };
 
 /**
@@ -221,6 +439,8 @@ export async function* chatStream(
     mode?: string;
     timeWindowStart?: string;
     timeWindowEnd?: string;
+    /** Continue an existing Hermes agent session (server-side context). */
+    hermesSessionId?: string | null;
   },
 ): AsyncGenerator<ChatStreamEvent> {
   const headers: Record<string, string> = {
@@ -236,10 +456,11 @@ export async function* chatStream(
     body: JSON.stringify({
       messages,
       mode: opts?.mode ?? null,
-      model: opts?.model ?? "hermes-agent",
+      model: opts?.model ?? null,
       temperature: opts?.temperature ?? 0.7,
       time_window_start: opts?.timeWindowStart ?? null,
       time_window_end: opts?.timeWindowEnd ?? null,
+      hermes_session_id: opts?.hermesSessionId ?? null,
     }),
     signal: opts?.signal,
   });
@@ -282,7 +503,356 @@ export async function* chatStream(
       }
     }
   } finally {
+    // Cancel the body reader so the HTTP connection is released promptly
+    // (releaseLock alone leaves the stream open).
+    try {
+      await reader.cancel();
+    } catch {
+      /* already closed */
+    }
     reader.releaseLock();
+  }
+}
+
+/* ── Chat Runs API (structured agent runs) ─────────── */
+
+/**
+ * Hermes Runs API — the agent-mode main path.
+ *
+ * ``POST /api/chat/runs`` returns a ``run_id`` immediately; progress arrives on
+ * ``/api/chat/runs/{run_id}/events`` (SSE) and the run can be stopped, steered
+ * and approved through dedicated endpoints.  Unlike ``/chat/stream`` the agent
+ * keeps running server-side when the browser disconnects, so a stop actually
+ * interrupts it and a refresh can reattach by ``run_id``.
+ */
+
+/** Body for ``POST /api/chat/runs``. */
+export interface ChatRunCreateParams {
+  input: string;
+  /** Hermes session to continue (omit for a fresh one). */
+  session_id?: string | null;
+  /** Ephemeral system prompt (the backend fills it from the chat mode). */
+  instructions?: string | null;
+  model?: string | null;
+  /**
+   * Prior turns to replay when there is no Hermes session yet (e.g. after a
+   * mode switch).  The newest user message travels as ``input``, not here.
+   */
+  conversation_history?: ChatMessage[] | null;
+  /** Chat mode slug — used server-side to pick the system prompt. */
+  mode?: string | null;
+}
+
+/** Response of ``POST /api/chat/runs``. */
+export interface ChatRunCreateResult {
+  run_id: string;
+  status: string;
+  /** Continuity token for the next turn (Hermes falls back to ``run_id``). */
+  session_id: string;
+  replayed?: boolean;
+}
+
+/** Token usage reported by the Runs API. */
+export interface ChatRunUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+}
+
+/** Pollable run state (``GET /api/chat/runs/{run_id}``). */
+export interface ChatRunStatus {
+  object?: string;
+  run_id: string;
+  /** queued | running | waiting_for_approval | stopping | completed | failed | cancelled | interrupted */
+  status: string;
+  session_id?: string;
+  output?: string;
+  error?: string;
+  usage?: ChatRunUsage;
+  pending_controls?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
+/** A tool-approval prompt raised by a running agent. */
+export interface ChatApprovalRequest {
+  /** Hermes ``request_id`` used to resolve this exact prompt ("" if absent). */
+  approvalId: string;
+  command?: string;
+  description?: string;
+  /** Choices the server allows: once / session / always / deny. */
+  choices: string[];
+}
+
+/** Event yielded by {@link chatRunEvents}, normalised onto the chat UI contract. */
+export type ChatRunEvent = (
+  | ChatStreamEvent
+  | { type: "approval"; approval: ChatApprovalRequest }
+) & {
+  /** SSE sequence number (``id:`` line / JSON ``seq``) used to resume a stream. */
+  seq?: number;
+};
+
+export const chatRuns = {
+  create(params: ChatRunCreateParams) {
+    return request<ChatRunCreateResult>("POST", "/chat/runs", params);
+  },
+  status(runId: string) {
+    return request<ChatRunStatus>("GET", `/chat/runs/${encodeURIComponent(runId)}`);
+  },
+  stop(runId: string) {
+    return request<{ run_id?: string; status?: string }>(
+      "POST",
+      `/chat/runs/${encodeURIComponent(runId)}/stop`,
+    );
+  },
+  steer(runId: string, input: string) {
+    return request<{ run_id?: string; accepted?: boolean }>(
+      "POST",
+      `/chat/runs/${encodeURIComponent(runId)}/steer`,
+      { input },
+    );
+  },
+  approval(runId: string, approvalId: string | null | undefined, decision: string) {
+    return request<{ run_id?: string; resolved?: number }>(
+      "POST",
+      `/chat/runs/${encodeURIComponent(runId)}/approval`,
+      { approval_id: approvalId || null, decision },
+    );
+  },
+};
+
+/**
+ * Stream a run's progress as normalised {@link ChatRunEvent}s.
+ *
+ * Hermes frames carry `id: <seq>` + `data: <json>` lines (the event *name* is
+ * the JSON `event` field, there is no `event:` line) plus `:` keepalive
+ * comments.  Comment frames are ignored, unknown event types are skipped, and
+ * the connection closes when the server emits the terminal run event.
+ *
+ * @param runId Hermes run id returned by {@link chatRuns.create}.
+ * @param opts.signal AbortSignal used by "停止" to drop the subscription.
+ * @param opts.lastEventId Last sequence number seen, so Hermes replays missed
+ *   frames after a reconnect (`Last-Event-ID` header).
+ */
+export async function* chatRunEvents(
+  runId: string,
+  opts?: { signal?: AbortSignal; lastEventId?: string | number | null },
+): AsyncGenerator<ChatRunEvent> {
+  const headers: Record<string, string> = { Accept: "text/event-stream" };
+  const tok = token();
+  if (tok) headers["Authorization"] = `Bearer ${tok}`;
+  if (opts?.lastEventId !== undefined && opts?.lastEventId !== null) {
+    headers["Last-Event-ID"] = String(opts.lastEventId);
+  }
+
+  const res = await fetch(`${BASE}/chat/runs/${encodeURIComponent(runId)}/events`, {
+    method: "GET",
+    headers,
+    signal: opts?.signal,
+  });
+
+  if (!res.ok) {
+    const msg = await res.text().catch(() => res.statusText);
+    throw new Error(msg || `chat/runs/${runId}/events → ${res.status}`);
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("Response body is not readable");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE frames are separated by double newlines
+      const frames = buffer.split("\n\n");
+      buffer = frames.pop() ?? "";
+
+      for (const frame of frames) {
+        const raw = _parseRunFrame(frame);
+        if (!raw) continue;
+        const event = _normalizeRunEvent(raw);
+        if (event) {
+          if (typeof raw.seq === "number") event.seq = raw.seq;
+          yield event;
+        }
+      }
+    }
+
+    // Flush a trailing frame that arrived without its blank-line terminator.
+    const tail = _parseRunFrame(buffer);
+    if (tail) {
+      const event = _normalizeRunEvent(tail);
+      if (event) {
+        if (typeof tail.seq === "number") event.seq = tail.seq;
+        yield event;
+      }
+    }
+  } finally {
+    // Cancel the body reader so the HTTP connection is released promptly
+    // (releaseLock alone leaves the stream open).
+    try {
+      await reader.cancel();
+    } catch {
+      /* already closed */
+    }
+    reader.releaseLock();
+  }
+}
+
+/** Decode one raw run SSE frame into its JSON payload (or ``null``). */
+function _parseRunFrame(frame: string): Record<string, unknown> | null {
+  const dataLines: string[] = [];
+  for (const line of frame.split("\n")) {
+    if (!line || line.startsWith(":")) continue; // ': open' / ': keepalive' / ': stream closed'
+    if (!line.startsWith("data:")) continue; // 'id:' (and any future 'event:') lines
+    dataLines.push(line.slice(5).trimStart());
+  }
+  if (dataLines.length === 0) return null;
+
+  const payload = dataLines.join("\n");
+  if (payload === "[DONE]") return null;
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    return parsed && typeof parsed === "object"
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    console.warn("[chatRunEvents] unparseable SSE data:", payload.slice(0, 200));
+    return null;
+  }
+}
+
+/** Coerce an unknown JSON value to display text ("" when absent). */
+function _runStr(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return "";
+    }
+  }
+  return String(value);
+}
+
+/** Map Hermes run usage onto the existing chat usage shape. */
+function _runUsage(
+  raw: unknown,
+): { prompt_tokens: number; completion_tokens: number } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const usage = raw as Record<string, unknown>;
+  const prompt = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0) || 0;
+  const completion = Number(usage.output_tokens ?? usage.completion_tokens ?? 0) || 0;
+  return { prompt_tokens: prompt, completion_tokens: completion };
+}
+
+/**
+ * Translate a raw Hermes run event into the UI's chat-event vocabulary.
+ *
+ * Observed Hermes 0.22.2 event types (probed against the live gateway):
+ *   message.delta{delta}, message.interim{text}, reasoning.available{text},
+ *   tool.started{tool,tool_call_id,preview}, tool.completed{tool,tool_call_id,
+ *   preview,error,duration}, approval.request{request_id?,command,description,
+ *   choices}, approval.responded, run.steered, run.queued, run.completed
+ *   {output,usage,completed,partial,interrupted}, run.failed{error},
+ *   run.cancelled / run.interrupted, subagent.start / subagent.complete,
+ *   replay.truncated.  Unknown types are ignored (never crash the stream).
+ */
+function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
+  const name = _runStr(raw.event) || _runStr(raw.type);
+
+  switch (name) {
+    case "message.delta": {
+      const content = _runStr(raw.delta);
+      return content ? { type: "delta", content } : null;
+    }
+    case "message.interim": {
+      // Mid-turn commentary beside tool calls — render as normal answer text.
+      const content = _runStr(raw.text);
+      return content ? { type: "delta", content } : null;
+    }
+    case "reasoning.available": {
+      const content = _runStr(raw.text);
+      return content ? { type: "reasoning", content } : null;
+    }
+    case "tool.started":
+    case "tool.completed": {
+      const completed = name === "tool.completed";
+      const toolName = _runStr(raw.tool) || "tool";
+      const label = completed
+        ? _runStr(raw.preview) || (raw.error ? "执行失败" : "已完成")
+        : _runStr(raw.preview);
+      return {
+        type: "tool_call",
+        tool_calls: [
+          {
+            id: _runStr(raw.tool_call_id) || toolName,
+            // `arguments` is repurposed as the display label, matching the
+            // hermes.tool.progress convention used by /chat/stream.
+            function: { name: toolName, arguments: label },
+            hermes_label: label,
+            hermes_status: completed ? "completed" : "running",
+          },
+        ],
+      };
+    }
+    case "approval.request": {
+      const choices = (Array.isArray(raw.choices) ? raw.choices : [])
+        .map((choice) => _runStr(choice))
+        .filter(Boolean);
+      return {
+        type: "approval",
+        approval: {
+          approvalId:
+            _runStr(raw.request_id) ||
+            _runStr(raw.approval_id) ||
+            _runStr(raw.id) ||
+            _runStr(raw.tool_call_id),
+          command: _runStr(raw.command) || undefined,
+          description: _runStr(raw.description) || undefined,
+          choices: choices.length > 0 ? choices : ["once", "deny"],
+        },
+      };
+    }
+    case "run.completed":
+      return { type: "done", finish_reason: "stop", usage: _runUsage(raw.usage) };
+    case "run.cancelled":
+    case "run.interrupted":
+      return { type: "done", finish_reason: "cancelled" };
+    case "run.failed":
+      return { type: "error", error: _runStr(raw.error) || "运行失败" };
+    case "error":
+      return {
+        type: "error",
+        error: _runStr(raw.error) || _runStr(raw.message) || "运行事件流出错",
+      };
+    case "session":
+    case "run.session": {
+      const sessionId = _runStr(raw.session_id);
+      return sessionId ? { type: "session", session_id: sessionId } : null;
+    }
+    case "run.queued":
+    case "run.steered":
+    case "run.stopping":
+    case "approval.responded":
+    case "subagent.start":
+    case "subagent.complete":
+    case "replay.truncated":
+      // Lifecycle / bookkeeping only — no UI surface.
+      return null;
+    default:
+      // Hermes may add event types at any time: ignore, never throw.
+      if (name) console.debug("[chatRunEvents] ignoring event:", name);
+      return null;
   }
 }
 
@@ -363,9 +933,6 @@ export const authApi = {
   },
   generateSetupPassword() {
     return request<{ password: string; length: number }>("GET", "/auth/setup/generate-password");
-  },
-  getLlmConfig() {
-    return request<LlmConfig>("GET", "/auth/llm-config");
   },
 };
 
@@ -730,6 +1297,10 @@ export const chatModes = {
   list() {
     return request<ChatModeOut[]>("GET", "/chat/modes");
   },
+  /** Update a system chat mode (currently: its system prompt). */
+  update(slug: string, data: { system_prompt?: string; enabled?: boolean }) {
+    return request<ChatModeOut>("PUT", `/chat/modes/${slug}`, data);
+  },
   createUserMode(data: { name: string; system_prompt: string; icon: string; provider: string }) {
     return request<ChatModeOut>("POST", "/chat/user-modes", data);
   },
@@ -739,7 +1310,34 @@ export const chatModes = {
   deleteUserMode(id: number) {
     return request<void>("DELETE", `/chat/user-modes/${id}`);
   },
+  /** Rich Hermes self-report (version / runtime / features / health). */
+  hermesInfo() {
+    return request<HermesInfo>("GET", "/chat/hermes-info");
+  },
 };
+
+/** Capability self-report surfaced by ``GET /api/chat/hermes-info``. */
+export interface HermesInfo {
+  url: string;
+  ok: boolean;
+  latency_ms?: number;
+  error?: string;
+  version?: string;
+  platform?: string;
+  gateway_state?: string;
+  runtime?: {
+    mode?: string;
+    tool_execution?: string;
+    split_runtime?: boolean;
+    description?: string;
+  };
+  features?: Record<string, boolean | string | Record<string, unknown> | undefined>;
+  session_continuity_header?: string | null;
+  checks?: Record<string, string>;
+  platforms?: Record<string, string>;
+  current_model?: { provider: string; models: string[] } | null;
+  disk_used_percent?: number | null;
+}
 
 /* ── Chat history ────────────────────────────────── */
 
@@ -827,6 +1425,8 @@ export interface JobItem {
   next_run_at: string | null;
   last_run_at: string | null;
   last_status: string | null;
+  /** Error message from the most recent execution, when Hermes reports one. */
+  last_error?: string | null;
   created_at: string | null;
 }
 
@@ -847,4 +1447,268 @@ export const jobsApi = {
   pause: (id: string) => request<JobItem>("POST", `/jobs/${id}/pause`),
   resume: (id: string) => request<JobItem>("POST", `/jobs/${id}/resume`),
   run: (id: string) => request<JobItem>("POST", `/jobs/${id}/run`),
+};
+
+/* ── Alert center (webhook → RCA pipeline) ─────────── */
+
+export interface AlertOut {
+  id: number;
+  alert_uid: string | null;
+  source: string | null;
+  ip: string | null;
+  ci_name: string | null;
+  ci_application: string | null;
+  ci_id: string | null;
+  content: string | null;
+  severity: string | null;
+  severity_level: number | null;
+  severity_label: string;
+  alert_type: string | null;
+  metric: string | null;
+  alert_time: string | null;
+  status: string;
+  trigger_reason: string | null;
+  rca_session_id: number | null;
+  raw_payload: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface AlertStats {
+  days: number;
+  total: number;
+  pending: number;
+  triggered: number;
+  coalesced: number;
+  filtered: number;
+  dismissed: number;
+  by_status: Record<string, number>;
+  by_severity: Record<string, number>;
+  top_services: Array<{ name: string; count: number }>;
+  by_type: Array<{ name: string; count: number }>;
+  rca: {
+    by_status: Record<string, number>;
+    completed: number;
+    failed: number;
+    running: number;
+    queued: number;
+    avg_seconds: number | null;
+  };
+}
+
+export interface AlertRetention {
+  /** 收件箱保留天数；0 = 不自动清理 */
+  inbox_days: number;
+  /** 垃圾箱保留天数；0 = 不自动清理 */
+  trash_days: number;
+  auto_clear_enabled: boolean;
+}
+
+export interface AlertPolicy {
+  mode: "auto" | "manual";
+  trigger: {
+    severity_max: number;
+    severity_trigger: boolean;
+    unrecognized_severity: string;
+    analysis_start_offset_minutes: number;
+    app_coalesce_window: number;
+    critical_components: string[];
+    high_risk_keywords: string[];
+  };
+  dedup: { window_seconds: number };
+  multi: { trigger_paths: { A: boolean; B: boolean; C: boolean } };
+  rca: { run_timeout_seconds: number; concurrency: number };
+  notify: { enabled: boolean; wecom_chat_id: string };
+  retention: AlertRetention;
+  webhook_token: string;
+}
+
+export interface WebhookInfo {
+  url: string;
+  token: string;
+  token_configured: boolean;
+  token_mode?: "multi" | "legacy" | "open";
+  team_token_count?: number;
+  sample_payload: Record<string, unknown>;
+  curl: string;
+  formats: string[];
+}
+
+/* Webhook token → team bindings (multi-team ingestion) */
+export interface WebhookTokenItem {
+  id: string;
+  name: string;
+  team_id: number;
+  team_name: string | null;
+  enabled: boolean;
+  created_at: string;
+  token_prefix: string;
+  masked: string;
+}
+
+export interface WebhookTokenList {
+  configured: boolean;
+  mode: "single" | "multi";
+  items: WebhookTokenItem[];
+  teams: Array<{ id: number; name: string }>;
+  legacy_token_configured: boolean;
+  max_tokens: number;
+}
+
+export interface WebhookTokenCreated {
+  token: string;
+  item: WebhookTokenItem;
+  message: string;
+}
+
+export interface AlertPurgeResult {
+  team_id: number | null;
+  inbox_days: number;
+  trash_days: number;
+  deleted_inbox: number;
+  deleted_trash: number;
+  deleted_total: number;
+  executed_at?: string;
+  message?: string;
+}
+
+export const alertsApi = {
+  webhookInfo() {
+    return request<WebhookInfo>("GET", "/alerts/webhook-info");
+  },
+  rotateToken() {
+    return request<{ token: string; configured: boolean }>("POST", "/alerts/webhook/rotate-token");
+  },
+  inbox(params?: { page?: number; page_size?: number; status?: string; search?: string }) {
+    const qs = new URLSearchParams();
+    if (params?.page) qs.set("page", String(params.page));
+    if (params?.page_size) qs.set("page_size", String(params.page_size));
+    if (params?.status) qs.set("status", params.status);
+    if (params?.search) qs.set("search", params.search);
+    const q = qs.toString();
+    return request<Paginated<AlertOut>>("GET", `/alerts/inbox${q ? `?${q}` : ""}`);
+  },
+  trash(params?: { page?: number; page_size?: number; search?: string }) {
+    const qs = new URLSearchParams();
+    if (params?.page) qs.set("page", String(params.page));
+    if (params?.page_size) qs.set("page_size", String(params.page_size));
+    if (params?.search) qs.set("search", params.search);
+    const q = qs.toString();
+    return request<Paginated<AlertOut>>("GET", `/alerts/trash${q ? `?${q}` : ""}`);
+  },
+  clearTrash() {
+    return request<{ deleted: number }>("POST", "/alerts/trash/clear");
+  },
+  stats(days = 7) {
+    return request<AlertStats>("GET", `/alerts/stats?days=${days}`);
+  },
+  policy() {
+    return request<AlertPolicy>("GET", "/alerts/policy");
+  },
+  savePolicy(policy: AlertPolicy) {
+    return request<AlertPolicy>("PUT", "/alerts/policy", policy);
+  },
+  webhookTokens() {
+    return request<WebhookTokenList>("GET", "/alerts/webhook-tokens");
+  },
+  createWebhookToken(data: { name?: string; team_id: number; enabled?: boolean }) {
+    return request<WebhookTokenCreated>("POST", "/alerts/webhook-tokens", data);
+  },
+  deleteWebhookToken(params: { id?: string; prefix?: string; token?: string }) {
+    const qs = new URLSearchParams();
+    if (params.id) qs.set("id", params.id);
+    if (params.prefix) qs.set("prefix", params.prefix);
+    if (params.token) qs.set("token", params.token);
+    const q = qs.toString();
+    return request<{
+      deleted: number;
+      id: string;
+      name: string;
+      team_id: number;
+      remaining: number;
+      message: string;
+    }>("DELETE", `/alerts/webhook-tokens${q ? `?${q}` : ""}`);
+  },
+  purgeAlerts(allTeams = false) {
+    return request<AlertPurgeResult>(
+      "POST",
+      `/alerts/purge${allTeams ? "?all_teams=true" : ""}`,
+    );
+  },
+  trigger(id: number) {
+    return request<{ status: string; rca_session_id: number }>("POST", `/alerts/${id}/trigger`);
+  },
+  dismiss(id: number) {
+    return request<{ status: string; id: number }>("POST", `/alerts/${id}/dismiss`);
+  },
+};
+
+/* ── Root-cause knowledge base ─────────────────────── */
+
+export interface RootCauseItem {
+  id: number;
+  session_id: number | null;
+  service_name: string | null;
+  alert_type: string | null;
+  title: string | null;
+  root_cause: string | null;
+  digest: string | null;
+  evidence: unknown[];
+  label: string;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+  similarity?: number;
+}
+
+export const rootCauseApi = {
+  list(params?: { page?: number; page_size?: number; label?: string; service?: string; search?: string }) {
+    const qs = new URLSearchParams();
+    if (params?.page) qs.set("page", String(params.page));
+    if (params?.page_size) qs.set("page_size", String(params.page_size));
+    if (params?.label) qs.set("label", params.label);
+    if (params?.service) qs.set("service", params.service);
+    if (params?.search) qs.set("search", params.search);
+    const q = qs.toString();
+    return request<Paginated<RootCauseItem>>("GET", `/knowledge/root-causes${q ? `?${q}` : ""}`);
+  },
+  similar(query: string, service?: string) {
+    const qs = new URLSearchParams({ query });
+    if (service) qs.set("service", service);
+    return request<{ query: string; items: RootCauseItem[] }>("GET", `/knowledge/root-causes/similar?${qs}`);
+  },
+  label(id: number, label: "confirmed" | "false_positive" | "pending") {
+    return request<RootCauseItem>("PUT", `/knowledge/root-causes/${id}/label`, { label });
+  },
+  create(data: { root_cause: string; service_name?: string; alert_type?: string; title?: string; label?: string }) {
+    return request<RootCauseItem>("POST", "/knowledge/root-causes", data);
+  },
+  remove(id: number) {
+    return request<{ deleted: number }>("DELETE", `/knowledge/root-causes/${id}`);
+  },
+};
+
+/* ── Audit trail ───────────────────────────────────── */
+
+export interface AuditEntry {
+  id: number;
+  username: string | null;
+  action: string;
+  detail: string | null;
+  ip: string | null;
+  extra: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export const auditApi = {
+  list(params?: { page?: number; page_size?: number; action?: string; username?: string }) {
+    const qs = new URLSearchParams();
+    if (params?.page) qs.set("page", String(params.page));
+    if (params?.page_size) qs.set("page_size", String(params.page_size));
+    if (params?.action) qs.set("action", params.action);
+    if (params?.username) qs.set("username", params.username);
+    const q = qs.toString();
+    return request<{ items: AuditEntry[]; total: number; page: number; page_size: number; actions: string[] }>(
+      "GET", `/audit${q ? `?${q}` : ""}`,
+    );
+  },
 };

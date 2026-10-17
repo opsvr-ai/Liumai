@@ -7,12 +7,12 @@ Renders four distinct message types:
 - **error** — red-bordered alert
 */
 
-import { useMemo, useState, useEffect, useCallback, type FC } from "react";
+import { memo, useMemo, useState, useEffect, useCallback, useRef, type FC } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize from "rehype-sanitize";
-import { User, AlertCircle, Loader2, Check, X, ChevronDown, ChevronRight, ArrowDown, CornerDownRight, Copy, Terminal, Globe, Search, Database, Code, FileText, Wrench } from "lucide-react";
+import { User, AlertCircle, Loader2, Check, X, ChevronDown, ChevronRight, ArrowDown, CornerDownRight, Copy, Terminal, Globe, Search, Database, Code, FileText, Wrench, Sparkles } from "lucide-react";
 import { LiumaiLogo } from "@/components/liumai-logo";
 import type { DisplayMessage } from "@/hooks/useChat";
 import type { ToolCallDelta } from "@/lib/api";
@@ -122,8 +122,9 @@ const ToolArgs: FC<{ tool: ToolCallDelta; isStreaming: boolean }> = ({
 const ToolMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
   const tc = message.toolCalls?.[0];
   const toolStatus = tc?.hermes_status;
-  const isRunning =
-    toolStatus === "running" || (message.isStreaming && !toolStatus);
+  const isRunning = Boolean(
+    toolStatus === "running" || (message.isStreaming && !toolStatus),
+  );
   const isError = toolStatus === "error";
   const isDone = !isRunning && !isError && !message.isStreaming;
   const emoji = tc?.hermes_emoji;
@@ -245,10 +246,209 @@ const ToolMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
 };
 
 /* ==========================================================================
+ * Reasoning ("thinking") block
+ * ========================================================================== */
+
+/** Collapsible display of the model's reasoning stream.
+ *
+ * Hermes streams ``delta.reasoning_content`` before the answer.  It is shown
+ * in a muted, collapsible block so the answer stays readable: open while the
+ * model is still thinking, auto-collapsed once the answer starts streaming
+ * (unless the user opened it manually).
+ */
+const ReasoningBlock: FC<{ text: string; streaming?: boolean; hasAnswer?: boolean }> = ({
+  text,
+  streaming,
+  hasAnswer,
+}) => {
+  const [open, setOpen] = useState(true);
+  const userToggled = useRef(false);
+
+  useEffect(() => {
+    if (!userToggled.current && hasAnswer) setOpen(false);
+  }, [hasAnswer]);
+
+  return (
+    <div className="mb-1.5 rounded-lg border border-border/60 bg-white/50 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => {
+          userToggled.current = true;
+          setOpen((v) => !v);
+        }}
+        className="flex w-full items-center gap-1.5 px-2 py-1 text-[11px] font-medium text-muted-foreground hover:text-text-secondary transition-colors"
+        aria-expanded={open}
+      >
+        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        <Sparkles className="h-3 w-3" />
+        思考过程
+        {streaming && !hasAnswer && (
+          <span className="ml-1 h-1.5 w-1.5 rounded-full bg-interactive-primary animate-pulse" />
+        )}
+        <span className="ml-auto font-normal text-[10px] opacity-60">{text.length} 字</span>
+      </button>
+      {open && (
+        <div className="max-h-56 overflow-y-auto whitespace-pre-wrap px-2.5 pb-2 text-[12px] leading-relaxed text-muted-foreground select-text">
+          {text}
+          {streaming && !hasAnswer && (
+            <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-current align-text-bottom" aria-hidden="true" />
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+/* ==========================================================================
+ * Streaming render throttling
+ * ========================================================================== */
+
+/** Minimum spacing between Markdown re-renders while a reply is streaming. */
+const STREAM_RENDER_INTERVAL_MS = 70;
+
+/**
+ * Throttles a rapidly-growing streaming value.
+ *
+ * ``react-markdown`` (+ rehype-raw / rehype-sanitize) re-parses the whole
+ * answer on every render, so feeding it one render per delta drops frames on
+ * long replies.  While ``streaming`` is true this yields at most one update
+ * per ``intervalMs`` (the freshest value is always the one flushed); the
+ * moment streaming ends it flushes the final value immediately so the text is
+ * never stale.
+ */
+function useThrottledValue(
+  value: string,
+  streaming: boolean,
+  intervalMs = STREAM_RENDER_INTERVAL_MS,
+): string {
+  const [throttled, setThrottled] = useState(value);
+  const latestRef = useRef(value);
+  latestRef.current = value;
+
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastFlushRef = useRef(0);
+
+  useEffect(() => {
+    if (!streaming) {
+      // Stream finished (or this is a restored message): show the final text
+      // now and drop any pending partial update.
+      if (timerRef.current !== null) {
+        clearTimeout(timerRef.current);
+        timerRef.current = null;
+      }
+      setThrottled(latestRef.current);
+      return;
+    }
+    // A flush is already queued; it will pick up the newest value.
+    if (timerRef.current !== null) return;
+    const wait = Math.max(0, intervalMs - (Date.now() - lastFlushRef.current));
+    timerRef.current = setTimeout(() => {
+      timerRef.current = null;
+      lastFlushRef.current = Date.now();
+      setThrottled(latestRef.current);
+    }, wait);
+  }, [value, streaming, intervalMs]);
+
+  // Never leave a timer behind when the message unmounts.
+  useEffect(
+    () => () => {
+      if (timerRef.current !== null) clearTimeout(timerRef.current);
+    },
+    [],
+  );
+
+  return throttled;
+}
+
+/* ==========================================================================
+ * Markdown body
+ * ========================================================================== */
+
+/**
+ * Markdown renderer isolated behind ``memo``.
+ *
+ * The streamed text only reaches it through {@link useThrottledValue}, so the
+ * expensive parse runs at most once per throttle tick instead of once per
+ * delta.  Earlier (finished) messages are skipped entirely by the memoised
+ * {@link ChatMessage}.
+ */
+const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeRaw, rehypeSanitize]}
+      components={{
+        /* ── Code blocks ──────────────────────────────── */
+        pre: ({ children }) => (
+          <pre className="bg-surface-secondary/60 border border-border/50 rounded-lg p-3 my-2 overflow-x-auto text-xs font-mono text-text-primary whitespace-pre-wrap break-all">
+            {children}
+          </pre>
+        ),
+        code: ({ className: cls, children, ...rest }) => {
+          const isInline = !cls?.includes("language-");
+          if (isInline) {
+            return (
+              <code
+                className="bg-surface-secondary/80 text-text-primary text-xs font-mono rounded px-1 py-0.5"
+                {...rest}
+              >
+                {children}
+              </code>
+            );
+          }
+          return <code className={cn("text-xs px-0 py-0", cls)} {...rest}>{children}</code>;
+        },
+        /* ── Tables ────────────────────────────────────── */
+        table: ({ children }) => (
+          <div className="overflow-x-auto my-2">
+            <table className="min-w-full border-collapse border border-border/50 text-xs">
+              {children}
+            </table>
+          </div>
+        ),
+        th: ({ children }) => (
+          <th className="border border-border/50 bg-surface-secondary/80 px-3 py-1.5 text-left font-medium text-text-primary">
+            {children}
+          </th>
+        ),
+        td: ({ children }) => (
+          <td className="border border-border/50 px-3 py-1.5 text-text-secondary">
+            {children}
+          </td>
+        ),
+        /* ── Blockquotes ────────────────────────────────── */
+        blockquote: ({ children }) => (
+          <blockquote className="border-l-3 border-interactive-primary/40 pl-3 my-2 text-text-secondary italic">
+            {children}
+          </blockquote>
+        ),
+        /* ── Lists ──────────────────────────────────────── */
+        ul: ({ children }) => <ul className="list-disc pl-5 my-1.5 space-y-0.5">{children}</ul>,
+        ol: ({ children }) => <ol className="list-decimal pl-5 my-1.5 space-y-0.5">{children}</ol>,
+        /* ── Headings ───────────────────────────────────── */
+        h1: ({ children }) => <h1 className="text-lg font-semibold text-text-primary mt-3 mb-1">{children}</h1>,
+        h2: ({ children }) => <h2 className="text-base font-semibold text-text-primary mt-2.5 mb-1">{children}</h2>,
+        h3: ({ children }) => <h3 className="text-sm font-semibold text-text-primary mt-2 mb-0.5">{children}</h3>,
+        /* ── Inline ─────────────────────────────────────── */
+        a: ({ href, children }) => (
+          <a href={href} target="_blank" rel="noopener noreferrer" className="text-interactive-primary underline underline-offset-2 hover:opacity-80">
+            {children}
+          </a>
+        ),
+        hr: () => <hr className="my-3 border-border/50" />,
+        p: ({ children }) => <p className="my-1">{children}</p>,
+      }}
+    >
+      {content}
+    </ReactMarkdown>
+  );
+});
+
+/* ==========================================================================
  * Message bubble
  * ========================================================================== */
 
-export const ChatMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
+const ChatMessageImpl: FC<{ message: DisplayMessage }> = ({ message }) => {
   const isUser = message.role === "user";
   const isTool = message.role === "tool";
   const isError = message.role === "error";
@@ -289,6 +489,13 @@ export const ChatMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
     </button>
   ) : null;
 
+  // Throttled snapshot for the Markdown body (see useThrottledValue).  Full
+  // `message.content` is still used for logic / copy / usage so nothing is lost.
+  const renderedContent = useThrottledValue(
+    message.content,
+    Boolean(message.isStreaming),
+  );
+
   /* ── Tool-call message ───────────────────────────────────────────── */
   if (isTool) {
     return <ToolMessage message={message} />;
@@ -324,75 +531,17 @@ export const ChatMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
               : "bg-surface-secondary text-text-primary rounded-2xl rounded-bl-md px-4 py-2.5"
         }`}
       >
-        {message.content && (
+        {!isUser && !isError && message.reasoning && (
+          <ReasoningBlock
+            text={message.reasoning}
+            streaming={message.isStreaming}
+            hasAnswer={Boolean(message.content)}
+          />
+        )}
+
+        {renderedContent && (
           <div className="text-sm leading-relaxed markdown-body">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              rehypePlugins={[rehypeRaw, rehypeSanitize]}
-              components={{
-                /* ── Code blocks ──────────────────────────────── */
-                pre: ({ children }) => (
-                  <pre className="bg-surface-secondary/60 border border-border/50 rounded-lg p-3 my-2 overflow-x-auto text-xs font-mono text-text-primary whitespace-pre-wrap break-all">
-                    {children}
-                  </pre>
-                ),
-                code: ({ className: cls, children, ...rest }) => {
-                  const isInline = !cls?.includes("language-");
-                  if (isInline) {
-                    return (
-                      <code
-                        className="bg-surface-secondary/80 text-text-primary text-xs font-mono rounded px-1 py-0.5"
-                        {...rest}
-                      >
-                        {children}
-                      </code>
-                    );
-                  }
-                  return <code className={cn("text-xs px-0 py-0", cls)} {...rest}>{children}</code>;
-                },
-                /* ── Tables ────────────────────────────────────── */
-                table: ({ children }) => (
-                  <div className="overflow-x-auto my-2">
-                    <table className="min-w-full border-collapse border border-border/50 text-xs">
-                      {children}
-                    </table>
-                  </div>
-                ),
-                th: ({ children }) => (
-                  <th className="border border-border/50 bg-surface-secondary/80 px-3 py-1.5 text-left font-medium text-text-primary">
-                    {children}
-                  </th>
-                ),
-                td: ({ children }) => (
-                  <td className="border border-border/50 px-3 py-1.5 text-text-secondary">
-                    {children}
-                  </td>
-                ),
-                /* ── Blockquotes ────────────────────────────────── */
-                blockquote: ({ children }) => (
-                  <blockquote className="border-l-3 border-interactive-primary/40 pl-3 my-2 text-text-secondary italic">
-                    {children}
-                  </blockquote>
-                ),
-                /* ── Lists ──────────────────────────────────────── */
-                ul: ({ children }) => <ul className="list-disc pl-5 my-1.5 space-y-0.5">{children}</ul>,
-                ol: ({ children }) => <ol className="list-decimal pl-5 my-1.5 space-y-0.5">{children}</ol>,
-                /* ── Headings ───────────────────────────────────── */
-                h1: ({ children }) => <h1 className="text-lg font-semibold text-text-primary mt-3 mb-1">{children}</h1>,
-                h2: ({ children }) => <h2 className="text-base font-semibold text-text-primary mt-2.5 mb-1">{children}</h2>,
-                h3: ({ children }) => <h3 className="text-sm font-semibold text-text-primary mt-2 mb-0.5">{children}</h3>,
-                /* ── Inline ─────────────────────────────────────── */
-                a: ({ href, children }) => (
-                  <a href={href} target="_blank" rel="noopener noreferrer" className="text-interactive-primary underline underline-offset-2 hover:opacity-80">
-                    {children}
-                  </a>
-                ),
-                hr: () => <hr className="my-3 border-border/50" />,
-                p: ({ children }) => <p className="my-1">{children}</p>,
-              }}
-            >
-              {message.content}
-            </ReactMarkdown>
+            <MarkdownContent content={renderedContent} />
             {message.isStreaming && (
               <span
                 className="inline-block w-1.5 h-4 ml-0.5 bg-current align-text-bottom animate-pulse rounded-sm"
@@ -402,11 +551,17 @@ export const ChatMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
           </div>
         )}
 
-        {!message.content && !message.toolCalls?.length && message.isStreaming && (
+        {!message.content && !message.reasoning && !message.toolCalls?.length && message.isStreaming && (
           <div className="flex items-center gap-1.5 py-1" aria-label="思考中…">
             <span className="h-2 w-2 rounded-full bg-interactive-primary animate-bounce [animation-delay:0ms]" />
             <span className="h-2 w-2 rounded-full bg-interactive-primary animate-bounce [animation-delay:150ms]" />
             <span className="h-2 w-2 rounded-full bg-interactive-primary animate-bounce [animation-delay:300ms]" />
+          </div>
+        )}
+
+        {!isUser && !isError && message.usage && !message.isStreaming && (
+          <div className="mt-1 text-[10px] text-muted-foreground/60 tabular-nums" title="本轮 token 用量">
+            ↑ {message.usage.prompt_tokens.toLocaleString()} · ↓ {message.usage.completion_tokens.toLocaleString()} tokens
           </div>
         )}
       </div>
@@ -422,3 +577,14 @@ export const ChatMessage: FC<{ message: DisplayMessage }> = ({ message }) => {
     </div>
   );
 };
+
+/**
+ * Memoised bubble.
+ *
+ * Streaming only mutates the newest message object; without this every delta
+ * re-rendered (and re-parsed the Markdown of) every earlier message in the
+ * transcript.  `message` objects for finished turns keep their identity, so
+ * those bubbles now skip re-rendering entirely.
+ */
+export const ChatMessage = memo(ChatMessageImpl);
+ChatMessage.displayName = "ChatMessage";

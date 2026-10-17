@@ -253,6 +253,10 @@ class RcaSession(Base):
         nullable=True,
         index=True,
     )
+    # ── Alert-driven RCA metadata (merged from 六脉RCA平台 webhook service) ──
+    service_name = Column(String(255), nullable=True, index=True)
+    alert_count = Column(Integer, nullable=False, default=1, server_default="1")
+    trigger_reason = Column(Text, nullable=True)
     trigger_type = Column(
         Enum(RcaTriggerType, name="rca_trigger_type", create_type=True),
         nullable=False,
@@ -557,3 +561,139 @@ class AppSystemResource(Base):
     __table_args__ = (
         UniqueConstraint("system_id", "resource_type", "resource_id"),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Alert inbox / webhook pipeline — merged from 六脉RCA平台 (webhook_rca_new.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class Alert(Base):
+    """Normalised inbound alert (webhook inbox / trash).
+
+    ``status`` values:
+      - ``pending``    : stored in inbox, waiting for a human to trigger (manual mode)
+      - ``triggered``  : auto/manual triggered an RCA session
+      - ``coalesced``  : attached to an already-running session for the same service
+      - ``filtered``   : policy decided not to trigger (kept in trash for auditing)
+      - ``dismissed``  : manually dismissed by an operator
+    """
+
+    __tablename__ = "alerts"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(
+        Integer, ForeignKey("teams.id", ondelete="CASCADE"),
+        nullable=False, default=1, index=True,
+    )
+    alert_uid = Column(String(128), nullable=True, index=True)
+    dedup_key = Column(String(512), nullable=True, index=True)
+    source = Column(String(100), nullable=True)
+    ip = Column(String(100), nullable=True)
+    ci_name = Column(String(255), nullable=True, index=True)
+    ci_application = Column(String(255), nullable=True, index=True)
+    ci_id = Column(String(255), nullable=True)
+    content = Column(Text, nullable=True)
+    severity = Column(String(50), nullable=True)
+    severity_level = Column(Integer, nullable=True, index=True)
+    alert_type = Column(String(50), nullable=True, index=True)
+    metric = Column(Text, nullable=True)
+    alert_time = Column(DateTime(timezone=True), nullable=True, index=True)
+    status = Column(
+        String(20), nullable=False, default="pending", server_default="pending", index=True,
+    )
+    trigger_reason = Column(Text, nullable=True)
+    rca_session_id = Column(
+        Integer, ForeignKey("rca_sessions.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    raw_payload = Column(JSONB, nullable=True, default=dict)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<Alert id={self.id} uid={self.alert_uid!r} status={self.status}>"
+
+
+class RcaReport(Base):
+    """Structured RCA report produced from a Hermes analysis output."""
+
+    __tablename__ = "rca_reports"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(Integer, nullable=False, default=1, index=True)
+    session_id = Column(
+        Integer, ForeignKey("rca_sessions.id", ondelete="CASCADE"),
+        nullable=False, unique=True, index=True,
+    )
+    service_name = Column(String(255), nullable=True, index=True)
+    alert_count = Column(Integer, nullable=False, default=1, server_default="1")
+    category = Column(String(50), nullable=True)
+    root_cause = Column(Text, nullable=True)
+    confidence = Column(Float, nullable=True)
+    evidence = Column(JSONB, nullable=True, default=list)
+    impacted_services = Column(JSONB, nullable=True, default=list)
+    recommended_actions = Column(JSONB, nullable=True, default=list)
+    raw_output = Column(Text, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<RcaReport id={self.id} session={self.session_id}>"
+
+
+class RootCauseKnowledge(Base):
+    """Historical root-cause cases used for L1 retrieval-augmented RCA.
+
+    ``label``: ``pending`` (auto-seeded candidate) / ``confirmed`` / ``false_positive``.
+    """
+
+    __tablename__ = "root_cause_knowledge"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(Integer, nullable=False, default=1, index=True)
+    session_id = Column(
+        Integer, ForeignKey("rca_sessions.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    service_name = Column(String(255), nullable=True, index=True)
+    alert_type = Column(String(50), nullable=True, index=True)
+    title = Column(String(255), nullable=True)
+    root_cause = Column(Text, nullable=True)
+    digest = Column(Text, nullable=True)
+    evidence = Column(JSONB, nullable=True, default=list)
+    label = Column(
+        String(20), nullable=False, default="pending", server_default="pending", index=True,
+    )
+    created_by = Column(String(255), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
+    )
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<RootCauseKnowledge id={self.id} service={self.service_name!r} label={self.label}>"
+
+
+class AuditLog(Base):
+    """Operator / system action audit trail."""
+
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String(255), nullable=True, index=True)
+    action = Column(String(100), nullable=False, index=True)
+    detail = Column(Text, nullable=True)
+    ip = Column(String(100), nullable=True)
+    extra = Column(JSONB, nullable=True, default=dict)
+    created_at = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True,
+    )
+
+    def __repr__(self) -> str:
+        return f"<AuditLog id={self.id} action={self.action!r} user={self.username!r}>"

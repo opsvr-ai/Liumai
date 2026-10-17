@@ -45,6 +45,18 @@ EXTRACT_PROMPT = """你是一个运维知识蒸馏专家。从以下对话记录
 {conversation}"""
 
 
+# 蒸馏知识入库：面向知识提炼的 system prompt（不再复用 RCA prompt）。
+DISTILL_INGEST_SYSTEM_PROMPT = """你是一个企业知识库的知识蒸馏助手。请从用户提供的运维知识正文中提炼可检索的知识条目。
+
+要求：
+1. 每条知识包含四个字段：title（标题）、summary（一句话摘要）、tags（2-5 个检索关键词）、content（可独立阅读的正文）
+2. content 保留完整的排查步骤、命令、参数与结论
+3. 只输出 JSON 数组，不要输出 markdown 代码块、解释或任何多余文字
+4. 输出格式：
+[{"title": "标题", "summary": "摘要", "tags": ["标签1", "标签2"], "content": "正文"}]
+5. 如果没有可提炼的知识，返回空数组 []"""
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Distiller
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -362,7 +374,11 @@ class Distiller:
     # ── Internal: auto-ingest ──────────────────────────────────────────────
 
     async def _auto_ingest(self, dk: Any) -> None:
-        """Auto-store high-scoring knowledge into knowledge_documents + llm-wiki v2."""
+        """Auto-store high-scoring knowledge into knowledge_documents + llm-wiki v2.
+
+        走面向蒸馏的 Hermes prompt（不再复用 RCA），全文分块提炼后保存
+        结构化条目；失败时文档保持 failed，绝不误标 stored。
+        """
         from app.models import KnowledgeDocument
 
         doc = KnowledgeDocument(
@@ -374,33 +390,43 @@ class Distiller:
         self.db.add(doc)
         await self.db.flush()
 
-        # Try to ingest via Hermes
         try:
-            from app.services.hermes import HermesClient, _hermes_url
+            from app.services.hermes import _hermes_url
 
-            if _hermes_url:
-                hermes = HermesClient()
-                if hermes.base_url:
-                    import uuid as _uuid
+            if not _hermes_url:
+                logger.warning(
+                    "Hermes 未配置，蒸馏知识保持 pending: dk={} doc={}", dk.id, doc.id
+                )
+                return
 
-                    session_id = f"distill--{_uuid.uuid4().hex}"
-                    result = await hermes.run_rca(
-                        skill_name="knowledge-ingest",
-                        params={
-                            "document_title": doc.title,
-                            "content_length": len(doc.content),
-                            "content_preview": doc.content[:3000],
-                        },
-                    )
-                    doc.status = "stored"
-                    doc.hermes_session_id = session_id
-                    doc.processed_content = result.get("result", {}).get("output", "")[:5000]
-                    doc.knowledge_id = session_id
-                    dk.status = "stored"
-                    dk.knowledge_id = session_id
-                    await self.db.flush()
-        except Exception:
+            # 复用知识入库的分块 / JSON 解析 / 去重逻辑，避免重复实现。
+            from app.routes.knowledge import _extract_knowledge_from_document
+
+            items, hermes_session_id = await _extract_knowledge_from_document(
+                doc.title,
+                doc.content,
+                system_prompt=DISTILL_INGEST_SYSTEM_PROMPT,
+                context_label=f"蒸馏来源：对话知识候选 #{dk.id}",
+            )
+
+            doc.status = "stored"
+            # 只记录 Hermes 真实返回的会话 id，取不到则留空。
+            doc.hermes_session_id = hermes_session_id or None
+            doc.processed_content = json.dumps(items, ensure_ascii=False)[:5000]
+            doc.knowledge_id = None
+            doc.error_message = None
+            dk.status = "stored"
+            dk.knowledge_id = None
+            await self.db.flush()
+            logger.info(
+                "Auto-ingest stored: dk={} doc={} items={} hermes_session={}",
+                dk.id, doc.id, len(items), doc.hermes_session_id or "-",
+            )
+        except Exception as exc:
             logger.exception("Auto-ingest failed for distilled knowledge {}", dk.id)
+            doc.status = "failed"
+            doc.error_message = str(exc)[:500]
+            await self.db.flush()
 
 
 # ── Worthless conversation filter ─────────────────────────────────────────────
