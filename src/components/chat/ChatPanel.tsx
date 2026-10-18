@@ -1,112 +1,140 @@
-/** Intelligent chat panel with sidebar session history.
+/** Intelligent chat page — presentation layer.
 
-Follows the DeepSeek / mainstream pattern:
-- Left sidebar with compact two-line session items (title + relative timestamp)
-- No per-item icons — clean layout with full-width titles
-- Pill-shaped input area with integrated send button
-- Full-height layout (no page header — chat fills the view)
+Data flow is unchanged: conversation state, streaming, runs, approvals, steer,
+attachments and history all still come from ``useChat`` / ``lib/api``.  This
+component now owns layout (sidebar → reading column → composer) and the small
+amount of UI state needed for editing, exporting and folding a turn's process.
 */
 
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
+  type ChangeEvent,
   type FC,
-  type KeyboardEvent,
+  type MouseEvent,
 } from "react";
 import { useSearchParams } from "react-router-dom";
 import {
-  Send,
-  Trash2,
-  Loader2,
-  Plus,
-  PanelLeft,
-  Clock,
-  Upload,
-  FileText,
-  X,
-  MessageCircle,
   Activity,
-  BookOpen,
-  Sparkles,
-  ChevronDown,
-  Square,
-  ShieldAlert,
   ArrowDown,
-  Check,
+  BookOpen,
+  MessageCircle,
+  Sparkles,
+  X,
+  type LucideIcon,
 } from "lucide-react";
 import { useChat, type ChatApprovalDecision } from "@/hooks/useChat";
-import { ChatMessage } from "@/components/chat/ChatMessage";
-import { LiumaiLogo } from "@/components/liumai-logo";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { chatHistory, chatModes, authApi, hermesDiscovery, type ChatModeOut, type ChatSessionSummary } from "@/lib/api";
-import { toast } from "sonner";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import {
+  chatFiles,
+  chatHistory,
+  chatModes,
+  authApi,
+  clearStagedChatImages,
+  hermesDiscovery,
+  stageChatImages,
+  type ChatModeOut,
+  type ChatSessionSummary,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { toast } from "sonner";
+import { ChatHeader } from "./chat-header";
+import { ChatSidebar } from "./chat-sidebar";
+import { Composer } from "./composer";
+import { EmptyState } from "./empty-state";
+import { MessageList } from "./message-list";
+import { titleFromMessages } from "./chat-utils";
 
-/* ── Relative time formatter ─────────────────────────────── */
+/* ==========================================================================
+ *  Constants
+ * ========================================================================== */
 
-function relativeTime(iso: string): string {
-  const d = new Date(iso);
-  const now = new Date();
-  const diffMs = now.getTime() - d.getTime();
-  const diffMin = Math.floor(diffMs / 60000);
-  if (diffMin < 1) return "刚刚";
-  if (diffMin < 60) return `${diffMin} 分钟前`;
-  const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr} 小时前`;
-  const diffDay = Math.floor(diffHr / 24);
-  if (diffDay < 7) return `${diffDay} 天前`;
-  return d.toLocaleDateString("zh-CN");
-}
-
-/* ── Tool-approval choices (Runs API) ─────────────────────── */
-
-/**
- * The four decisions the approval endpoint accepts, in display order.
- * Fixed (rather than derived from ``pendingApproval.choices``) so the banner
- * always offers the full vocabulary; an unsupported choice surfaces as a
- * retryable error instead of silently disappearing.
- */
-const APPROVAL_ACTIONS: ReadonlyArray<{
-  decision: ChatApprovalDecision;
-  label: string;
-}> = [
-  { decision: "once", label: "允许一次" },
-  { decision: "session", label: "本会话" },
-  { decision: "always", label: "始终" },
-  { decision: "deny", label: "拒绝" },
-];
-
-/** Human label for an approval decision (banner + 已响应 note). */
-function approvalLabel(decision: string): string {
-  return (
-    APPROVAL_ACTIONS.find((action) => action.decision === decision)?.label ??
-    decision
-  );
-}
-
-/* ── Welcome message cache (P1-17) ────────────────────────── */
-
-/**
- * sessionStorage key prefix for the generated welcome text.  The username is
- * appended in {@link fetchWelcome} so two accounts sharing a tab never see each
- * other's greeting.
- */
 const WELCOME_CACHE_PREFIX = "liumai:welcome:";
-
-/** Fallback greeting when the LLM is unavailable. */
 const DEFAULT_WELCOME =
   "你好！我是六脉智能运维助手。我可以帮你实时监控、追踪故障根因、分析历史数据、协调应急响应。随时向我提问，一起保障系统稳定运行。";
 
-/* ── Scroll-follow behaviour (P1-6) ───────────────────────── */
-
-/** Auto-follow only while the viewport is within this distance of the bottom. */
 const BOTTOM_FOLLOW_THRESHOLD_PX = 120;
 
-/* ═══════════════════════════════════════════════════════════ */
+/** Inline image limit — keep the base64 payload comfortably below 6MB. */
+const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
+/** Agent-mode text cap: Hermes silently truncates text parts above 64K chars. */
+const AGENT_ATTACHMENT_MAX_CHARS = 60_000;
+
+const APPROVAL_LABELS: Record<ChatApprovalDecision, string> = {
+  once: "允许一次",
+  session: "本会话",
+  always: "始终",
+  deny: "拒绝",
+};
+
+const MODE_ICONS: Record<string, LucideIcon> = {
+  default: MessageCircle,
+  general: Sparkles,
+  rca: Activity,
+  knowledge: BookOpen,
+};
+
+/** Display names for the engines a chat mode can route to. */
+const ENGINE_LABELS: Record<string, string> = {
+  hermes: "Hermes",
+  openai: "OpenAI",
+  anthropic: "Anthropic",
+  deepseek: "DeepSeek",
+  ollama: "Ollama",
+};
+
+/** Resolve the provider the same way ``submitTurn`` routes the run. */
+function resolveModeProvider(
+  activeMode: string | null,
+  mode: ChatModeOut | undefined,
+): string {
+  const configured = mode?.config?.provider;
+  if (typeof configured === "string" && configured.trim()) {
+    return configured.trim().toLowerCase();
+  }
+  if (!activeMode || activeMode === "system:general" || activeMode.startsWith("user:")) {
+    return "llm";
+  }
+  return "hermes";
+}
+
+function providerLabel(provider: string): string {
+  return (
+    ENGINE_LABELS[provider] ??
+    provider.charAt(0).toUpperCase() + provider.slice(1)
+  );
+}
+
+/** Rename a saved session without touching its transcript. */
+async function updateSessionTitle(sessionId: number, title: string): Promise<void> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  try {
+    const token = localStorage.getItem("liumai_token");
+    if (token) headers.Authorization = `Bearer ${token}`;
+  } catch {
+    /* storage unavailable — still attempt the request */
+  }
+  const response = await fetch(`/api/chat/sessions/${sessionId}/messages`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ title }),
+  });
+  if (!response.ok) throw new Error(`rename → ${response.status}`);
+}
+
+function safeFilename(title: string): string {
+  const cleaned = title.replace(/[\\/:*?"<>|\n\r]/g, "-").trim().slice(0, 40);
+  return cleaned || "liumai-chat";
+}
+
+/* ==========================================================================
+ *  Panel
+ * ========================================================================== */
 
 export const ChatPanel: FC = () => {
   const {
@@ -126,51 +154,85 @@ export const ChatPanel: FC = () => {
     loadSession,
   } = useChat();
 
+  /* ── Composer / session state ─────────────────────────────────────── */
   const [input, setInput] = useState("");
-  /** "正在提交…" / "已响应 · 允许一次" note under the approval banner. */
   const [approvalNotice, setApprovalNotice] = useState<string | null>(null);
-  /** request_id currently in flight — blocks the same banner's double click. */
   const approvalRequestRef = useRef<string | null>(null);
-  /** Text queued because a steer hit a run that had already ended. */
   const [pendingResend, setPendingResend] = useState<string | null>(null);
-  /** Steer request in flight — Enter must not submit twice. */
   const steerInFlightRef = useRef(false);
+
   const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [welcomeText, setWelcomeText] = useState("");       // start empty — no flash
-  const [welcomeLoading, setWelcomeLoading] = useState(true); // shimmer while waiting
+  const [sidebarOpen, setSidebarOpen] = useState(() => {
+    if (typeof window === "undefined") return true;
+    return window.matchMedia("(min-width: 1024px)").matches;
+  });
+
+  /* ── Welcome (unchanged data source, new presentation) ────────────── */
+  const [welcomeText, setWelcomeText] = useState("");
+  const [welcomeLoading, setWelcomeLoading] = useState(true);
   const [welcomeTyping, setWelcomeTyping] = useState(false);
   const welcomeIndexRef = useRef(0);
   const welcomeTargetRef = useRef(DEFAULT_WELCOME);
-  /** Guards the one-and-only welcome generation request per mount. */
   const welcomeRequestedRef = useRef(false);
-
   const typewriterTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Clean up typewriter interval on unmount
-  useEffect(() => {
-    return () => {
-      if (typewriterTimerRef.current) {
-        clearInterval(typewriterTimerRef.current);
-        typewriterTimerRef.current = null;
-      }
-    };
-  }, []);
+  /* ── Modes / models ───────────────────────────────────────────────── */
+  const [searchParams] = useSearchParams();
+  const initialModeFromUrl = searchParams.get("mode");
+  const [modes, setModes] = useState<ChatModeOut[]>([]);
+  const [activeMode, setActiveMode] = useState<string | null>(
+    initialModeFromUrl ? `system:${initialModeFromUrl}` : "system:general",
+  );
+  const [availableModels, setAvailableModels] = useState<Array<{ id: string }>>([]);
+  const [selectedModel, setSelectedModel] = useState("");
 
-  // A fresh approval prompt supersedes the previous "已响应" note.
-  useEffect(() => {
-    if (pendingApproval) setApprovalNotice(null);
-  }, [pendingApproval]);
+  /* ── Custom assistant dialog ──────────────────────────────────────── */
+  const [showCreate, setShowCreate] = useState(false);
+  const [editMode, setEditMode] = useState<ChatModeOut | null>(null);
+  const [cmName, setCmName] = useState("");
+  const [cmPrompt, setCmPrompt] = useState("");
+  const [cmIcon, setCmIcon] = useState("🤖");
+  const [cmProvider, setCmProvider] = useState("llm");
 
-  // Dismiss the success note after a moment (the in-flight note is transient
-  // until respondApproval settles).
-  useEffect(() => {
-    if (!approvalNotice || approvalNotice.startsWith("正在")) return;
-    const timer = setTimeout(() => setApprovalNotice(null), 4000);
-    return () => clearTimeout(timer);
-  }, [approvalNotice]);
+  /* ── Hermes health / RCA window ───────────────────────────────────── */
+  const [hermesOnline, setHermesOnline] = useState(true);
+  const [rcaTimeStart, setRcaTimeStart] = useState("");
+  const [rcaTimeEnd, setRcaTimeEnd] = useState("");
+  const [rcaPreset, setRcaPreset] = useState("none");
 
-  // Typewriter — exposed as a stable callback
+  /* ── Attachment ───────────────────────────────────────────────────── */
+  const [attachedFile, setAttachedFile] = useState<File | null>(null);
+  const [attachedContent, setAttachedContent] = useState("");
+  /** Inline image for the current turn only (never persisted / replayed). */
+  const [attachedImage, setAttachedImage] = useState<{
+    filename: string;
+    dataUrl: string;
+    bytes: number;
+  } | null>(null);
+  const [attachedTruncated, setAttachedTruncated] = useState(false);
+  const [attachedOriginalChars, setAttachedOriginalChars] = useState(0);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [converting, setConverting] = useState(false);
+
+  /* ── Scroll-follow ────────────────────────────────────────────────── */
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const nearBottomRef = useRef(true);
+  const scrollRafRef = useRef<number | null>(null);
+  const prevMessageCountRef = useRef(0);
+  const [isNearBottom, setIsNearBottom] = useState(true);
+  const [hasUnread, setHasUnread] = useState(false);
+
+  /* ── Local presentation state ─────────────────────────────────────── */
+  const [titleOverride, setTitleOverride] = useState<string | null>(null);
+  const persistedTitleRef = useRef<string | null>(null);
+  const [hiddenIds, setHiddenIds] = useState<Set<string>>(new Set());
+  const [clearOpen, setClearOpen] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  /* ====================================================================
+   *  Welcome text (generated once per browser session, cached)
+   * ==================================================================== */
+
   const startTypewriter = useCallback((text: string) => {
     if (!text) return;
     welcomeTargetRef.current = text;
@@ -178,12 +240,9 @@ export const ChatPanel: FC = () => {
     setWelcomeText("");
     setWelcomeTyping(true);
     const chars = [...text];
-    // Clear any running timer before starting a new one
-    if (typewriterTimerRef.current) {
-      clearInterval(typewriterTimerRef.current);
-    }
+    if (typewriterTimerRef.current) clearInterval(typewriterTimerRef.current);
     typewriterTimerRef.current = setInterval(() => {
-      welcomeIndexRef.current++;
+      welcomeIndexRef.current += 1;
       if (welcomeIndexRef.current <= chars.length) {
         setWelcomeText(chars.slice(0, welcomeIndexRef.current).join(""));
       } else {
@@ -196,106 +255,8 @@ export const ChatPanel: FC = () => {
     }, 40);
   }, []);
 
-  /* ── Mode icon map ────────────────────────────────── */
-  const modeIcons: Record<string, typeof MessageCircle> = {
-    default: MessageCircle,
-    general: Sparkles,
-    rca: Activity,
-    knowledge: BookOpen,
-  };
-
-  /* ── Mode state ───────────────────────────────────── */
-  const [searchParams] = useSearchParams();
-  const initialModeFromUrl = searchParams.get("mode");
-  const [modes, setModes] = useState<ChatModeOut[]>([]);
-  const [activeMode, setActiveMode] = useState<string | null>(
-    initialModeFromUrl ? `system:${initialModeFromUrl}` : "system:general"
-  );
-  const [availableModels, setAvailableModels] = useState<Array<{ id: string }>>([]);
-  const [selectedModel, setSelectedModel] = useState<string>("");
-
-  /* Custom assistant creation dialog */
-  const [showCreate, setShowCreate] = useState(false);
-  const [editMode, setEditMode] = useState<ChatModeOut | null>(null);
-  const [cmName, setCmName] = useState("");
-  const [cmPrompt, setCmPrompt] = useState("");
-  const [cmIcon, setCmIcon] = useState("🤖");
-  const [cmProvider, setCmProvider] = useState("llm");
-
-  /* Hermes health */
-  const [hermesOnline, setHermesOnline] = useState(true);
-  const [rcaTimeStart, setRcaTimeStart] = useState("");
-  const [rcaTimeEnd, setRcaTimeEnd] = useState("");
-  const [rcaPreset, setRcaPreset] = useState("none");
-
-  /* ── File attachment (knowledge QA mode) ──────────── */
-  const [attachedFile, setAttachedFile] = useState<File | null>(null);
-  const [attachedContent, setAttachedContent] = useState("");
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const [converting, setConverting] = useState(false);
-
-  const handleFileSelect = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      setAttachedFile(file);
-      setAttachedContent("");
-      setConverting(true);
-      try {
-        const token = localStorage.getItem("liumai_token");
-        const form = new FormData();
-        form.append("file", file);
-        const res = await fetch("/api/chat/convert-file", {
-          method: "POST",
-          headers: { Authorization: `Bearer ${token}` },
-          body: form,
-        });
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({ detail: "转换失败" }));
-          throw new Error(err.detail || "转换失败");
-        }
-        const data = await res.json();
-        setAttachedContent(data.content);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : "转换失败";
-        setAttachedContent(`[${msg}: ${file.name}]`);
-      } finally {
-        setConverting(false);
-      }
-    },
-    [],
-  );
-
-  const clearAttachment = useCallback(() => {
-    setAttachedFile(null);
-    setAttachedContent("");
-    if (fileInputRef.current) fileInputRef.current.value = "";
-  }, []);
-
-  /* ── Scroll follow / 回到底部 (P1-6) ─────────────────── */
-  const messagesRootRef = useRef<HTMLDivElement>(null);
-  const viewportRef = useRef<HTMLDivElement | null>(null);
-  const nearBottomRef = useRef(true);
-  const scrollRafRef = useRef<number | null>(null);
-  const prevMessageCountRef = useRef(0);
-  const [isNearBottom, setIsNearBottom] = useState(true);
-  const [hasUnread, setHasUnread] = useState(false);
-
-  const reloadSessions = useCallback(async () => {
-    try {
-      setSessions(await chatHistory.list());
-    } catch { /* backend may not be up yet */ }
-  }, []);
-
-  useEffect(() => { reloadSessions(); }, [reloadSessions]);
-
-  // Personalised welcome text.  Generated **once per browser session per user**
-  // on first mount and cached in sessionStorage; 新对话 must never hit the LLM
-  // again (P1-17).  The username is part of the key so switching accounts in
-  // the same tab never shows another user's greeting.
   const fetchWelcome = useCallback(() => {
-    if (welcomeRequestedRef.current) return; // React StrictMode double-invoke
+    if (welcomeRequestedRef.current) return;
     welcomeRequestedRef.current = true;
 
     const username = localStorage.getItem("liumai_user") || "用户";
@@ -305,10 +266,9 @@ export const ChatPanel: FC = () => {
     try {
       cached = sessionStorage.getItem(cacheKey);
     } catch {
-      /* storage unavailable (private mode) — fall through to the API */
+      /* private mode */
     }
     if (cached) {
-      // Already generated earlier this browser session: show it instantly.
       welcomeTargetRef.current = cached;
       setWelcomeText(cached);
       setWelcomeLoading(false);
@@ -317,39 +277,81 @@ export const ChatPanel: FC = () => {
 
     setWelcomeLoading(true);
     setWelcomeText("");
-    authApi.generateWelcome(username)
-      .then((r) => {
-        const text = r.text?.trim();
+    authApi
+      .generateWelcome(username)
+      .then((result) => {
+        const text = result.text?.trim();
         if (!text) throw new Error("欢迎语为空");
         try {
           sessionStorage.setItem(cacheKey, text);
         } catch {
-          /* non-fatal — the greeting still renders */
+          /* non-fatal */
         }
         startTypewriter(text);
       })
-      .catch(() => {
-        // AI unavailable — use the (richer) default text directly, no typewriter
-        setWelcomeText(DEFAULT_WELCOME);
-      })
+      .catch(() => setWelcomeText(DEFAULT_WELCOME))
       .finally(() => setWelcomeLoading(false));
   }, [startTypewriter]);
 
-  useEffect(() => { fetchWelcome(); }, [fetchWelcome]);
+  useEffect(() => {
+    fetchWelcome();
+  }, [fetchWelcome]);
 
-  // Load modes
+  useEffect(
+    () => () => {
+      if (typewriterTimerRef.current) clearInterval(typewriterTimerRef.current);
+    },
+    [],
+  );
+
+  /* ====================================================================
+   *  Sidebar / sessions
+   * ==================================================================== */
+
+  const reloadSessions = useCallback(async () => {
+    try {
+      setSessions(await chatHistory.list());
+    } catch {
+      /* backend may not be up yet */
+    }
+  }, []);
+
+  useEffect(() => {
+    void reloadSessions();
+  }, [reloadSessions]);
+
+  // Close the drawer when the viewport shrinks below the desktop breakpoint.
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 1024px)");
+    const onChange = (event: MediaQueryListEvent) => {
+      if (!event.matches) setSidebarOpen(false);
+    };
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, []);
+
+  // A fresh approval prompt supersedes the previous "已响应" note.
+  useEffect(() => {
+    if (pendingApproval) setApprovalNotice(null);
+  }, [pendingApproval]);
+
+  useEffect(() => {
+    if (!approvalNotice || approvalNotice.startsWith("正在")) return;
+    const timer = setTimeout(() => setApprovalNotice(null), 4000);
+    return () => clearTimeout(timer);
+  }, [approvalNotice]);
+
+  /* ====================================================================
+   *  Modes / models / capabilities
+   * ==================================================================== */
+
   useEffect(() => {
     chatModes.list().then(setModes).catch(() => {});
   }, []);
 
-  // Probe Hermes capabilities once: the Runs path needs to know whether a stop
-  // really interrupts the agent server-side, and whether steer/approval exist.
-  // A failed probe never errors the chat: approval/steer are treated as absent
-  // (their UI stays hidden) while runs/stop keep their optimistic defaults.
   useEffect(() => {
-    // Non-admin endpoint: capability bits only.  The admin-only hermes-info
-    // call used to 403 for normal users and could clobber the probed values.
-    chatModes.hermesCapabilities()
+    chatModes
+      .hermesCapabilities()
       .then((caps) => {
         configureRunCapabilities({
           runs: caps.run_submission !== false,
@@ -359,71 +361,74 @@ export const ChatPanel: FC = () => {
         });
       })
       .catch(() => {
-        // Older / non-admin backend or offline — capability is unknown, so do
-        // not guess: hide approval & steer instead of showing dead controls.
         configureRunCapabilities({ approval: false, steer: false });
       });
   }, [configureRunCapabilities]);
 
-  // Poll Hermes health every 30s; force-switch to general if offline
   useEffect(() => {
     const check = () => {
-      hermesDiscovery.health().then(r => {
-        const online = r.ok;
-        setHermesOnline(online);
-        if (!online && activeMode && activeMode !== "system:general" && !activeMode.startsWith("user:")) {
-          setActiveMode("system:general");
-        }
-      }).catch(() => {
-        setHermesOnline(false);
-        if (activeMode && activeMode !== "system:general" && !activeMode.startsWith("user:")) {
-          setActiveMode("system:general");
-        }
-      });
+      hermesDiscovery
+        .health()
+        .then((result) => {
+          const online = result.ok;
+          setHermesOnline(online);
+          if (
+            !online &&
+            activeMode &&
+            activeMode !== "system:general" &&
+            !activeMode.startsWith("user:")
+          ) {
+            setActiveMode("system:general");
+          }
+        })
+        .catch(() => {
+          setHermesOnline(false);
+          if (
+            activeMode &&
+            activeMode !== "system:general" &&
+            !activeMode.startsWith("user:")
+          ) {
+            setActiveMode("system:general");
+          }
+        });
     };
     check();
     const timer = setInterval(check, 30000);
     return () => clearInterval(timer);
-  }, []); // intentionally no activeMode dep — only check on mount
+    // Intentionally mount-only: the health probe uses the mode at mount time.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // Load available LLM models (P1-14).
-  //
-  // `GET /api/chat/llm-models` is readable by every signed-in user, unlike the
-  // admin-only `/auth/llm-config` the panel used to call — a normal user's 403
-  // was swallowed and the picker rendered blank.  The endpoint only echoes the
-  // configured default when model discovery fails, so an unambiguous single
-  // model is auto-selected; with several models we keep "" ("默认模型") and the
-  // backend continues to apply its configured default.
   useEffect(() => {
     let cancelled = false;
-    hermesDiscovery.listLlmModels()
+    hermesDiscovery
+      .listLlmModels()
       .then((models) => {
         if (cancelled) return;
         const list = models ?? [];
         setAvailableModels(list);
-        // Keep a still-valid manual choice, otherwise fall back to the default.
-        setSelectedModel((prev) => {
-          if (prev && list.some((m) => m.id === prev)) return prev;
+        setSelectedModel((previous) => {
+          if (previous && list.some((model) => model.id === previous)) return previous;
           return list.length === 1 ? list[0].id : "";
         });
       })
       .catch(() => {
-        // Offline / empty — hide the picker rather than render a blank select.
-        if (!cancelled) {
-          setAvailableModels([]);
-          setSelectedModel("");
-        }
+        if (cancelled) return;
+        setAvailableModels([]);
+        setSelectedModel("");
       });
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  /* ── Auto-follow only while the user is near the bottom (P1-6) ────── */
+  /* ====================================================================
+   *  Scroll-follow behaviour
+   * ==================================================================== */
 
   const scrollToBottom = useCallback(() => {
-    const viewport = viewportRef.current;
+    const viewport = scrollRef.current;
     if (!viewport) return;
-    // Coalesce bursts into one scroll per frame; the callback reads the
-    // freshest scrollHeight, so it always lands on the true bottom.
     if (scrollRafRef.current !== null) return;
     scrollRafRef.current = requestAnimationFrame(() => {
       scrollRafRef.current = null;
@@ -432,33 +437,25 @@ export const ChatPanel: FC = () => {
   }, []);
 
   const handleViewportScroll = useCallback(() => {
-    const viewport = viewportRef.current;
+    const viewport = scrollRef.current;
     if (!viewport) return;
-    const distanceFromBottom =
+    const distance =
       viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
-    const near = distanceFromBottom < BOTTOM_FOLLOW_THRESHOLD_PX;
+    const near = distance < BOTTOM_FOLLOW_THRESHOLD_PX;
     nearBottomRef.current = near;
     setIsNearBottom(near);
     if (near) setHasUnread(false);
   }, []);
 
-  // Our ScrollArea wrapper does not forward a viewport ref, so find the Base UI
-  // scroll viewport inside the message area and observe real user scrolling.
-  useEffect(() => {
-    const viewport = messagesRootRef.current?.querySelector<HTMLDivElement>(
-      '[data-slot="scroll-area-viewport"]',
-    ) ?? null;
-    viewportRef.current = viewport;
+  const handleScrollToBottom = useCallback(() => {
+    const viewport = scrollRef.current;
+    nearBottomRef.current = true;
+    setIsNearBottom(true);
+    setHasUnread(false);
     if (!viewport) return;
-    viewport.addEventListener("scroll", handleViewportScroll, { passive: true });
-    handleViewportScroll();
-    return () => {
-      viewport.removeEventListener("scroll", handleViewportScroll);
-      viewportRef.current = null;
-    };
-  }, [handleViewportScroll]);
+    viewport.scrollTo({ top: viewport.scrollHeight, behavior: "smooth" });
+  }, []);
 
-  // Cancel a pending scroll frame on unmount.
   useEffect(
     () => () => {
       if (scrollRafRef.current !== null) cancelAnimationFrame(scrollRafRef.current);
@@ -466,18 +463,9 @@ export const ChatPanel: FC = () => {
     [],
   );
 
-  const handleScrollToBottom = useCallback(() => {
-    nearBottomRef.current = true;
-    setIsNearBottom(true);
-    setHasUnread(false);
-    scrollToBottom();
-  }, [scrollToBottom]);
-
   useEffect(() => {
-    const viewport = viewportRef.current;
-    if (!viewport) return;
+    if (!scrollRef.current) return;
 
-    // Cleared transcript (new conversation / deleted session): reset follow state.
     if (messages.length === 0) {
       prevMessageCountRef.current = 0;
       nearBottomRef.current = true;
@@ -488,9 +476,7 @@ export const ChatPanel: FC = () => {
 
     const previousCount = prevMessageCountRef.current;
     prevMessageCountRef.current = messages.length;
-
     const lastMessage = messages[messages.length - 1];
-    // A freshly sent turn or a restored transcript always lands at bottom.
     const forceBottom =
       (previousCount === 0 && messages.length > 0) ||
       (messages.length > previousCount && lastMessage?.role === "user");
@@ -501,31 +487,96 @@ export const ChatPanel: FC = () => {
       setHasUnread(false);
       scrollToBottom();
     } else {
-      // Content arrived while the user is reading history: never yank the
-      // viewport back — show the 回到底部 pill instead.
       setHasUnread(true);
     }
   }, [messages, scrollToBottom]);
 
-  // Refresh session list after streaming finishes
+  // Refresh history after streaming finishes.
   const prevStreaming = useRef(isStreaming);
   useEffect(() => {
-    if (prevStreaming.current && !isStreaming) {
-      reloadSessions().catch(() => {});
-    }
+    if (prevStreaming.current && !isStreaming) void reloadSessions();
     prevStreaming.current = isStreaming;
   }, [isStreaming, reloadSessions]);
 
-  // While an agent run is active and Hermes supports steer, the input box
-  // becomes a "supplementary instruction" box instead of being disabled.
+  /* ====================================================================
+   *  Attachment
+   * ==================================================================== */
+
+  const clearAttachment = useCallback(() => {
+    setAttachedFile(null);
+    setAttachedContent("");
+    setAttachedImage(null);
+    setAttachedTruncated(false);
+    setAttachedOriginalChars(0);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }, []);
+
+  const convertFile = useCallback(
+    async (file: File) => {
+      const isImage = /\.(png|jpe?g|webp|gif)$/i.test(file.name);
+      if (isImage && file.size > MAX_IMAGE_BYTES) {
+        clearAttachment();
+        toast.error("图片超过 3MB 上限，请压缩后再上传");
+        return;
+      }
+
+      setAttachedFile(file);
+      setAttachedContent("");
+      setAttachedImage(null);
+      setAttachedTruncated(false);
+      setAttachedOriginalChars(0);
+      setConverting(true);
+      try {
+        const modeMeta = modes.find(
+          (mode) => mode.slug === (activeMode ?? "system:general"),
+        );
+        const provider = resolveModeProvider(activeMode, modeMeta);
+        // Agent (Hermes) turns get a 60k-char cap: above 64K Hermes silently
+        // truncates the text part. Direct-LLM modes keep the 200k default.
+        const maxChars =
+          provider === "llm" ? undefined : AGENT_ATTACHMENT_MAX_CHARS;
+        const result = await chatFiles.convert(file, maxChars);
+        if (result.kind === "image") {
+          setAttachedImage({
+            filename: result.filename,
+            dataUrl: result.data_url,
+            bytes: result.bytes,
+          });
+        } else {
+          setAttachedContent(result.content);
+          setAttachedTruncated(result.truncated);
+          setAttachedOriginalChars(result.original_chars);
+          if (result.truncated) {
+            toast.warning(
+              `附件内容超长，已截断为 ${result.max_chars ?? maxChars ?? ""} 字符（原文 ${result.original_chars} 字符）`,
+            );
+          }
+        }
+      } catch (err: unknown) {
+        // Never feed an error string to the model as attachment text.
+        clearAttachment();
+        toast.error(err instanceof Error ? err.message : "文件转换失败");
+      } finally {
+        setConverting(false);
+      }
+    },
+    [activeMode, clearAttachment, modes],
+  );
+
+  const handleFileSelect = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const file = event.target.files?.[0];
+      if (file) void convertFile(file);
+    },
+    [convertFile],
+  );
+
+  /* ====================================================================
+   *  Streaming / approval / steer handlers
+   * ==================================================================== */
+
   const canSteer = isStreaming && Boolean(activeRunId) && runCapabilities.steer;
 
-  /**
-   * Send the current input as a supplementary instruction to the running run.
-   *
-   * Success clears the box.  A 409 (the run already finished) must not lose
-   * the text: it is queued and resent as a normal turn once the run settles.
-   */
   const handleSteer = useCallback(async () => {
     const text = input.trim();
     if (!text || !canSteer || steerInFlightRef.current) return;
@@ -547,22 +598,18 @@ export const ChatPanel: FC = () => {
     }
   }, [input, canSteer, steerMessage]);
 
-  /** Answer the pending approval prompt (the hook clears/restores it). */
   const handleApprovalResponse = useCallback(
     async (decision: ChatApprovalDecision) => {
       if (!pendingApproval) return;
       const requestId = pendingApproval.approvalId;
-      // Never submit two decisions at once.  The hook additionally dedupes the
-      // same request_id; this also covers prompts with no id at all.
       if (approvalRequestRef.current !== null) return;
       approvalRequestRef.current = requestId;
       setApprovalNotice("正在提交审批…");
       try {
         const ok = await respondApproval({ decision });
         if (ok) {
-          setApprovalNotice(`已响应 · ${approvalLabel(decision)}`);
+          setApprovalNotice(`已响应 · ${APPROVAL_LABELS[decision]}`);
         } else {
-          // The prompt is restored by the hook so the user can retry.
           setApprovalNotice(null);
           toast.error("审批响应失败，请重试");
         }
@@ -573,39 +620,61 @@ export const ChatPanel: FC = () => {
     [pendingApproval, respondApproval],
   );
 
-  /**
-   * Send a normal turn, applying mode-specific extras (RCA window, inlined
-   * attachment, model pick).  Shared by Enter and the steer→normal fallback.
-   */
   const submitTurn = useCallback(
     async (rawText: string) => {
       let text = rawText;
+      /* ``null`` means the default (通用) mode everywhere else in the UI, so
+         route it as ``system:general`` instead of letting Hermes pick it up. */
+      const modeSlug = activeMode ?? "system:general";
       const isGeneralMode =
-        activeMode === "system:general" ||
-        Boolean(activeMode?.startsWith("user:"));
-      const isRcaMode = activeMode === "system:rca";
-      // General mode: inline attached document content
-      if (isGeneralMode && attachedContent) {
+        modeSlug === "system:general" || modeSlug.startsWith("user:");
+      const isRcaMode = modeSlug === "system:rca";
+      const image = attachedImage;
+
+      /* Text attachments are inline text: available in every mode (agent
+         modes included). Only the current turn carries the body. */
+      if (attachedContent) {
         const fileName = attachedFile?.name ?? "文档";
         text = `[上传文档: ${fileName}]\n\n${attachedContent}\n\n[用户问题]\n${text}`;
-        clearAttachment();
       }
-      const twStart = isRcaMode ? (rcaTimeStart || new Date(Date.now() - 15 * 60000).toISOString()) : undefined;
-      const twEnd = isRcaMode ? (rcaTimeEnd || new Date().toISOString()) : undefined;
-      // The mode's config picks the engine: direct-LLM modes stay on
-      // /chat/stream, agent modes (default/hermes) go through the Runs API.
-      const activeModeMeta = modes.find((m) => m.slug === activeMode);
-      const provider = activeModeMeta
-        ? ((activeModeMeta.config?.provider as string | undefined) ??
-          (activeMode?.startsWith("system:") ? "hermes" : "llm"))
-        : "hermes";
-      await sendMessage(text, {
-        mode: activeMode ?? undefined,
-        provider,
-        timeWindowStart: twStart,
-        timeWindowEnd: twEnd,
-        model: isGeneralMode ? (selectedModel || undefined) : undefined,
-      });
+
+      /* The image placeholder stays in the transcript; the data URL itself is
+         staged for this request only and is never persisted/replayed. */
+      if (image) {
+        text = `[图片] ${image.filename}\n${text}`;
+        stageChatImages([{ filename: image.filename, dataUrl: image.dataUrl }]);
+      } else {
+        clearStagedChatImages();
+      }
+
+      const twStart = isRcaMode
+        ? rcaTimeStart || new Date(Date.now() - 15 * 60000).toISOString()
+        : undefined;
+      const twEnd = isRcaMode ? rcaTimeEnd || new Date().toISOString() : undefined;
+      const activeModeMeta = modes.find((mode) => mode.slug === modeSlug);
+      /* Images travel as content parts, which only ``/chat/stream`` accepts.
+         Verified against the running Hermes build: POST /v1/runs rejects a
+         parts array ("No user message found in input") and coerces
+         conversation_history content with str(), so the agent saw base64 text
+         instead of the image; /v1/chat/completions answered the same image
+         correctly.  Keep image turns on the streaming path; text turns stay on
+         the Runs API (stop / steer / approval). */
+      const provider = image
+        ? "llm"
+        : resolveModeProvider(activeMode, activeModeMeta);
+
+      clearAttachment();
+      try {
+        await sendMessage(text, {
+          mode: modeSlug,
+          provider,
+          timeWindowStart: twStart,
+          timeWindowEnd: twEnd,
+          model: isGeneralMode ? selectedModel || undefined : undefined,
+        });
+      } finally {
+        if (image) clearStagedChatImages();
+      }
     },
     [
       activeMode,
@@ -614,6 +683,7 @@ export const ChatPanel: FC = () => {
       rcaTimeEnd,
       attachedContent,
       attachedFile,
+      attachedImage,
       clearAttachment,
       selectedModel,
       sendMessage,
@@ -623,7 +693,6 @@ export const ChatPanel: FC = () => {
   const handleSend = useCallback(async () => {
     if (!input.trim()) return;
     if (isStreaming) {
-      // Mid-run input is a steer instruction, not a new turn.
       if (canSteer) await handleSteer();
       return;
     }
@@ -632,8 +701,7 @@ export const ChatPanel: FC = () => {
     await submitTurn(text);
   }, [input, isStreaming, canSteer, handleSteer, submitTurn]);
 
-  // A steer hit an already-finished run: once the local run settles, send the
-  // queued text as a normal turn.
+  // A steer hit an already-finished run: resend the text as a normal turn.
   useEffect(() => {
     if (isStreaming || !pendingResend) return;
     const text = pendingResend;
@@ -641,34 +709,343 @@ export const ChatPanel: FC = () => {
     void submitTurn(text);
   }, [isStreaming, pendingResend, submitTurn]);
 
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  /* ====================================================================
+   *  Navigation / title / export / clear
+   * ==================================================================== */
 
-  // Auto-resize textarea: 3–5 lines, then scroll
-  const autoResize = useCallback(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    const lineHeight = 24; // matches leading-relaxed text-sm
-    const minH = lineHeight * 3 + 16; // 3 lines + padding
-    const maxH = lineHeight * 5 + 16; // 5 lines + padding
-    el.style.height = `${Math.min(Math.max(el.scrollHeight, minH), maxH)}px`;
+  const resetTransientUi = useCallback(() => {
+    setHiddenIds(new Set());
+    setTitleOverride(null);
+    persistedTitleRef.current = null;
+    prevMessageCountRef.current = 0;
+    nearBottomRef.current = true;
+    setIsNearBottom(true);
+    setHasUnread(false);
   }, []);
 
-  const handleKeyDown = useCallback(
-    (e: KeyboardEvent<HTMLTextAreaElement>) => {
-      // IME composition (pinyin etc.): Enter confirms the candidate, it must
-      // never send the message.
-      if (e.nativeEvent.isComposing) return;
-      if (e.key === "Enter" && !e.shiftKey) {
-        e.preventDefault();
-        handleSend();
+  const handleNewSession = useCallback(() => {
+    clearMessages();
+    setActiveMode("system:general");
+    setPendingResend(null);
+    setApprovalNotice(null);
+    resetTransientUi();
+    if (window.innerWidth < 1024) setSidebarOpen(false);
+  }, [clearMessages, resetTransientUi]);
+
+  const handleLoadSession = useCallback(
+    async (id: number) => {
+      setPendingResend(null);
+      setApprovalNotice(null);
+      setHiddenIds(new Set());
+      const summary = sessions.find((session) => session.id === id);
+      const loadedTitle =
+        summary && summary.message_count > 0 && summary.title.trim()
+          ? summary.title
+          : null;
+      setTitleOverride(loadedTitle);
+      // The stored title is already persisted — do not write it back on load.
+      persistedTitleRef.current = loadedTitle ? `${id}:${loadedTitle}` : null;
+      prevMessageCountRef.current = 0;
+      try {
+        await loadSession(id);
+        nearBottomRef.current = true;
+        setIsNearBottom(true);
+        setHasUnread(false);
+        scrollToBottom();
+      } catch {
+        /* 404 — session disappeared */
       }
+      if (window.innerWidth < 1024) setSidebarOpen(false);
     },
-    [handleSend],
+    [loadSession, scrollToBottom, sessions],
   );
 
-  // Run auto-resize whenever input changes
-  useEffect(() => { autoResize(); }, [input, autoResize]);
+  const handleDeleteSession = useCallback(
+    async (id: number, event: MouseEvent) => {
+      event.stopPropagation();
+      try {
+        await chatHistory.delete(id);
+        if (sessionId === id) {
+          clearMessages();
+          resetTransientUi();
+        }
+        void reloadSessions();
+      } catch {
+        /* already gone */
+      }
+    },
+    [sessionId, clearMessages, reloadSessions, resetTransientUi],
+  );
+
+  const derivedTitle = useMemo(() => titleFromMessages(messages), [messages]);
+  const displayTitle = titleOverride || derivedTitle;
+
+  const handleRename = useCallback(
+    (next: string) => {
+      const value = next.trim();
+      setTitleOverride(value || null);
+      if (sessionId && value) {
+        setSessions((previous) =>
+          previous.map((session) =>
+            session.id === sessionId ? { ...session, title: value } : session,
+          ),
+        );
+      }
+    },
+    [sessionId],
+  );
+
+  // Persist a custom title once the turn is idle (avoids racing the transcript
+  // auto-save); the request only updates the title — messages are untouched.
+  useEffect(() => {
+    if (!sessionId || !titleOverride || isStreaming) return;
+    const key = `${sessionId}:${titleOverride}`;
+    if (persistedTitleRef.current === key) return;
+    persistedTitleRef.current = key;
+    const timer = window.setTimeout(() => {
+      void updateSessionTitle(sessionId, titleOverride).catch(() => {
+        persistedTitleRef.current = null;
+      });
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [sessionId, titleOverride, isStreaming]);
+
+  const handleConfirmClear = useCallback(() => {
+    clearMessages();
+    setClearOpen(false);
+    setPendingResend(null);
+    setApprovalNotice(null);
+    resetTransientUi();
+  }, [clearMessages, resetTransientUi]);
+
+  const handleExport = useCallback(() => {
+    const visible = messages.filter(
+      (message) => message.role !== "error" && !hiddenIds.has(message.id),
+    );
+    if (visible.length === 0) return;
+
+    const lines: string[] = [
+      `# ${displayTitle}`,
+      "",
+      `> 导出时间：${new Date().toLocaleString("zh-CN")}`,
+      "",
+    ];
+    for (const message of visible) {
+      if (message.role === "user") {
+        lines.push("## 用户", "", message.content, "");
+      } else if (message.role === "assistant") {
+        if (message.reasoning) {
+          lines.push(
+            "<details><summary>思考过程</summary>",
+            "",
+            message.reasoning,
+            "",
+            "</details>",
+            "",
+          );
+        }
+        if (message.content) lines.push("## 助手", "", message.content, "");
+      } else if (message.role === "tool") {
+        const tool = message.toolCalls?.[0];
+        const name = tool?.function?.name || message.content || "tool";
+        const args = tool?.function?.arguments?.trim();
+        lines.push(`<details><summary>工具 · ${name}</summary>`, "");
+        if (args) {
+          const language = (() => {
+            try {
+              JSON.parse(args);
+              return "json";
+            } catch {
+              return "text";
+            }
+          })();
+          lines.push("```" + language, args, "```");
+        }
+        lines.push("</details>", "");
+      }
+    }
+
+    const blob = new Blob([lines.join("\n")], {
+      type: "text/markdown;charset=utf-8",
+    });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${safeFilename(displayTitle)}.md`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+    toast.success("已导出 Markdown");
+  }, [messages, hiddenIds, displayTitle]);
+
+  /* ====================================================================
+   *  Edit / regenerate / retry (UI-only branching)
+   * ==================================================================== */
+
+  const hideFromIndex = useCallback(
+    (index: number) => {
+      if (index < 0) return;
+      setHiddenIds((previous) => {
+        const next = new Set(previous);
+        for (let cursor = index; cursor < messages.length; cursor += 1) {
+          next.add(messages[cursor].id);
+        }
+        return next;
+      });
+    },
+    [messages],
+  );
+
+  const handleEditResend = useCallback(
+    (messageId: string, text: string) => {
+      if (isStreaming) return;
+      const index = messages.findIndex((message) => message.id === messageId);
+      if (index < 0) return;
+      hideFromIndex(index);
+      void submitTurn(text);
+    },
+    [isStreaming, messages, hideFromIndex, submitTurn],
+  );
+
+  const handleRegenerate = useCallback(
+    (assistantMessageId: string) => {
+      if (isStreaming) return;
+      const index = messages.findIndex((message) => message.id === assistantMessageId);
+      if (index < 0) return;
+      let userIndex = -1;
+      for (let cursor = index; cursor >= 0; cursor -= 1) {
+        if (messages[cursor].role === "user") {
+          userIndex = cursor;
+          break;
+        }
+      }
+      if (userIndex < 0) return;
+      const prompt = messages[userIndex].content;
+      hideFromIndex(userIndex);
+      void submitTurn(prompt);
+    },
+    [isStreaming, messages, hideFromIndex, submitTurn],
+  );
+
+  const handleRetry = useCallback(() => {
+    if (isStreaming) return;
+    let userIndex = -1;
+    for (let cursor = messages.length - 1; cursor >= 0; cursor -= 1) {
+      if (messages[cursor].role === "user") {
+        userIndex = cursor;
+        break;
+      }
+    }
+    if (userIndex < 0) return;
+    const prompt = messages[userIndex].content;
+    hideFromIndex(userIndex);
+    void submitTurn(prompt);
+  }, [isStreaming, messages, hideFromIndex, submitTurn]);
+
+  /* ====================================================================
+   *  Derived UI values
+   * ==================================================================== */
+
+  const activeModeSlug = activeMode ?? "system:general";
+  /* Attachment (text inline + image parts) is available in every mode — agent
+     modes included. Attachments are converted server-side per mode cap. */
+  const supportsAttachment = true;
+  const isRcaMode = activeModeSlug === "system:rca";
+
+  const effectiveMode = useMemo(
+    () => modes.find((mode) => mode.slug === activeModeSlug),
+    [modes, activeModeSlug],
+  );
+
+  const modeLabel = effectiveMode?.name ?? "通用";
+  const modeIconNode = useMemo(() => {
+    if (!effectiveMode) return <MessageCircle className="h-3 w-3" />;
+    if (effectiveMode.slug.startsWith("user:")) {
+      const icon = (effectiveMode.config as { icon?: string } | undefined)?.icon;
+      return <span className="text-[10px] leading-none">{icon || "🤖"}</span>;
+    }
+    const systemSlug = effectiveMode.slug.replace("system:", "");
+    const Icon = MODE_ICONS[systemSlug] || MessageCircle;
+    return <Icon className="h-3 w-3" />;
+  }, [effectiveMode]);
+
+  /* The badge always mirrors the live selection: engine modes (Hermes-backed
+     assistants) show their engine, LLM modes show the picked model. */
+  const provider = resolveModeProvider(activeMode, effectiveMode);
+  const engineMode = provider !== "llm";
+  const engineName = providerLabel(provider);
+  const modelLabel = engineMode ? engineName : selectedModel || "默认模型";
+  const modelHint = engineMode
+    ? `引擎：${engineName}（由 ${modeLabel} 调用）`
+    : selectedModel
+      ? `模型：${selectedModel}`
+      : "模型：默认模型（未指定时由服务端决定）";
+  const modeHint = engineMode
+    ? `模式：${modeLabel} · 引擎：${engineName}`
+    : `模式：${modeLabel} · ${modelHint}`;
+
+  const errorText =
+    error ??
+    [...messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.role === "error" && !hiddenIds.has(message.id),
+      )?.content ??
+    null;
+  const canRetry = !isStreaming && messages.some((message) => message.role === "user");
+
+  const isEmpty = messages.length === 0;
+
+  const handleSuggestion = useCallback((text: string) => {
+    setInput(text);
+    requestAnimationFrame(() => {
+      const editor = textareaRef.current;
+      if (!editor) return;
+      editor.focus();
+      editor.selectionStart = editor.value.length;
+      editor.selectionEnd = editor.value.length;
+    });
+  }, []);
+
+  const handleSelectMode = useCallback((slug: string) => {
+    /* Clicking the already-active mode keeps it selected: clearing it to
+       ``null`` used to fall through to Hermes while the header still said 通用. */
+    setActiveMode(slug);
+  }, []);
+
+  const handleOpenCreate = useCallback(() => {
+    setEditMode(null);
+    setCmName("");
+    setCmPrompt("");
+    setCmIcon("🤖");
+    setCmProvider("llm");
+    setShowCreate(true);
+  }, []);
+
+  const handleEditMode = useCallback((mode: ChatModeOut) => {
+    const config = (mode.config ?? {}) as { icon?: string; provider?: string };
+    setEditMode(mode);
+    setCmName(mode.name);
+    setCmPrompt(mode.system_prompt);
+    setCmIcon(config.icon || "🤖");
+    setCmProvider(config.provider || "llm");
+    setShowCreate(true);
+  }, []);
+
+  const handleDeleteMode = useCallback(async (mode: ChatModeOut) => {
+    const id = Number.parseInt(mode.slug.split(":")[1] ?? "", 10);
+    if (!Number.isFinite(id)) return;
+    try {
+      await chatModes.deleteUserMode(id);
+      if (activeMode === mode.slug) setActiveMode("system:general");
+      chatModes.list().then(setModes).catch(() => {});
+      toast.success("已删除智能助理");
+    } catch {
+      toast.error("删除失败，请重试");
+    }
+  }, [activeMode]);
 
   const applyRcaPreset = useCallback((preset: string) => {
     setRcaPreset(preset);
@@ -682,577 +1059,262 @@ export const ChatPanel: FC = () => {
     }
   }, []);
 
-  const handleNewSession = useCallback(() => {
-    clearMessages();
-    setActiveMode(null);
-    // Anything queued for the previous run must not leak into a new chat.
-    setPendingResend(null);
-    setApprovalNotice(null);
-    // The welcome text is already loaded for this mount (and cached in
-    // sessionStorage for later mounts) — never request it again (P1-17).
-    nearBottomRef.current = true;
-    setIsNearBottom(true);
-    setHasUnread(false);
-  }, [clearMessages]);
+  /* ====================================================================
+   *  Render
+   * ==================================================================== */
 
-  const handleLoadSession = useCallback(
-    async (id: number) => {
-      // Switching chats abandons any queued steer fallback.
-      setPendingResend(null);
-      setApprovalNotice(null);
-      try {
-        await loadSession(id);
-        // Restored transcripts should open at the newest message.
-        nearBottomRef.current = true;
-        setIsNearBottom(true);
-        setHasUnread(false);
-        scrollToBottom();
-      } catch { /* 404 */ }
-    },
-    [loadSession, scrollToBottom],
-  );
-
-  const handleDeleteSession = useCallback(
-    async (id: number, e: React.MouseEvent) => {
-      e.stopPropagation();
-      try {
-        await chatHistory.delete(id);
-        if (sessionId === id) clearMessages();
-        reloadSessions();
-      } catch { /* ok */ }
-    },
-    [sessionId, clearMessages, reloadSessions],
-  );
-
-  /* ── Sidebar content ─────────────────────────────────── */
-  const sidebarContent = (
-    <div className={cn(
-      "shrink-0 border-r border-border flex flex-col transition-all duration-200 overflow-hidden",
-      sidebarOpen ? "w-[260px]" : "w-[52px]",
-    )}>
-      {/* Sidebar header — toggle + new session */}
-      <div className="shrink-0 px-3 py-2.5 flex items-center gap-1">
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => setSidebarOpen((v) => !v)}
-          aria-label={sidebarOpen ? "收起侧栏" : "展开侧栏"}
-        >
-          <PanelLeft className={cn("h-4 w-4 transition-transform", !sidebarOpen && "rotate-180")} />
-        </Button>
-        {sidebarOpen && (
-          <button
-            type="button"
-            onClick={handleNewSession}
-            className="flex items-center gap-2.5 flex-1 rounded-lg px-2.5 py-2 text-[13px] text-text-secondary hover:bg-black/5 transition-colors"
-          >
-            <Plus className="h-4 w-4" />
-            <span>新对话</span>
-          </button>
-        )}
-      </div>
-
-      {/* Session list */}
-      <div className="flex-1 min-h-0">
-        <ScrollArea className="h-full">
-          <div className="px-2 pb-2">
-            {sessions.length === 0 ? (
-              <p className="text-xs text-muted-foreground py-6 text-center">
-                暂无对话历史
-              </p>
-            ) : (
-              sessions.map((s) => (
-                <div
-                  key={s.id}
-                  className={cn(
-                    "group flex items-start rounded-lg px-3 py-2.5 cursor-pointer transition-colors",
-                    sessionId === s.id
-                      ? "bg-interactive-primary/8"
-                      : "hover:bg-black/[0.04]",
-                  )}
-                  onClick={() => handleLoadSession(s.id)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") handleLoadSession(s.id);
-                  }}
-                >
-                  {/* Text area */}
-                  <div className="flex-1 min-w-0">
-                    <p
-                      className={cn(
-                        "text-[13px] leading-snug truncate",
-                        sessionId === s.id
-                          ? "text-text-primary font-medium"
-                          : "text-text-secondary",
-                      )}
-                    >
-                      {s.title}
-                    </p>
-                    <p className="text-[11px] text-muted-foreground/60 mt-0.5">
-                      {relativeTime(s.updated_at)}
-                    </p>
-                  </div>
-                  {/* Delete button */}
-                  <button
-                    type="button"
-                    className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-status-active/10 text-muted-foreground hover:text-status-active transition-all shrink-0 ml-1 mt-0.5"
-                    onClick={(e) => handleDeleteSession(s.id, e)}
-                    aria-label={`删除 ${s.title}`}
-                  >
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              ))
-            )}
-          </div>
-        </ScrollArea>
-      </div>
-    </div>
-  );
-
-  /* ── Main content ────────────────────────────────────── */
   return (
-    <div className="flex flex-row h-full bg-surface-primary">
-      {sidebarContent}
+    <div className="relative flex h-full min-h-0 overflow-hidden bg-surface-primary">
+      <ChatSidebar
+        sessions={sessions}
+        sessionId={sessionId}
+        open={sidebarOpen}
+        onToggle={() => setSidebarOpen((value) => !value)}
+        onNewSession={handleNewSession}
+        onLoadSession={handleLoadSession}
+        onDeleteSession={handleDeleteSession}
+      />
 
-      {/* Chat area — subtle gradient depth */}
-      <div className="flex-1 flex flex-col min-w-0 max-w-[48rem] mx-auto w-full"
-        style={{ background: "radial-gradient(ellipse at 50% 80%, rgba(59,130,246,0.04) 0%, transparent 60%)" }}>
-        {/* Top bar — minimal spacer */}
-        <div className="shrink-0 h-2" />
+      <div className="relative flex min-w-0 flex-1 flex-col">
+        <ChatHeader
+          title={displayTitle}
+          modeLabel={modeLabel}
+          modeIcon={modeIconNode}
+          modeHint={modeHint}
+          modelLabel={modelLabel}
+          modelHint={modelHint}
+          isStreaming={isStreaming}
+          hasMessages={messages.length > 0}
+          sidebarOpen={sidebarOpen}
+          onToggleSidebar={() => setSidebarOpen((value) => !value)}
+          onRename={handleRename}
+          onClear={() => setClearOpen(true)}
+          onExport={handleExport}
+        />
 
-        {/* Messages — flex-1 when chatting, auto-height when empty */}
-        <div
-          ref={messagesRootRef}
-          className={cn(
-            "relative",
-            messages.length === 0 ? "shrink-0" : "flex-1 min-h-0",
-          )}
-        >
-          <ScrollArea className="h-full">
-            <div
-              className="flex flex-col gap-4 px-4 py-2"
-            >
-              {messages.map((msg) => (
-                <ChatMessage key={msg.id} message={msg} />
-              ))}
-              {error && (
-                <div className="text-xs text-status-active bg-status-active/5 rounded-lg px-3 py-2 border border-status-active/10">
-                  {error}
-                </div>
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <div
+            ref={scrollRef}
+            onScroll={handleViewportScroll}
+            className="chat-thin-scroll min-h-0 flex-1 overflow-y-auto overscroll-contain"
+          >
+            <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col px-4 pb-7 pt-5 sm:px-6 sm:pt-7">
+              {isEmpty ? (
+                <EmptyState
+                  welcomeText={welcomeText}
+                  welcomeLoading={welcomeLoading}
+                  welcomeTyping={welcomeTyping}
+                  onSuggestion={handleSuggestion}
+                />
+              ) : (
+                <MessageList
+                  messages={messages}
+                  hiddenIds={hiddenIds}
+                  errorText={errorText}
+                  isStreaming={isStreaming}
+                  canRetry={canRetry}
+                  sessionId={sessionId}
+                  onRetry={handleRetry}
+                  onRegenerate={handleRegenerate}
+                  onEditResend={handleEditResend}
+                />
               )}
             </div>
-          </ScrollArea>
+          </div>
 
-          {/* 回到底部 — appears only after the user scrolled up and missed content */}
-          {messages.length > 0 && hasUnread && !isNearBottom && (
+          {!isNearBottom && messages.length > 0 && (
             <button
               type="button"
               onClick={handleScrollToBottom}
-              className="absolute bottom-3 right-5 z-10 flex items-center gap-1 rounded-full bg-white/95 px-3 py-1.5 text-[11px] font-medium text-text-secondary shadow-lg ring-1 ring-black/[0.06] backdrop-blur transition-all duration-150 hover:text-text-primary hover:shadow-xl"
+              className={cn(
+                "absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1 rounded-full border border-border/70 bg-surface-primary/95 px-3 py-1.5 text-[11px] font-medium text-text-secondary shadow-lg backdrop-blur transition-all duration-150 hover:text-text-primary",
+                hasUnread && "border-interactive-primary/30 ring-2 ring-interactive-primary/10",
+              )}
               aria-label="回到底部"
               title="回到底部"
             >
-              <ArrowDown className="h-3.5 w-3.5" />
+              <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
               回到底部
+              {hasUnread && (
+                <span
+                  className="ml-0.5 h-1.5 w-1.5 rounded-full bg-interactive-primary"
+                  aria-hidden="true"
+                />
+              )}
             </button>
           )}
         </div>
 
-        {/* ── Unified input area — centered when empty, bottom when chatting ── */}
-        <div
-          className={cn(
-            "px-4 pb-4 pt-2 transition-all duration-500 ease-out",
-            messages.length === 0
-              ? "flex-1 flex flex-col justify-center items-center pb-16"
-              : "shrink-0",
-          )}
-        >
-          <div className="w-full max-w-[48rem] mx-auto space-y-4">
-            {/* Welcome — logo + tagline centered above input */}
-            {messages.length === 0 && (
-              <div className="flex flex-col items-center text-center pb-1">
-                {/* Logo with pulsing glow ring */}
-                <div className="relative mb-5">
-                  <div className="absolute inset-0 rounded-full bg-interactive-primary/20 blur-2xl scale-150 animate-pulse" />
-                  <div className="absolute -inset-2 rounded-full border border-interactive-primary/20 animate-ping [animation-duration:3s]" />
-                  <LiumaiLogo size={48} className="text-interactive-primary relative" />
-                </div>
-
-                {/* Gradient title */}
-                <h2 className="text-[22px] font-bold bg-gradient-to-r from-blue-600 via-indigo-600 to-purple-600 bg-clip-text text-transparent mb-2">
-                  运维智能助手
-                </h2>
-
-                {/* Welcome text area */}
-                <div className="min-h-[60px] max-w-[420px] mb-3">
-                  {welcomeLoading ? (
-                    /* ── Shimmer loading ──────────────────── */
-                    <div className="space-y-2">
-                      <div className="h-3.5 bg-gradient-to-r from-muted-foreground/10 via-muted-foreground/20 to-muted-foreground/10 rounded-full w-64 mx-auto animate-pulse bg-[length:200%_100%]" />
-                      <div className="h-3.5 bg-gradient-to-r from-muted-foreground/10 via-muted-foreground/20 to-muted-foreground/10 rounded-full w-48 mx-auto animate-pulse bg-[length:200%_100%]" />
-                      <p className="text-[11px] text-muted-foreground/50 mt-1">
-                        <span className="inline-block animate-bounce [animation-delay:0ms]">●</span>
-                        <span className="inline-block animate-bounce [animation-delay:150ms] ml-1">●</span>
-                        <span className="inline-block animate-bounce [animation-delay:300ms] ml-1">●</span>
-                      </p>
-                    </div>
-                  ) : (
-                    /* ── Welcome text (typewriter or fallback) ── */
-                    <p className="text-[13px] leading-relaxed text-muted-foreground">
-                      {welcomeText}
-                      {welcomeTyping && (
-                        <span className="inline-block w-0.5 h-4 bg-interactive-primary ml-0.5 align-middle animate-pulse" />
-                      )}
-                    </p>
-                  )}
-                </div>
-
-                {/* Quick suggestion hints */}
-                {!welcomeLoading && (
-                  <div className="flex flex-wrap justify-center gap-1.5">
-                    {["系统健康检查", "最近告警分析", "帮我排查故障"].map((hint) => (
-                      <button key={hint} type="button"
-                        onClick={() => { setInput(hint); }}
-                        className="text-[11px] px-2.5 py-1 rounded-full border border-border/60 text-muted-foreground hover:text-text-primary hover:border-interactive-primary/30 hover:bg-interactive-primary/5 transition-all duration-200">
-                        {hint}
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Mode extensions — shown above input card */}
-            {activeMode === "system:rca" && (
-              <div className="flex items-center gap-1.5 bg-white/60 backdrop-blur rounded-xl px-2 py-1.5 self-center border border-border/30 shadow-sm">
-                <Clock className="h-3 w-3 text-muted-foreground" />
-                {[["none","自定义"],["15m","15分钟"],["1h","1小时"],["4h","4小时"],["24h","24小时"]].map(([val, label]) => (
-                  <button key={val} type="button" onClick={() => applyRcaPreset(val)} className={cn("px-2 py-0.5 rounded-full text-[11px] transition-colors", rcaPreset === val ? "bg-interactive-primary/10 text-interactive-primary font-medium" : "text-muted-foreground hover:text-text-secondary")}>{label}</button>
-                ))}
-                {rcaPreset === "none" && (<><input type="datetime-local" value={rcaTimeStart} onChange={(e) => setRcaTimeStart(e.target.value)} className="h-7 rounded-lg border border-border/50 bg-white px-2 text-[11px]" /><span className="text-[11px] text-muted-foreground">→</span><input type="datetime-local" value={rcaTimeEnd} onChange={(e) => setRcaTimeEnd(e.target.value)} className="h-7 rounded-lg border border-border/50 bg-white px-2 text-[11px]" /></>)}
-              </div>
-            )}
-            {/* Attached file badge */}
-            {attachedFile && !converting && (activeMode === "system:general" || activeMode?.startsWith("user:")) && (
-              <div className="flex items-center gap-2 self-center bg-white/80 backdrop-blur rounded-lg px-3 py-1 border border-border/30 shadow-sm text-[12px]">
-                <FileText className="h-3 w-3 text-muted-foreground" />{attachedFile.name}
-                <button type="button" onClick={clearAttachment} className="text-muted-foreground hover:text-status-active"><X className="h-3 w-3" /></button>
-              </div>
-            )}
-
-            {/* ── Tool approval prompt (Runs API) ──
-                Only rendered when the probed backend supports approval
-                responses; old Hermes / failed probes stay hidden. */}
-            {runCapabilities.approval && pendingApproval && (
-              <div
-                className="rounded-xl border border-amber-300/60 bg-amber-50/90 px-3 py-2 shadow-sm space-y-2"
-                role="alertdialog"
-                aria-label="工具调用审批"
-              >
-                <div className="flex items-start gap-2">
-                  <ShieldAlert className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
-                  <div className="min-w-0 flex-1">
-                    <p className="text-[12px] font-medium text-amber-900">
-                      工具调用需要审批
-                      {pendingApproval.tool && (
-                        <>
-                          {" · "}
-                          <span className="font-mono text-[11px]">
-                            {pendingApproval.tool}
-                          </span>
-                        </>
-                      )}
-                    </p>
-                    {pendingApproval.description && (
-                      <p className="mt-0.5 text-[11px] leading-snug text-amber-800/90 break-words">
-                        {pendingApproval.description}
-                      </p>
-                    )}
-                    {pendingApproval.command && (
-                      <pre className="mt-1 max-h-28 overflow-auto rounded bg-white/70 px-2 py-1 text-[11px] leading-snug text-text-secondary whitespace-pre-wrap break-all">
-                        {pendingApproval.command}
-                      </pre>
-                    )}
-                  </div>
-                </div>
-                <div className="flex flex-wrap justify-end gap-1.5">
-                  {APPROVAL_ACTIONS.map(({ decision, label }) => (
-                    <button
-                      key={decision}
-                      type="button"
-                      onClick={() => { void handleApprovalResponse(decision); }}
-                      className={cn(
-                        "px-2.5 py-1 rounded-full text-[11px] font-medium transition-colors",
-                        decision === "deny"
-                          ? "bg-status-active/10 text-status-active hover:bg-status-active/20"
-                          : "bg-interactive-primary/10 text-interactive-primary hover:bg-interactive-primary/20",
-                      )}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Outcome of the last approval decision ("正在提交…" / "已响应"). */}
-            {runCapabilities.approval && !pendingApproval && approvalNotice && (
-              <div
-                className="ml-auto flex w-fit items-center gap-1.5 px-1 text-[11px] text-status-resolved"
-                role="status"
-                aria-live="polite"
-              >
-                {approvalNotice.startsWith("正在") ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                ) : (
-                  <Check className="h-3 w-3" />
-                )}
-                {approvalNotice}
-              </div>
-            )}
-
-            {/* ── Input card ── */}
-            <div className="rounded-2xl bg-white shadow-lg ring-1 ring-black/[0.04] overflow-hidden transition-all duration-200 focus-within:shadow-xl">
-              {/* Tab bar — underline style.  Narrow viewports scroll
-                  horizontally instead of wrapping labels into a vertical stack. */}
-              {modes.length > 0 && (
-                <div className="flex items-center gap-0 px-3 pt-2.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-                  {modes.map((m) => {
-                    const isUser = m.slug.startsWith("user:");
-                    const slug = m.slug;
-                    const systemSlug = slug.startsWith("system:") ? slug.replace("system:", "") : slug;
-                    const Icon = modeIcons[systemSlug] || MessageCircle;
-                    const isActive = activeMode === slug || (!activeMode && slug === "system:general");
-                    const config = m.config || {};
-                    const userIcon = (config as any)?.icon || "🤖";
-                    const provider = (config as any)?.provider || (slug.startsWith("system:") ? "hermes" : "llm");
-                    const needsHermes = provider === "hermes" || (!isUser && !(config as any)?.provider && slug !== "system:general");
-                    const disabled = needsHermes && !hermesOnline;
-
-                    return (
-                      <div key={slug} className="relative group flex items-center shrink-0">
-                        <button
-                          type="button"
-                          disabled={disabled}
-                          onClick={() => { if (!disabled) setActiveMode(isActive ? null : slug); }}
-                          title={disabled ? "Hermes 服务不可用" : undefined}
-                          className={cn(
-                            "relative flex shrink-0 items-center gap-1.5 whitespace-nowrap px-2.5 py-2 text-[12px] font-medium transition-colors duration-200",
-                            disabled ? "opacity-35 cursor-not-allowed" : "",
-                            isActive && !disabled ? "text-text-primary" : disabled ? "text-muted-foreground/40" : "text-muted-foreground/60 hover:text-text-secondary",
-                          )}
-                        >
-                          {isUser ? <span className="text-sm leading-none">{userIcon}</span> : <Icon className="h-3 w-3" />}
-                          {m.name}
-                          {disabled && <span className="text-[9px] opacity-60">⚠</span>}
-                          {isActive && !disabled && <span className="absolute bottom-0 left-1/2 -translate-x-1/2 w-2/3 h-[2px] rounded-full bg-text-primary/80" />}
-                        </button>
-                        {/* Edit/delete for user modes */}
-                        {isUser && (
-                          <div className="hidden group-hover:flex absolute -top-1 -right-1 gap-0.5">
-                            <button type="button" onClick={(e) => { e.stopPropagation();
-                              const id = parseInt(slug.split(":")[1]);
-                              setEditMode(m); setCmName(m.name); setCmPrompt(m.system_prompt);
-                              setCmIcon(userIcon); setCmProvider((config as any)?.provider || "llm");
-                              setShowCreate(true);
-                            }} className="h-4 w-4 rounded-full bg-surface-tertiary flex items-center justify-center text-[8px] hover:bg-surface-primary">✎</button>
-                            <button type="button" onClick={async (e) => { e.stopPropagation();
-                              const id = parseInt(slug.split(":")[1]);
-                              await chatModes.deleteUserMode(id);
-                              chatModes.list().then(setModes).catch(() => {});
-                            }} className="h-4 w-4 rounded-full bg-surface-tertiary flex items-center justify-center text-[8px] hover:bg-surface-primary">✕</button>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                  {/* + button */}
-                  <button type="button" onClick={() => { setEditMode(null); setCmName(""); setCmPrompt(""); setCmIcon("🤖"); setCmProvider("llm"); setShowCreate(true); }}
-                    className="flex items-center justify-center h-6 w-6 rounded-md text-muted-foreground/40 hover:text-text-secondary hover:bg-black/[0.03] transition-colors ml-1">
-                    <Plus className="h-3.5 w-3.5" />
-                  </button>
-                  {/* Hermes health indicator */}
-                  <span className={cn("ml-1.5 flex items-center gap-1 text-[10px]", hermesOnline ? "text-muted-foreground/30" : "text-status-active")} title={hermesOnline ? "Hermes 在线" : "Hermes 离线"}>
-                    <span className={cn("h-1.5 w-1.5 rounded-full", hermesOnline ? "bg-status-resolved" : "bg-status-active animate-pulse")} />
-                    {hermesOnline ? "" : "离线"}
-                  </span>
-                </div>
-              )}
-
-              {/* Textarea with bottom bar */}
-              <div className="relative flex flex-col">
-                <textarea
-                  ref={textareaRef}
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder={
-                    isStreaming
-                      ? canSteer
-                        ? "运行中… 可输入补充指令（Enter 发送），点 ■ 停止运行"
-                        : "等待回复中…"
-                    : activeMode === "system:general" ? "通用模型智能问答，支持多格式文档上传… Enter 发送，Shift+Enter 换行"
-                    : activeMode === "system:default" ? "智能运维助理，具备工具调用与自主执行能力… Enter 发送，Shift+Enter 换行"
-                    : activeMode === "system:knowledge" ? "遵循 LLM-WIKI V2 协议，从知识库进行知识检索与问答… Enter 发送，Shift+Enter 换行"
-                    : activeMode === "system:rca" ? "故障根因分析，输入服务名称和时间窗口… Enter 发送，Shift+Enter 换行"
-                    : activeMode?.startsWith("user:") ? `与 ${cmName || "自定义助理"} 对话… Enter 发送，Shift+Enter 换行`
-                    : "输入消息，Enter 发送，Shift+Enter 换行"
-                  }
-                  disabled={isStreaming && !canSteer}
-                  rows={1}
-                  className="w-full bg-transparent pl-5 pr-5 py-3.5 text-[14px] text-text-primary placeholder:text-muted-foreground/35 disabled:opacity-40 resize-none leading-relaxed outline-none focus-visible:outline-0"
-                  style={{ minHeight: "52px" }}
-                  aria-label="聊天输入"
-                />
-
-                {/* Bottom bar */}
-                <div className="flex items-center justify-between px-3 pb-3 gap-2">
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    {/* Run indicator — the stop button on the right interrupts
-                        the same run (POST /runs/{id}/stop when supported). */}
-                    {isStreaming && (
-                      <span
-                        className="inline-flex min-w-0 items-center gap-1 rounded-full bg-interactive-primary/8 px-2 py-0.5 text-[10px] font-medium text-interactive-primary"
-                        role="status"
-                        aria-live="polite"
-                        title={activeRunId ? `运行中：${activeRunId}` : "正在执行"}
-                      >
-                        <Loader2 className="h-2.5 w-2.5 shrink-0 animate-spin" />
-                        <span className="truncate max-w-[170px]">
-                          {activeRunId ? `执行中 · ${activeRunId}` : "执行中"}
-                        </span>
-                      </span>
-                    )}
-                    {(activeMode === "system:general" || activeMode?.startsWith("user:")) && (
-                      <>
-                        <input ref={fileInputRef} type="file" onChange={handleFileSelect} className="hidden"
-                          accept=".pdf,.docx,.pptx,.xlsx,.xls,.epub,.html,.csv,.json,.xml,.ipynb,.jpg,.jpeg,.png,.gif,.bmp,.tiff,.zip,.txt,.md,.py,.js,.ts,.log,.sql,.yaml,.yml,.ini,.cfg,.css,.rss" />
-                        <button type="button" onClick={() => fileInputRef.current?.click()} disabled={converting}
-                          className="flex items-center justify-center h-7 w-7 rounded-lg text-muted-foreground/50 hover:text-muted-foreground hover:bg-black/[0.03] transition-all disabled:opacity-50"
-                          title="上传文档">
-                          {converting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-4 w-4" />}
-                        </button>
-                      </>
-                    )}
-                    {(activeMode === "system:general" || activeMode?.startsWith("user:")) && availableModels.length > 0 && (
-                      <select value={selectedModel} onChange={(e) => setSelectedModel(e.target.value)}
-                        title="选择模型（默认跟随后台配置）"
-                        className="h-7 rounded-lg border-0 bg-transparent px-1.5 text-[11px] text-muted-foreground/60 focus:outline-none cursor-pointer max-w-[130px] truncate hover:text-text-secondary">
-                        {/* Never render a blank <select>: "" means the backend's
-                            configured default model is used (P1-14). */}
-                        <option value="">默认模型</option>
-                        {availableModels.map((m) => (
-                          <option key={m.id} value={m.id}>{m.id}</option>
-                        ))}
-                      </select>
-                    )}
-                  </div>
-
-                  {isStreaming ? (
-                    <div className="flex items-center gap-1.5 shrink-0">
-                      {canSteer && (
-                        <button
-                          onClick={handleSteer}
-                          disabled={!input.trim()}
-                          className={cn(
-                            "flex items-center justify-center h-8 w-8 rounded-full transition-all duration-200",
-                            input.trim()
-                              ? "bg-interactive-primary text-white shadow-md shadow-black/10 hover:bg-interactive-primary/90"
-                              : "bg-black/[0.04] text-muted-foreground/30 cursor-not-allowed",
-                          )}
-                          aria-label="发送补充指令"
-                          title="发送补充指令（Steer）"
-                        >
-                          <Send className="h-3.5 w-3.5" />
-                        </button>
-                      )}
-                      <button
-                        onClick={stopStreaming}
-                        className="flex items-center justify-center h-8 w-8 rounded-full transition-all duration-200 shrink-0 bg-text-primary text-white shadow-md shadow-black/10 hover:bg-text-primary/90 hover:shadow-lg"
-                        aria-label="停止生成"
-                        title="停止生成"
-                      >
-                        <Square className="h-3 w-3 fill-current" />
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      onClick={handleSend}
-                      disabled={!input.trim()}
-                      className={cn(
-                        "flex items-center justify-center h-8 w-8 rounded-full transition-all duration-200 shrink-0",
-                        input.trim()
-                          ? "bg-text-primary text-white shadow-md shadow-black/10 hover:bg-text-primary/90 hover:shadow-lg hover:scale-[1.04]"
-                          : "bg-black/[0.04] text-muted-foreground/30 cursor-not-allowed",
-                      )}
-                      aria-label="发送"
-                    >
-                      <Send className="h-3.5 w-3.5" />
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
+        <div className="shrink-0 border-t border-border/40 bg-surface-primary/95 px-3 pb-3 pt-2.5 backdrop-blur sm:px-6">
+          <div className="mx-auto w-full max-w-3xl">
+            <Composer
+              input={input}
+              setInput={setInput}
+              textareaRef={textareaRef}
+              isStreaming={isStreaming}
+              canSteer={canSteer}
+              activeRunId={activeRunId}
+              onSend={handleSend}
+              onStop={stopStreaming}
+              onSteer={handleSteer}
+              modes={modes}
+              activeMode={activeMode}
+              modeIcons={MODE_ICONS}
+              hermesOnline={hermesOnline}
+              onSelectMode={handleSelectMode}
+              onCreateMode={handleOpenCreate}
+              onEditMode={handleEditMode}
+              onDeleteMode={handleDeleteMode}
+              availableModels={availableModels}
+              selectedModel={selectedModel}
+              onSelectModel={setSelectedModel}
+              supportsAttachment={supportsAttachment}
+              attachedFile={attachedFile}
+              attachedImage={attachedImage}
+              attachedTruncated={attachedTruncated}
+              attachedOriginalChars={attachedOriginalChars}
+              converting={converting}
+              fileInputRef={fileInputRef}
+              onFileSelect={handleFileSelect}
+              onDropFile={(file) => void convertFile(file)}
+              onClearAttachment={clearAttachment}
+              isRcaMode={isRcaMode}
+              rcaPreset={rcaPreset}
+              rcaTimeStart={rcaTimeStart}
+              rcaTimeEnd={rcaTimeEnd}
+              onRcaPreset={applyRcaPreset}
+              onRcaStart={setRcaTimeStart}
+              onRcaEnd={setRcaTimeEnd}
+              approvalsEnabled={runCapabilities.approval}
+              pendingApproval={pendingApproval}
+              approvalNotice={approvalNotice}
+              onApproval={handleApprovalResponse}
+            />
           </div>
         </div>
       </div>
 
-      {/* ── Create/Edit custom assistant dialog ──────────── */}
+      <ConfirmDialog
+        open={clearOpen}
+        onOpenChange={setClearOpen}
+        title="清空当前对话"
+        description="当前页面中的消息将被清空，已保存的历史会话仍会保留。是否继续？"
+        confirmLabel="清空"
+        variant="destructive"
+        onConfirm={handleConfirmClear}
+      />
+
       {showCreate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30" onClick={() => setShowCreate(false)}>
-          <div className="bg-white rounded-2xl shadow-xl p-6 w-full max-w-md mx-4 space-y-4" onClick={e => e.stopPropagation()}>
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4"
+          onClick={() => setShowCreate(false)}
+        >
+          <div
+            className="w-full max-w-md space-y-4 rounded-2xl border border-border bg-surface-primary p-5 shadow-xl"
+            onClick={(event) => event.stopPropagation()}
+          >
             <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold">{editMode ? "编辑助理" : "创建智能助理"}</h3>
-              <button onClick={() => setShowCreate(false)} className="text-muted-foreground hover:text-text-primary"><X className="h-4 w-4" /></button>
+              <h3 className="text-[15px] font-semibold text-text-primary">
+                {editMode ? "编辑智能助理" : "创建智能助理"}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setShowCreate(false)}
+                className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-surface-secondary hover:text-text-primary"
+                aria-label="关闭"
+              >
+                <X className="h-4 w-4" />
+              </button>
             </div>
+
             <div className="space-y-3">
-              {/* Icon picker */}
               <div>
                 <label className="text-[12px] font-medium text-text-secondary">图标</label>
-                <div className="flex gap-1 mt-1 flex-wrap">
-                  {["🤖","🧠","🔧","📊","🛡️","🚀","💡","🎯","⚡","🔍","📝","💬"].map(emoji => (
-                    <button key={emoji} type="button" onClick={() => setCmIcon(emoji)}
-                      className={cn("h-8 w-8 rounded-lg text-lg flex items-center justify-center transition-all", cmIcon === emoji ? "bg-interactive-primary/10 ring-2 ring-interactive-primary/30" : "hover:bg-surface-secondary")}>{emoji}</button>
-                  ))}
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {["🤖", "🧠", "🔧", "📊", "🛡️", "🚀", "💡", "🎯", "⚡", "🔍", "📝", "💬"].map(
+                    (emoji) => (
+                      <button
+                        key={emoji}
+                        type="button"
+                        onClick={() => setCmIcon(emoji)}
+                        className={cn(
+                          "flex h-8 w-8 items-center justify-center rounded-lg text-lg transition-all",
+                          cmIcon === emoji
+                            ? "bg-interactive-primary/10 ring-2 ring-interactive-primary/30"
+                            : "hover:bg-surface-secondary",
+                        )}
+                      >
+                        {emoji}
+                      </button>
+                    ),
+                  )}
                 </div>
               </div>
+
               <div>
                 <label className="text-[12px] font-medium text-text-secondary">名称</label>
-                <Input value={cmName} onChange={e => setCmName(e.target.value)} placeholder="我的助理" className="mt-1" />
+                <Input
+                  value={cmName}
+                  onChange={(event) => setCmName(event.target.value)}
+                  placeholder="我的助理"
+                  className="mt-1"
+                />
               </div>
+
               <div>
                 <label className="text-[12px] font-medium text-text-secondary">引擎</label>
-                <select value={cmProvider} onChange={e => setCmProvider(e.target.value)}
-                  className="mt-1 w-full h-9 rounded-lg border border-border bg-white px-3 text-sm">
-                  <option value="llm">LLM 直连 (通用模型)</option>
-                  <option value="hermes">Hermes (工具调用)</option>
+                <select
+                  value={cmProvider}
+                  onChange={(event) => setCmProvider(event.target.value)}
+                  className="mt-1 h-9 w-full rounded-lg border border-border bg-surface-primary px-3 text-sm text-text-primary outline-none"
+                >
+                  <option value="llm">LLM 直连（通用模型）</option>
+                  <option value="hermes">Hermes（工具调用）</option>
                 </select>
               </div>
+
               <div>
                 <label className="text-[12px] font-medium text-text-secondary">系统提示词</label>
-                <textarea value={cmPrompt} onChange={e => setCmPrompt(e.target.value)} rows={6}
-                  placeholder="你是一个专业的...&#10;设定助理的角色、能力和回复风格"
-                  className="mt-1 w-full rounded-lg border border-border bg-white px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-interactive-primary/25" />
+                <textarea
+                  value={cmPrompt}
+                  onChange={(event) => setCmPrompt(event.target.value)}
+                  rows={6}
+                  placeholder={"你是一个专业的...\n设定助理的角色、能力和回复风格"}
+                  className="chat-thin-scroll mt-1 w-full resize-none rounded-lg border border-border bg-surface-primary px-3 py-2 text-sm text-text-primary outline-none focus:ring-2 focus:ring-interactive-primary/25"
+                />
               </div>
             </div>
+
             <div className="flex justify-end gap-2">
-              <Button variant="outline" onClick={() => setShowCreate(false)}>取消</Button>
-              <Button disabled={!cmName.trim()} onClick={async () => {
-                const data = { name: cmName, system_prompt: cmPrompt, icon: cmIcon, provider: cmProvider };
-                try {
-                  if (editMode) {
-                    const id = parseInt(editMode.slug.split(":")[1]);
-                    await chatModes.updateUserMode(id, data);
-                  } else {
-                    await chatModes.createUserMode(data);
+              <Button variant="outline" onClick={() => setShowCreate(false)}>
+                取消
+              </Button>
+              <Button
+                disabled={!cmName.trim()}
+                onClick={async () => {
+                  const data = {
+                    name: cmName,
+                    system_prompt: cmPrompt,
+                    icon: cmIcon,
+                    provider: cmProvider,
+                  };
+                  try {
+                    if (editMode) {
+                      const id = Number.parseInt(editMode.slug.split(":")[1] ?? "", 10);
+                      await chatModes.updateUserMode(id, data);
+                    } else {
+                      await chatModes.createUserMode(data);
+                    }
+                    toast.success(editMode ? "已更新" : "已创建");
+                    setShowCreate(false);
+                    chatModes.list().then(setModes).catch(() => {});
+                  } catch (err) {
+                    toast.error(err instanceof Error ? err.message : "保存失败");
                   }
-                  toast.success(editMode ? "已更新" : "已创建");
-                  setShowCreate(false);
-                  chatModes.list().then(setModes).catch(() => {});
-                } catch (err: any) { toast.error(err.message || "失败"); }
-              }}>{editMode ? "保存" : "创建"}</Button>
+                }}
+              >
+                {editMode ? "保存" : "创建"}
+              </Button>
             </div>
           </div>
         </div>

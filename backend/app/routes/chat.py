@@ -8,16 +8,22 @@ that the frontend chat panel renders in real time.
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
+import os
+import re
+import secrets
 import time
+from pathlib import Path
 from typing import Any
 
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,11 +59,72 @@ router = APIRouter()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+#: 单条消息 content parts 的载荷上限（base64 图片 + 文本）。
+MAX_CHAT_CONTENT_BYTES = 6 * 1024 * 1024
+
+#: 允许内联的图片 MIME（与 /convert-file 的图片白名单一致）。
+_ALLOWED_IMAGE_MIMES = ("png", "jpeg", "jpg", "webp", "gif")
+
+
+def _part_payload_size(part: dict[str, Any]) -> int:
+    """UTF-8 byte size of the user-visible payload carried by one part."""
+    if part.get("type") == "text":
+        return len(str(part.get("text") or "").encode("utf-8"))
+    image_url = part.get("image_url")
+    url = image_url.get("url") if isinstance(image_url, dict) else image_url
+    return len(str(url or "").encode("utf-8"))
+
+
 class ChatMessageIn(BaseModel):
-    """A single message in the conversation history."""
+    """A single message in the conversation history.
+
+    ``content`` is either a plain string (text-only turn) or an OpenAI-style
+    content-parts array.  Only ``text`` and ``image_url`` parts are accepted —
+    Hermes rejects ``file`` / ``input_file`` parts upstream — and the whole
+    message must stay within :data:`MAX_CHAT_CONTENT_BYTES`.
+    """
 
     role: str = Field(..., pattern="^(system|user|assistant|tool)$")
-    content: str
+    content: str | list[dict[str, Any]]
+
+    @field_validator("content")
+    @classmethod
+    def _validate_content_parts(
+        cls, value: str | list[dict[str, Any]]
+    ) -> str | list[dict[str, Any]]:
+        """Loose shape check on content parts + hard 6MB payload cap."""
+        if isinstance(value, str):
+            return value
+
+        total = 0
+        for part in value:
+            if not isinstance(part, dict):
+                raise ValueError("消息内容格式无效")
+            part_type = part.get("type")
+            if part_type == "text":
+                if not isinstance(part.get("text"), str):
+                    raise ValueError("文本片段格式无效")
+            elif part_type == "image_url":
+                image_url = part.get("image_url")
+                url = image_url.get("url") if isinstance(image_url, dict) else image_url
+                if not isinstance(url, str) or not url:
+                    raise ValueError("图片片段格式无效")
+                lowered = url.lower()
+                if lowered.startswith("data:"):
+                    if not any(
+                        lowered.startswith(f"data:image/{mime};")
+                        for mime in _ALLOWED_IMAGE_MIMES
+                    ):
+                        raise ValueError("仅支持 png/jpeg/webp/gif 图片")
+                elif not lowered.startswith(("http://", "https://")):
+                    raise ValueError("图片链接格式无效")
+            else:
+                raise ValueError("不支持的消息片段类型（仅支持 text / image_url）")
+            total += _part_payload_size(part)
+            if total > MAX_CHAT_CONTENT_BYTES:
+                raise ValueError("消息内容超过 6MB 上限")
+
+        return value
 
 
 class ChatRequest(BaseModel):
@@ -94,6 +161,16 @@ class ChatRequest(BaseModel):
         description=(
             "Hermes agent session to continue. Sent upstream as "
             "X-Hermes-Session-Id so the agent keeps its server-side context."
+        ),
+    )
+    chat_session_id: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Platform chat session (ChatSession.id) this turn belongs to.  It "
+            "scopes agent artifacts to hermes-files/<chat_session_id>/ and is "
+            "echoed back as X-Artifact-Session-Id.  Omit on the very first turn: "
+            "a short random directory is used until the session is saved."
         ),
     )
 
@@ -143,6 +220,118 @@ def _sse_event(event_type: str, data: str) -> str:
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
+# ── Agent artifact (B1) ───────────────────────────────────────────────────────
+#
+# Artifacts live under one directory per platform chat session:
+#   <HERMES_FILES_DIR>/<chat_session_id>/<filename>
+# The download endpoint only serves files from a session directory owned by the
+# caller, so guesses of another user's session id (or the old flat layout) 404.
+
+#: Container-side shared directory (bind-mounted from the host).
+HERMES_FILES_DIR = os.getenv("HERMES_FILES_DIR", "/data/hermes-files")
+#: Host-side path of the same directory, only used inside the prompt.
+HERMES_FILES_HOST_PATH = os.getenv(
+    "HERMES_FILES_HOST_PATH", r"E:\dev\Liumai\hermes-files"
+)
+#: Single downloadable artifact size cap.
+MAX_ARTIFACT_BYTES = 10 * 1024 * 1024
+#: Strict basename whitelist — no separators, no traversal, no spaces.
+_ARTIFACT_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,128}")
+#: Download-path session id: digits only (a real ``ChatSession.id``).
+_ARTIFACT_SESSION_ID_RE = re.compile(r"[0-9]{1,19}")
+
+
+def _artifact_root() -> Path:
+    """Resolved shared artifact directory (host bind mount inside the container)."""
+    return Path(os.getenv("HERMES_FILES_DIR", HERMES_FILES_DIR)).resolve()
+
+
+def _random_artifact_token() -> str:
+    """Short, non-guessable directory token for a turn without a saved session."""
+    return f"art_{secrets.token_hex(4)}"
+
+
+def _artifact_prompt(token: str) -> str:
+    """Artifact convention for one turn, scoped to ``token`` (the session id)."""
+    container_dir = f"{HERMES_FILES_DIR.rstrip('/')}/{token}"
+    host_dir = HERMES_FILES_HOST_PATH.rstrip("/\\") + "\\" + token
+    return (
+        f"本会话 id 为 {token}。需要产出文件时，写入 {container_dir}"
+        f"（宿主路径 {host_dir}），"
+        "并在最终回复中用 [[artifact: 文件名]] 标记。"
+        "文件名只能包含字母、数字、点、下划线、连字符，不得包含目录或路径。"
+    )
+
+
+async def _resolve_artifact_scope(
+    db: AsyncSession,
+    user: User,
+    chat_session_id: int | None,
+) -> tuple[str, str]:
+    """Return ``(directory_token, prompt)`` for this turn.
+
+    A valid platform chat session owned by the caller keys the directory.  When
+    the turn has no saved session yet (or the id is not the caller's), a short
+    random token is used instead so artifacts never land in the shared root.
+    The token is echoed back in the response (header / JSON field).
+    """
+    token: str | None = None
+    if chat_session_id:
+        row = await db.get(ChatSession, chat_session_id)
+        if row is not None and row.user_id == user.id:
+            token = str(row.id)
+        else:
+            logger.warning(
+                "Artifact scope rejected: chat_session_id={} user_id={}",
+                chat_session_id,
+                user.id,
+            )
+
+    root = _artifact_root()
+    if token is None:
+        token = _random_artifact_token()
+
+    directory = root / token
+    try:
+        if directory.is_symlink():
+            # Never write through a symlink that could escape the shared dir.
+            logger.warning("Artifact directory is a symlink, using temp scope: {}", directory)
+            token = _random_artifact_token()
+            directory = root / token
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        logger.warning("Cannot create artifact directory: {}", directory, exc_info=True)
+
+    logger.info(
+        "Artifact scope: chat_session_id={} token={} dir={}",
+        chat_session_id,
+        token,
+        directory,
+    )
+    return token, _artifact_prompt(token)
+
+
+def _append_artifact_prompt(messages: list[dict[str, Any]], prompt: str) -> None:
+    """Append the artifact convention to the system message (or insert one).
+
+    Existing system prompts are never overwritten — the convention is appended
+    at the end so a mode's own instructions stay authoritative and Hermes still
+    sees them verbatim.
+    """
+    for message in messages:
+        if message.get("role") != "system":
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content.append({"type": "text", "text": f"\n\n{prompt}"})
+        elif content:
+            message["content"] = f"{content}\n\n{prompt}"
+        else:
+            message["content"] = prompt
+        return
+    messages.insert(0, {"role": "system", "content": prompt})
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Endpoints
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -178,8 +367,18 @@ async def chat_stream_endpoint(
     hermes = _get_hermes()
 
     # ── Mode-aware system prompt injection ───────────────────────────────
+    # ``content`` may be a string or content-parts array (image inline); it is
+    # forwarded to Hermes verbatim, so parts must not be stringified here.
     messages: list[dict[str, Any]] = [
-        {"role": m.role, "content": m.content} for m in body.messages
+        {
+            "role": m.role,
+            "content": (
+                m.content
+                if isinstance(m.content, str)
+                else [dict(part) for part in m.content]
+            ),
+        }
+        for m in body.messages
     ]
 
     mode: Any = None  # ChatMode or UserChatMode
@@ -223,7 +422,11 @@ async def chat_stream_endpoint(
                         last_user = m
                         break
                 if last_user:
-                    last_user["content"] += tw_info
+                    content = last_user.get("content")
+                    if isinstance(content, list):
+                        content.append({"type": "text", "text": tw_info})
+                    else:
+                        last_user["content"] = f"{content or ''}{tw_info}"
             # RCA mode: lower temperature for deterministic output
             if mode_slug == "rca":
                 body.temperature = 0.3
@@ -231,6 +434,15 @@ async def chat_stream_endpoint(
     # ── LLM direct path (mode with provider=llm) ─────────────────────────
     if mode and mode_config.get("provider") == "llm":
         return await _llm_direct_stream(messages, body, mode, db)
+
+    # ── Agent path: teach Hermes where to write downloadable artifacts ───
+    # Runs on the Hermes path only; direct-LLM modes have no file tools.
+    # The directory is per platform chat session: hermes-files/<session_id>/.
+    artifact_token, artifact_prompt = await _resolve_artifact_scope(
+        db, user, body.chat_session_id
+    )
+    _append_artifact_prompt(messages, artifact_prompt)
+    artifact_headers = {"X-Artifact-Session-Id": artifact_token}
 
     # Guard against empty URL (not yet configured by admin)
     if not hermes.base_url:
@@ -249,6 +461,7 @@ async def chat_stream_endpoint(
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                **artifact_headers,
             },
         )
 
@@ -331,6 +544,7 @@ async def chat_stream_endpoint(
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",  # disable nginx buffering
+            **artifact_headers,
         },
     )
 
@@ -349,6 +563,16 @@ class ChatRunRequest(BaseModel):
         description=(
             "Hermes agent session to continue.  When omitted Hermes keys the run "
             "by run_id, so callers wanting multi-turn continuity must pass it back."
+        ),
+    )
+    chat_session_id: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Platform chat session (ChatSession.id) this run belongs to.  It "
+            "scopes agent artifacts to hermes-files/<chat_session_id>/ and is "
+            "returned as ``artifact_session_id``.  Omit on the very first turn: "
+            "a short random directory is used until the session is saved."
         ),
     )
     instructions: str | None = Field(
@@ -491,6 +715,17 @@ async def create_chat_run(
         if system_prompt:
             instructions = system_prompt
 
+    # Agent runs always go to Hermes: append the artifact convention (scoped to
+    # this platform chat session) instead of overwriting the mode's instructions.
+    artifact_token, artifact_prompt = await _resolve_artifact_scope(
+        db, user, body.chat_session_id
+    )
+    instructions = (
+        f"{instructions}\n\n{artifact_prompt}"
+        if instructions
+        else artifact_prompt
+    )
+
     try:
         result = await hermes.create_run(
             input=body.input,
@@ -526,6 +761,9 @@ async def create_chat_run(
         "status": result.get("status") or "queued",
         "session_id": session_id,
         "replayed": bool(result.get("replayed")),
+        # Directory token the agent was told to write into (also the platform
+        # chat session id when one was supplied and owned by the caller).
+        "artifact_session_id": artifact_token,
     }
 
 
@@ -1270,40 +1508,64 @@ async def get_cache_interval(
 # File conversion (MarkItDown)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-import os
 import tempfile
 import uuid
 
 from fastapi import UploadFile
 
-ALLOWED_EXTENSIONS = {
+#: 文本 / 文档类附件白名单（MarkItDown 可转换）。
+TEXT_EXTENSIONS = {
     ".pdf", ".docx", ".pptx", ".xlsx", ".xls", ".epub",
     ".html", ".htm", ".csv", ".json", ".xml", ".ipynb",
-    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
     ".zip", ".txt", ".md", ".py", ".js", ".ts", ".log", ".sql",
     ".java", ".go", ".rs", ".c", ".cpp", ".h", ".sh", ".bat", ".ps1",
     ".yaml", ".yml", ".ini", ".cfg", ".env", ".css", ".rss",
 }
 
+#: 图片白名单 — 只有这四种会走内联 data URL（Hermes 仅支持图片 data URL）。
+IMAGE_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+ALLOWED_EXTENSIONS = TEXT_EXTENSIONS | set(IMAGE_MIME_BY_EXT)
+
 # 附件链路上限：避免超大文件把内存 / MarkItDown / 后续 prompt 打爆。
-MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024      # 上传文件 20MB
-MAX_ATTACHMENT_CHARS = 200_000               # 转换后正文 200k 字符
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024      # 文本类上传文件 20MB
+MAX_ATTACHMENT_CHARS = 200_000               # 转换后正文默认 200k 字符
+MAX_IMAGE_BYTES = 3 * 1024 * 1024            # 内联图片 3MB（base64 后 < 6MB）
+MIN_ATTACHMENT_CHARS = 1_000
+MAX_ATTACHMENT_CHARS_LIMIT = 1_000_000
 
 
 @router.post("/convert-file")
 async def convert_file(
     file: UploadFile = File(...),
+    max_chars: int | None = Query(
+        default=None,
+        ge=MIN_ATTACHMENT_CHARS,
+        le=MAX_ATTACHMENT_CHARS_LIMIT,
+        description=(
+            "转换后正文的最大字符数。省略时沿用 200k；agent 模式前端传 60000 "
+            "(Hermes 对单段文本有 64K 字符的静默截断)。"
+        ),
+    ),
     user: User = Depends(get_current_user),
 ) -> dict:
-    """Convert an uploaded file to Markdown using Microsoft MarkItDown.
+    """Convert an uploaded file to Markdown (or inline an image as data URL).
 
-    Supports PDF, Word, Excel, PPT, images (OCR), HTML, CSV, JSON, code,
-    Jupyter notebooks, ZIP archives, and more.
+    Supports PDF, Word, Excel, PPT, HTML, CSV, JSON, code, Jupyter notebooks,
+    ZIP archives, and inline images (png/jpeg/webp/gif).
 
-    约束（P1-13）：
-    * 上传大小 ≤ 20MB，超出返回 413；
-    * 转换后正文 ≤ 200k 字符，超出截断并在正文末尾标注；
+    约束：
+    * 文本类上传大小 ≤ 20MB、图片 ≤ 3MB，超出返回 413；
+    * 转换后正文 ≤ ``max_chars``（默认 200k），超出截断并在正文末尾标注；
+    * 图片不进入 MarkItDown，直接返回 ``kind="image"`` + data URL；
     * 转换失败返回 4xx，绝不把 `[错误: 文件名]` 之类的错误文本当正文。
+    * 日志只记录文件名 / 大小，绝不打印文件内容。
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="未提供文件名")
@@ -1312,8 +1574,35 @@ async def convert_file(
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"不支持的文件类型: {ext}。支持: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+            detail=f"不支持的文件类型: {ext}。支持文本类文档与 png/jpg/webp/gif 图片",
         )
+
+    # ── 图片：内联为 data URL，交给 Hermes 的 vision 通道 ────────────────
+    if ext in IMAGE_MIME_BY_EXT:
+        # 多读 1 字节即可判断是否超限，避免把超大图片整个读进内存。
+        raw = await file.read(MAX_IMAGE_BYTES + 1)
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"图片超过 {MAX_IMAGE_BYTES // (1024 * 1024)}MB 上限",
+            )
+        if not raw:
+            raise HTTPException(status_code=400, detail="文件为空")
+        mime = IMAGE_MIME_BY_EXT[ext]
+        logger.info(
+            "Attached image inlined: filename={!r} bytes={} mime={}",
+            file.filename,
+            len(raw),
+            mime,
+        )
+        return {
+            "ok": True,
+            "kind": "image",
+            "filename": file.filename,
+            "mime": mime,
+            "bytes": len(raw),
+            "data_url": f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}",
+        }
 
     # 多读 1 字节即可判断是否超限，避免把超大文件整个读进内存。
     raw = await file.read(MAX_ATTACHMENT_BYTES + 1)
@@ -1324,6 +1613,8 @@ async def convert_file(
         )
     if not raw:
         raise HTTPException(status_code=400, detail="文件为空")
+
+    char_limit = max_chars or MAX_ATTACHMENT_CHARS
 
     # Save to a temp file (markitdown needs a real file path for binary formats)
     suffix = ext if ext else ".txt"
@@ -1347,26 +1638,28 @@ async def convert_file(
             )
 
         original_chars = len(text)
-        truncated = original_chars > MAX_ATTACHMENT_CHARS
+        truncated = original_chars > char_limit
         if truncated:
             text = (
-                text[:MAX_ATTACHMENT_CHARS]
+                text[:char_limit]
                 + f"\n\n[内容超长已截断：原文 {original_chars} 字符，"
-                  f"仅保留前 {MAX_ATTACHMENT_CHARS} 字符]"
+                  f"仅保留前 {char_limit} 字符]"
             )
             logger.warning(
                 "Attached file truncated: filename={!r} chars={} limit={}",
                 file.filename,
                 original_chars,
-                MAX_ATTACHMENT_CHARS,
+                char_limit,
             )
 
         return {
             "ok": True,
+            "kind": "text",
             "filename": file.filename,
             "content": text,
             "truncated": truncated,
             "original_chars": original_chars,
+            "max_chars": char_limit,
         }
     except HTTPException:
         raise
@@ -1384,6 +1677,102 @@ async def convert_file(
                 os.unlink(tmp_path)
             except Exception:
                 pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Agent artifacts (B1) — download files Hermes wrote into the shared directory
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@router.get(
+    "/artifacts/{session_id}/{filename}",
+    summary="Download a Hermes agent artifact",
+    description=(
+        "Serves a file the agent produced for one platform chat session.  "
+        "``session_id`` must be an integer ``ChatSession.id`` owned by the "
+        "caller (admins get no bypass — same 404 policy as the other chat "
+        "session routes); the file must live in "
+        "``HERMES_FILES_DIR/<session_id>/``.  The filename is whitelisted, "
+        "symlinks are refused and path traversal returns 404.  Files left in "
+        "the legacy flat root are deliberately no longer downloadable."
+    ),
+)
+async def download_artifact(
+    session_id: str,
+    filename: str,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> FileResponse:
+    """Return one session-scoped artifact (≤10MB, no traversal, no symlinks)."""
+    # The handler takes ``session_id`` as a string so a non-integer id yields the
+    # same 404 as an unknown one (``int`` would answer 422 and leak the shape).
+    if (
+        not _ARTIFACT_SESSION_ID_RE.fullmatch(session_id or "")
+        or not _ARTIFACT_NAME_RE.fullmatch(filename or "")
+        or filename in {".", ".."}
+    ):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    chat_session = await db.get(ChatSession, int(session_id))
+    if chat_session is None or chat_session.user_id != user.id:
+        # Deliberately indistinguishable from "file missing": no ownership or
+        # existence oracle for other users' sessions.
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    root = _artifact_root()
+    directory = root / str(chat_session.id)
+    # Reject symlinks *before* resolving: resolve() would follow them away.
+    if directory.is_symlink():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    try:
+        session_dir = directory.resolve()
+        session_dir.relative_to(root)
+    except (ValueError, OSError):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    if session_dir.is_symlink() or not session_dir.is_dir():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    candidate = session_dir / filename
+    if candidate.is_symlink():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    try:
+        target = candidate.resolve()
+        target.relative_to(session_dir)
+    except (ValueError, OSError):
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    if target.is_symlink() or not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+
+    try:
+        size = target.stat().st_size
+    except OSError:
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if size > MAX_ARTIFACT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"文件超过 {MAX_ARTIFACT_BYTES // (1024 * 1024)}MB 上限",
+        )
+
+    media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    logger.info(
+        "Artifact download: session_id={} filename={!r} bytes={}",
+        chat_session.id,
+        filename,
+        size,
+    )
+    return FileResponse(
+        target,
+        media_type=media_type,
+        filename=filename,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -4,7 +4,7 @@
 
 <h1 align="center">六脉 Liumai</h1>
 
-<p align="center"><strong>智能化运维数智平台</strong> · Intelligent AIOps Platform</p>
+<p align="center"><strong>六脉智能运维数智平台</strong> · Intelligent AIOps Platform</p>
 
 <p align="center">
   <a href="#快速开始">快速开始</a> ·
@@ -44,6 +44,17 @@ docker compose up -d     # 启动全部服务
 | Backend (FastAPI) | 8000 | API 服务 |
 | PostgreSQL 16 | 5432 | 主数据库 |
 | Redis 7 | 6379 | 缓存 |
+
+### 告警 Webhook 自动触发 RCA
+
+平台内置了从「六脉 RCA 平台」融合的告警接入管线：
+
+- Webhook 地址：`POST http://localhost:3000/api/alerts/webhook`（对象或数组，支持 Tarsier / Zabbix / 通用字段）
+- 自动归一化 → 去重 → 严重级别 / 关键组件 / 高危签名多信号判定 → 应用级合并 → 触发 RCA
+- 控制台「告警中心」可查看收件箱 / 垃圾箱、切换自动/人工模式、编辑触发策略、生成 Webhook 令牌
+- 分析完成后报告入库，可在「RCA 分析 → 报告库 / 根因知识库」查看与标注
+
+详见 [docs/rca-webhook-integration.md](docs/rca-webhook-integration.md)。
 
 ## 架构
 
@@ -99,6 +110,13 @@ docker compose up -d     # 启动全部服务
 - 系统运行状态一览：活跃 RCA 会话、排队任务、Hermes 健康状态
 - 快速入口导航到各功能模块
 - 最近分析会话列表，一键跳转详情
+
+### 告警中心
+- Webhook 接入：Tarsier / Zabbix / 通用 JSON，支持批量推送与 Java Map 字符串
+- 自动去重（默认 300s）、应用级合并（默认 600s）、触发策略热配置
+- 多信号触发：严重级别 / 关键组件 / 高危故障签名（可选交易量波动）
+- 自动 / 人工两种模式，收件箱批量触发、忽略、垃圾箱清理
+- Webhook 令牌鉴权、接入示例与实时告警统计
 
 ### 智能对话
 - **四种对话模式**：通用（LLM 直连 + 模型切换）、智能助理（Hermes 工具调用）、知识问答（llm-wiki v2）、故障定界（RCA）

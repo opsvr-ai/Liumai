@@ -128,12 +128,12 @@ export default function LoginPage() {
         <div className="backdrop-blur-xl bg-white/70 border border-black/[0.06] rounded-3xl shadow-xl shadow-black/[0.03] p-10">
           {/* Logo + brand */}
           <div className="flex flex-col items-center mb-6">
-            <LiumaiLogoFull size={140} />
-            <h1 className="text-[25px] font-bold tracking-tight text-text-primary mt-5">
-              {isFirstSetup ? "初始化 六脉" : "六脉"}
+            <LiumaiLogoFull size={132} />
+            <h1 className="text-[21px] font-bold tracking-tight text-text-primary mt-5">
+              {isFirstSetup ? "初始化 六脉" : "六脉智能运维数智平台"}
             </h1>
-            <p className="text-[14px] text-muted-foreground mt-1.5">
-              {isFirstSetup ? "创建管理员账户以开始使用" : "智能化运维数智平台"}
+            <p className="text-[13px] text-muted-foreground mt-1.5 tracking-wide">
+              {isFirstSetup ? "创建管理员账户以开始使用" : "Liumai · Intelligent AIOps Platform"}
             </p>
           </div>
 

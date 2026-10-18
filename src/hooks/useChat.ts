@@ -500,6 +500,22 @@ export function useChat() {
       stoppedRef.current = false;
       answeredApprovalIdsRef.current.clear();
 
+      // Make sure the turn has a platform chat session before anything streams:
+      // agent artifacts live in ``hermes-files/<session_id>/`` and the download
+      // chip needs that id while the answer is still arriving.  If creation
+      // fails the turn still runs — the backend then uses a temporary token and
+      // the chip stays hidden.
+      if (!sessionIdRef.current) {
+        try {
+          const created = await chatHistory.create();
+          sessionIdRef.current = created.id;
+          setSessionId(created.id);
+        } catch (err) {
+          console.warn("[useChat] 无法创建会话，产物暂存临时目录", err);
+        }
+      }
+      const platformSessionId = sessionIdRef.current;
+
       // Build API message list from display messages.  A Hermes session is
       // reused only in the mode that created it; the server then holds the
       // history, so only the newest turn is sent (smaller prompts, no
@@ -602,6 +618,7 @@ export function useChat() {
           timeWindowStart: opts?.timeWindowStart,
           timeWindowEnd: opts?.timeWindowEnd,
           hermesSessionId: reuseHermesSession ? hermesSessionId : null,
+          chatSessionId: platformSessionId,
         })) {
           applyEvent(event);
         }
@@ -615,6 +632,7 @@ export function useChat() {
         const created = await chatRuns.create({
           input: userMsg.content,
           session_id: sessionMatches ? hermesSessionId : null,
+          chat_session_id: platformSessionId,
           conversation_history: history && history.length > 0 ? history : null,
           model: opts?.model ?? null,
           mode: opts?.mode ?? null,

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, Field
@@ -579,6 +581,181 @@ async def save_llm_config(
         model=body.model,
         welcome_prompt=body.welcome_prompt,
     )
+
+
+# ── LLM model probe (admin-only, read-only discovery) ───────────────────────
+
+# (base_url, api_key[:6]) -> (monotonic_timestamp, response_payload)
+# Successful *and* failed probe results are cached for 60s so a repeatedly
+# clicked button cannot hammer an external endpoint; invalid-input failures
+# never reach the network and are not cached.
+_LLM_PROBE_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+_LLM_PROBE_TTL_SECONDS = 60.0
+
+
+class LlmProbeRequest(BaseModel):
+    base_url: str = ""
+    api_key: str | None = None
+
+
+def _normalize_probe_base(raw: str) -> str:
+    return (raw or "").strip().rstrip("/")
+
+
+def _probe_url_candidates(base: str) -> list[str]:
+    """Return the model-list URLs to try, in order.
+
+    A base that already ends in ``/v1`` gets ``/models`` appended; every other
+    base first tries the OpenAI-compatible ``/v1/models`` path and only falls
+    back to ``/models`` when the upstream answers 400/404.
+    """
+    base = (base or "").strip().rstrip("/")
+    if base.endswith("/models"):
+        return [base]
+    if base.endswith("/v1") or "/v1/" in base:
+        return [f"{base}/models"]
+    return [f"{base}/v1/models", f"{base}/models"]
+
+
+def _probe_endpoint(url: str) -> str:
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).path or "/"
+
+
+def _scrub_secret(text: object, secret: str) -> str:
+    """Remove the API key (and key-shaped tokens) from an error string."""
+    out = str(text or "")
+    if secret:
+        masked = _mask_key(secret) if len(secret) >= 8 else "***"
+        out = out.replace(secret, masked)
+    out = re.sub(r"sk-[A-Za-z0-9_\-]{6,}", lambda m: f"{m.group(0)[:5]}...", out)
+    out = re.sub(
+        r"([?&](?:api_?key|key|token)=)[^&\s]+",
+        r"\1***",
+        out,
+        flags=re.IGNORECASE,
+    )
+    return out
+
+
+def _parse_probe_models(payload: object) -> list[dict[str, str]]:
+    """Accept ``{data: [{id, owned_by}]}`` and bare arrays of objects/strings."""
+    raw: object = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(raw, list):
+        return []
+    models: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, str):
+            model_id, owned_by = item, ""
+        elif isinstance(item, dict):
+            model_id = item.get("id") or item.get("model") or ""
+            owned_by = item.get("owned_by") or ""
+        else:
+            continue
+        model_id = str(model_id).strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append({"id": model_id, "owned_by": str(owned_by or "")})
+    return models
+
+
+def _probe_failure(reason: str) -> dict:
+    """Failure envelope — HTTP 200 so the settings form keeps its normal state."""
+    return {"ok": False, "error": reason, "hint": "可手动填写模型名"}
+
+
+@router.post("/llm-models/probe")
+async def probe_llm_models(
+    body: LlmProbeRequest,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> dict:
+    """Discover the models exposed by an OpenAI-compatible endpoint.
+
+    Read-only: nothing is persisted and the API key is never logged or echoed
+    back.  ``api_key`` may be omitted (or left as the masked value the settings
+    form shows) to reuse the stored ``llm_api_key``.
+    """
+    import httpx
+    from app.models import SystemConfig
+
+    base = _normalize_probe_base(body.base_url)
+    if not base:
+        return _probe_failure("Base URL 为空")
+    if not base.startswith(("http://", "https://")):
+        return _probe_failure("Base URL 必须以 http:// 或 https:// 开头")
+
+    row = await db.get(SystemConfig, "llm_api_key")
+    stored_key = ((row.value if row else "") or "").strip()
+
+    api_key = (body.api_key or "").strip()
+    if not api_key or (stored_key and api_key == _mask_key(stored_key)):
+        api_key = stored_key
+
+    cache_key = (base, api_key[:6])
+    cached = _LLM_PROBE_CACHE.get(cache_key)
+    if cached and time.monotonic() - cached[0] < _LLM_PROBE_TTL_SECONDS:
+        return cached[1]
+
+    def _remember(payload: dict) -> dict:
+        _LLM_PROBE_CACHE[cache_key] = (time.monotonic(), payload)
+        return payload
+
+    def _fail(reason: str) -> dict:
+        return _remember(_probe_failure(reason))
+
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    candidates = _probe_url_candidates(base)
+    last_reason = "未知错误"
+
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0, connect=5.0), follow_redirects=True
+    ) as client:
+        for index, url in enumerate(candidates):
+            try:
+                resp = await client.get(url, headers=headers)
+            except httpx.TimeoutException:
+                return _fail("连接超时，请检查 Base URL 和网络")
+            except httpx.ConnectError:
+                return _fail("无法连接到服务，请检查 Base URL 和网络")
+            except Exception as exc:  # noqa: BLE001 — never leak a traceback to the UI
+                return _fail(_scrub_secret(f"请求失败：{exc}", api_key))
+
+            if resp.status_code == 401:
+                return _fail("API Key 无效")
+            if resp.status_code == 403:
+                return _fail("API Key 无权限（HTTP 403）")
+            if resp.status_code in (400, 404):
+                last_reason = (
+                    "接口不存在（HTTP 404），请确认 Base URL"
+                    if resp.status_code == 404
+                    else "请求被拒绝（HTTP 400），请确认 Base URL"
+                )
+                # Only the OpenAI-style /v1/models path gets a fallback.
+                if index + 1 < len(candidates):
+                    continue
+                return _fail(last_reason)
+            if resp.status_code >= 400:
+                return _fail(f"服务返回 HTTP {resp.status_code}")
+
+            try:
+                payload = resp.json()
+            except Exception:  # noqa: BLE001
+                return _fail("响应不是有效的 JSON")
+
+            return _remember({
+                "ok": True,
+                "models": _parse_probe_models(payload),
+                "endpoint": _probe_endpoint(url),
+            })
+
+    return _fail(last_reason)
 
 
 # ── Welcome message generation ──────────────────────────────────────────────

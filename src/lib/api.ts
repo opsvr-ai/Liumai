@@ -458,10 +458,25 @@ export const historyApi = {
 
 /* ── Chat (SSE streaming) ────────────────────────── */
 
+/** Inline image part accepted by Hermes' vision channel. */
+export interface ChatImagePart {
+  type: "image_url";
+  image_url: { url: string };
+}
+
+/** Text part of a multi-part message. */
+export interface ChatTextPart {
+  type: "text";
+  text: string;
+}
+
+/** OpenAI-compatible content parts (Hermes only accepts text + image_url). */
+export type ChatContentPart = ChatTextPart | ChatImagePart;
+
 /** A single message in a chat conversation. */
 export interface ChatMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string;
+  content: string | ChatContentPart[];
 }
 
 /** A tool-call definition as streamed by Hermes. */
@@ -496,6 +511,71 @@ export type ChatStreamEvent =
     }
   | { type: "error"; error: string };
 
+/* ── One-turn image staging (A3) ─────────────────── */
+
+/** An image attached to the *current* turn only. */
+export interface StagedChatImage {
+  filename: string;
+  /** ``data:image/<mime>;base64,...`` from ``/chat/convert-file``. */
+  dataUrl: string;
+}
+
+/**
+ * Module-level hand-off for inline images.
+ *
+ * The composer converts a picked image with ``/chat/convert-file`` and stages
+ * the data URL here; the very next ``/chat/stream`` request attaches it as a
+ * content part to the newest user message and clears the staging slot.  Images
+ * are therefore never part of the persisted transcript or of history replays.
+ */
+let stagedChatImages: StagedChatImage[] = [];
+
+export function stageChatImages(images: StagedChatImage[]): void {
+  stagedChatImages = images.slice();
+}
+
+export function clearStagedChatImages(): void {
+  stagedChatImages = [];
+}
+
+function consumeStagedChatImages(): StagedChatImage[] {
+  const images = stagedChatImages;
+  stagedChatImages = [];
+  return images;
+}
+
+/** Attach staged images to the last user message as ``image_url`` parts. */
+function withStagedChatImages(
+  messages: ChatMessage[],
+  images: StagedChatImage[],
+): ChatMessage[] {
+  if (images.length === 0) return messages;
+  const next = messages.slice();
+  for (let index = next.length - 1; index >= 0; index -= 1) {
+    if (next[index].role !== "user") continue;
+    const content = next[index].content;
+    const text =
+      typeof content === "string"
+        ? content
+        : content
+            .filter((part): part is ChatTextPart => part.type === "text")
+            .map((part) => part.text)
+            .join("\n");
+    next[index] = {
+      ...next[index],
+      content: [
+        { type: "text", text },
+        ...images.map<ChatImagePart>((image) => ({
+          type: "image_url",
+          image_url: { url: image.dataUrl },
+        })),
+      ],
+    };
+    break;
+  }
+  return next;
+}
+
 /**
  * Stream a chat completion from the Hermes agent via SSE.
  *
@@ -513,6 +593,12 @@ export async function* chatStream(
     timeWindowEnd?: string;
     /** Continue an existing Hermes agent session (server-side context). */
     hermesSessionId?: string | null;
+    /**
+     * Platform chat session id.  The backend scopes agent artifacts to
+     * ``hermes-files/<chatSessionId>/`` and echoes the used token in
+     * ``X-Artifact-Session-Id``.
+     */
+    chatSessionId?: number | null;
   },
 ): AsyncGenerator<ChatStreamEvent> {
   const headers: Record<string, string> = {
@@ -522,17 +608,22 @@ export async function* chatStream(
   const tok = token();
   if (tok) headers["Authorization"] = `Bearer ${tok}`;
 
+  // The pending image belongs to this request only; consume it even if the
+  // request fails so a retry cannot silently attach a stale image.
+  const outgoingMessages = withStagedChatImages(messages, consumeStagedChatImages());
+
   const res = await fetch(`${BASE}/chat/stream`, {
     method: "POST",
     headers,
     body: JSON.stringify({
-      messages,
+      messages: outgoingMessages,
       mode: opts?.mode ?? null,
       model: opts?.model ?? null,
       temperature: opts?.temperature ?? 0.7,
       time_window_start: opts?.timeWindowStart ?? null,
       time_window_end: opts?.timeWindowEnd ?? null,
       hermes_session_id: opts?.hermesSessionId ?? null,
+      chat_session_id: opts?.chatSessionId ?? null,
     }),
     signal: opts?.signal,
   });
@@ -586,6 +677,113 @@ export async function* chatStream(
   }
 }
 
+/* ── Chat attachments & artifacts ────────────────── */
+
+/** Converted text attachment returned by ``POST /api/chat/convert-file``. */
+export interface ConvertedFileText {
+  ok: true;
+  kind: "text";
+  filename: string;
+  content: string;
+  truncated: boolean;
+  original_chars: number;
+  max_chars?: number;
+}
+
+/** Inline image returned by ``POST /api/chat/convert-file`` (≤3MB). */
+export interface ConvertedFileImage {
+  ok: true;
+  kind: "image";
+  filename: string;
+  mime: string;
+  bytes: number;
+  /** ``data:image/<mime>;base64,...`` — sent as an ``image_url`` content part. */
+  data_url: string;
+}
+
+export type ConvertedFile = ConvertedFileText | ConvertedFileImage;
+
+export const chatFiles = {
+  /**
+   * Convert an uploaded document to text, or inline an image as a data URL.
+   *
+   * @param maxChars Text char cap. Agent modes pass 60000 because Hermes
+   *   silently truncates a text part above 64K characters.
+   */
+  async convert(file: File, maxChars?: number): Promise<ConvertedFile> {
+    const headers: Record<string, string> = {};
+    const tok = token();
+    if (tok) headers["Authorization"] = `Bearer ${tok}`;
+
+    const form = new FormData();
+    form.append("file", file);
+    const query = maxChars ? `?max_chars=${encodeURIComponent(String(maxChars))}` : "";
+    const response = await fetch(`${BASE}/chat/convert-file${query}`, {
+      method: "POST",
+      headers,
+      body: form,
+    });
+    if (!response.ok) {
+      const payload = await response
+        .json()
+        .catch(() => ({ detail: `文件转换失败 (HTTP ${response.status})` }));
+      throw new Error(
+        typeof payload?.detail === "string" ? payload.detail : "文件转换失败",
+      );
+    }
+    return (await response.json()) as ConvertedFile;
+  },
+};
+
+export const chatArtifacts = {
+  /**
+   * Download a session-scoped Hermes artifact as a blob and save it
+   * (Authorization header — the token is never placed in a URL).
+   *
+   * Artifacts live in ``hermes-files/<sessionId>/`` and the backend only serves
+   * them to the session's owner, so a platform session id is required.
+   */
+  async download(
+    sessionId: string | number | null | undefined,
+    filename: string,
+  ): Promise<void> {
+    const sid =
+      typeof sessionId === "number" ? sessionId : Number.parseInt(String(sessionId), 10);
+    if (!Number.isInteger(sid) || sid <= 0) {
+      throw new Error("请先保存会话后再下载产物");
+    }
+
+    const headers: Record<string, string> = {};
+    const tok = token();
+    if (tok) headers["Authorization"] = `Bearer ${tok}`;
+
+    const response = await fetch(
+      `${BASE}/chat/artifacts/${sid}/${encodeURIComponent(filename)}`,
+      { headers },
+    );
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null);
+      const detail =
+        typeof payload?.detail === "string" ? payload.detail : "文件不存在或下载失败";
+      throw new Error(detail);
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    try {
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      document.body.removeChild(anchor);
+    } finally {
+      // Give the browser a tick to start the download before revoking.
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+  },
+};
+
 /* ── Chat Runs API (structured agent runs) ─────────── */
 
 /**
@@ -603,6 +801,12 @@ export interface ChatRunCreateParams {
   input: string;
   /** Hermes session to continue (omit for a fresh one). */
   session_id?: string | null;
+  /**
+   * Platform chat session id — scopes agent artifacts to
+   * ``hermes-files/<id>/``; the backend returns the used token as
+   * ``artifact_session_id``.
+   */
+  chat_session_id?: number | null;
   /** Ephemeral system prompt (the backend fills it from the chat mode). */
   instructions?: string | null;
   model?: string | null;
@@ -621,6 +825,8 @@ export interface ChatRunCreateResult {
   status: string;
   /** Continuity token for the next turn (Hermes falls back to ``run_id``). */
   session_id: string;
+  /** Agent artifact directory token (the platform chat session id when known). */
+  artifact_session_id?: string;
   replayed?: boolean;
 }
 
@@ -970,6 +1176,16 @@ export interface LlmConfig {
   welcome_prompt: string;
 }
 
+export interface LlmModelInfo {
+  id: string;
+  owned_by: string;
+}
+
+/** Result of POST /auth/llm-models/probe — failures are HTTP 200 by design. */
+export type LlmModelsProbeResult =
+  | { ok: true; models: LlmModelInfo[]; endpoint: string }
+  | { ok: false; error: string; hint?: string };
+
 export interface PermissionCatalogItem {
   key: string;
   label: string;
@@ -1022,6 +1238,19 @@ export const authApi = {
   },
   saveLlmConfig(data: LlmConfig) {
     return request<LlmConfig>("PUT", "/auth/llm-config", data);
+  },
+  /**
+   * Discover the models an OpenAI-compatible endpoint exposes.
+   *
+   * Omitting `api_key` (or passing the masked value shown in the form) makes
+   * the backend reuse the stored key.  Failures resolve with `ok: false`
+   * instead of throwing, so callers can show an inline hint.
+   */
+  probeLlmModels(base_url: string, api_key?: string) {
+    return request<LlmModelsProbeResult>("POST", "/auth/llm-models/probe", {
+      base_url,
+      api_key: api_key?.trim() ? api_key.trim() : null,
+    });
   },
   generateWelcome(username: string) {
     return request<{ text: string }>("POST", "/auth/generate-welcome", { username });

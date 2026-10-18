@@ -141,7 +141,7 @@ export default function DashboardPage() {
       {/* ── Hero ──────────────────────────────────────────── */}
       <div className="flex flex-col items-start gap-4 sm:flex-row sm:items-center sm:gap-6">
         <div className="shrink-0">
-          <LiumaiLogo size={64} className="text-interactive-primary" />
+          <LiumaiLogo size={64} />
         </div>
         <div className="flex-1">
           <h1 className="text-2xl font-bold tracking-tight text-text-primary">六脉智能运维数智平台</h1>

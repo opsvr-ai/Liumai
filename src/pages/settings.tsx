@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   RefreshCw,
   Server,
@@ -19,7 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { authApi, chatModes, hermesDiscovery, type ChatModeOut, type HermesConfig, type HermesInfo, type LdapConfig, type LdapStatus, type LlmConfig } from "@/lib/api";
+import { authApi, chatModes, hermesDiscovery, type ChatModeOut, type HermesConfig, type HermesInfo, type LdapConfig, type LdapStatus, type LlmConfig, type LlmModelInfo } from "@/lib/api";
 import { useAuth } from "@/components/auth/auth-context";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -87,11 +87,59 @@ export default function SettingsPage() {
   const [llmConfig, setLlmConfig] = useState<LlmConfig>({ base_url: "", api_key: "", model: "", welcome_prompt: "" });
   const [llmLoading, setLlmLoading] = useState(true);
   const [llmSaving, setLlmSaving] = useState(false);
+  /** Models discovered from the configured endpoint (may be empty). */
+  const [llmModels, setLlmModels] = useState<LlmModelInfo[]>([]);
+  const [llmProbing, setLlmProbing] = useState(false);
+  const [llmProbeError, setLlmProbeError] = useState<string | null>(null);
+  /** Auto-probe runs at most once per page visit. */
+  const llmProbedRef = useRef(false);
 
   const loadLlmConfig = useCallback(() => {
     setLlmLoading(true);
     authApi.getLlmConfig().then(setLlmConfig).catch(() => {}).finally(() => setLlmLoading(false));
   }, []);
+
+  const probeLlmModels = useCallback(async (
+    baseUrl: string,
+    apiKey?: string,
+    opts?: { silent?: boolean },
+  ) => {
+    const base = baseUrl.trim();
+    if (!base) {
+      if (!opts?.silent) setLlmProbeError("请先填写 Base URL");
+      return;
+    }
+    setLlmProbing(true);
+    if (!opts?.silent) setLlmProbeError(null);
+    try {
+      const result = await authApi.probeLlmModels(base, apiKey);
+      if (result.ok) {
+        setLlmModels(result.models ?? []);
+        setLlmProbeError(null);
+        if ((result.models?.length ?? 0) === 0 && !opts?.silent) {
+          setLlmProbeError("未发现可用模型");
+        }
+      } else {
+        setLlmModels([]);
+        // Auto-probe failures stay silent — the manual fallback still works.
+        if (!opts?.silent) setLlmProbeError(result.error || "未知错误");
+      }
+    } catch (e: any) {
+      setLlmModels([]);
+      if (!opts?.silent) setLlmProbeError(e?.message || "请求失败");
+    } finally {
+      setLlmProbing(false);
+    }
+  }, []);
+
+  // First visit with a saved Base URL: probe once, silently.
+  useEffect(() => {
+    if (llmLoading || llmProbedRef.current) return;
+    llmProbedRef.current = true;
+    if (llmConfig.base_url.trim()) {
+      void probeLlmModels(llmConfig.base_url, undefined, { silent: true });
+    }
+  }, [llmLoading, llmConfig.base_url, probeLlmModels]);
 
   async function handleSaveLlm() {
     setLlmSaving(true);
@@ -101,6 +149,10 @@ export default function SettingsPage() {
       toast.success("LLM 配置已保存");
     } catch (e: any) { toast.error(`保存失败: ${e.message}`); }
     finally { setLlmSaving(false); }
+  }
+
+  function handleProbeModels() {
+    void probeLlmModels(llmConfig.base_url, llmConfig.api_key);
   }
 
   /* ── Skills cache interval ──────────────────────────── */
@@ -215,6 +267,8 @@ export default function SettingsPage() {
   function updateCfg<K extends keyof LdapConfig>(key: K, value: LdapConfig[K]) {
     setLdapConfig((prev) => (prev ? { ...prev, [key]: value } : prev));
   }
+
+  const selectedLlmModel = llmModels.find((m) => m.id === llmConfig.model);
 
   /* ═══════════════════════════════════════════════════════ */
   return (
@@ -402,15 +456,78 @@ export default function SettingsPage() {
                 {llmLoading ? (<div className="space-y-3"><Skeleton className="h-9 w-full" /><Skeleton className="h-9 w-full" /></div>) : (<>
                   <div>
                     <label className="text-xs text-muted-foreground mb-1 block">Base URL</label>
-                    <Input value={llmConfig.base_url} onChange={(e) => setLlmConfig((p) => ({ ...p, base_url: e.target.value }))} placeholder="https://api.openai.com/v1" />
+                    <Input
+                      value={llmConfig.base_url}
+                      onChange={(e) => {
+                        const base_url = e.target.value;
+                        setLlmConfig((p) => ({ ...p, base_url }));
+                        // The old list belongs to the old endpoint — keep only a manual model value.
+                        setLlmModels([]);
+                        setLlmProbeError(null);
+                      }}
+                      placeholder="https://api.openai.com/v1"
+                    />
                   </div>
                   <div>
                     <label className="text-xs text-muted-foreground mb-1 block">API Key</label>
-                    <Input type="password" value={llmConfig.api_key} onChange={(e) => setLlmConfig((p) => ({ ...p, api_key: e.target.value }))} placeholder="sk-..." />
+                    <Input
+                      type="password"
+                      value={llmConfig.api_key}
+                      onChange={(e) => {
+                        const api_key = e.target.value;
+                        setLlmConfig((p) => ({ ...p, api_key }));
+                        setLlmProbeError(null);
+                      }}
+                      placeholder="sk-..."
+                    />
                   </div>
+
+                  {/* Model discovery — optional; manual entry below always works. */}
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Button
+                        variant="ghostMuted"
+                        size="sm"
+                        onClick={handleProbeModels}
+                        disabled={llmProbing || !llmConfig.base_url.trim()}
+                      >
+                        <RefreshCw className={cn("h-3.5 w-3.5 mr-1", llmProbing && "animate-spin")} />
+                        {llmProbing ? "获取中…" : "获取模型列表"}
+                      </Button>
+                      {!llmProbing && llmModels.length > 0 && (
+                        <span className="text-[11px] text-muted-foreground">共 {llmModels.length} 个可用模型</span>
+                      )}
+                    </div>
+                    {llmProbeError && (
+                      <p className="text-xs text-status-active">自动获取失败：{llmProbeError}，可手动填写模型名</p>
+                    )}
+                    {llmModels.length > 0 && (
+                      <div>
+                        <select
+                          value={llmConfig.model}
+                          onChange={(e) => setLlmConfig((p) => ({ ...p, model: e.target.value }))}
+                          className="h-9 w-full rounded-lg border border-border bg-surface-secondary px-3 text-sm text-text-primary"
+                          aria-label="可用模型列表"
+                        >
+                          <option value="">选择模型（可选）</option>
+                          {llmConfig.model && !llmModels.some((m) => m.id === llmConfig.model) && (
+                            <option value={llmConfig.model}>{llmConfig.model}（当前配置，不在列表中）</option>
+                          )}
+                          {llmModels.map((m) => (
+                            <option key={m.id} value={m.id}>{m.id}</option>
+                          ))}
+                        </select>
+                        {selectedLlmModel?.owned_by && (
+                          <p className="text-[11px] text-muted-foreground/70 mt-1">owned_by: {selectedLlmModel.owned_by}</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
                   <div>
                     <label className="text-xs text-muted-foreground mb-1 block">模型名</label>
                     <Input value={llmConfig.model} onChange={(e) => setLlmConfig((p) => ({ ...p, model: e.target.value }))} placeholder="gpt-4o-mini" />
+                    <p className="text-[11px] text-muted-foreground mt-0.5">可从上方列表选择，或手动输入</p>
                   </div>
                   <div>
                     <label className="text-xs text-muted-foreground mb-1 block">欢迎语生成提示词</label>

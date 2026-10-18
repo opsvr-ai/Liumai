@@ -1,73 +1,25 @@
-<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <defs>
-    <linearGradient id="brandGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#4f6bf7"/>
-      <stop offset="100%" stop-color="#7c8cf8"/>
-    </linearGradient>
-    <filter id="glow">
-      <feGaussianBlur stdDeviation="5" result="blur"/>
-      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
-    </filter>
-  </defs>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="六脉 Liumai">
+  <title>六脉 Liumai</title>
+  <style>
+    .favicon-bg { fill: #ffffff; }
+    .favicon-ink { fill: #4f6bf7; }
+    @media (prefers-color-scheme: dark) {
+      .favicon-bg { fill: #101016; }
+      .favicon-ink { fill: #e6ebff; }
+    }
+  </style>
 
-  <!-- Light background matching platform -->
-  <rect width="512" height="512" rx="96" fill="#ffffff"/>
-  <rect width="512" height="512" rx="96" fill="none" stroke="#e5e5e8" stroke-width="2"/>
+  <!-- 22.7% rounded container keeps the 16px tab icon clean -->
+  <rect class="favicon-bg" width="512" height="512" rx="116" />
 
-  <!-- Subtle orbital rings -->
-  <circle cx="256" cy="256" r="190" fill="none" stroke="#4f6bf7" stroke-width="1" stroke-dasharray="6 14" opacity="0.12"/>
-  <circle cx="256" cy="256" r="176" fill="none" stroke="#7c8cf8" stroke-width="1" stroke-dasharray="3 18" opacity="0.08"/>
-
-  <!-- Six meridian lines -->
-  <g fill="none" stroke="url(#brandGrad)" stroke-width="4" stroke-linecap="round" opacity="0.45">
-    <path d="M 256 256 Q 320 300, 377.2 326"/>
-    <path d="M 256 256 Q 256 330, 256 396"/>
-    <path d="M 256 256 Q 192 300, 134.8 326"/>
-    <path d="M 256 256 Q 192 212, 134.8 186"/>
-    <path d="M 256 256 Q 256 182, 256 116"/>
-    <path d="M 256 256 Q 320 212, 377.2 186"/>
+  <!-- Simplified mark for 16px: one core dot + six radiating nodes -->
+  <g class="favicon-ink">
+    <circle cx="256" cy="256" r="54" />
+    <circle cx="256" cy="110" r="38" />
+    <circle cx="382.44" cy="183" r="38" />
+    <circle cx="382.44" cy="329" r="38" />
+    <circle cx="256" cy="402" r="38" />
+    <circle cx="129.56" cy="329" r="38" />
+    <circle cx="129.56" cy="183" r="38" />
   </g>
-
-  <!-- Terminal nodes (6 peripheral nodes) -->
-  <g transform="translate(256, 256)">
-    <!-- NE -->
-    <g transform="translate(121.2, 70) rotate(15)">
-      <polygon points="18,0 9,15.588 -9,15.588 -18,0 -9,-15.588 9,-15.588" fill="#4f6bf7" opacity="0.1" stroke="#4f6bf7" stroke-width="1.5"/>
-      <circle cx="0" cy="0" r="3" fill="#4f6bf7" opacity="0.45"/>
-    </g>
-    <!-- S -->
-    <g transform="translate(0, 140) rotate(15)">
-      <polygon points="18,0 9,15.588 -9,15.588 -18,0 -9,-15.588 9,-15.588" fill="#4f6bf7" opacity="0.1" stroke="#4f6bf7" stroke-width="1.5"/>
-      <circle cx="0" cy="0" r="3" fill="#4f6bf7" opacity="0.45"/>
-    </g>
-    <!-- SW -->
-    <g transform="translate(-121.2, 70) rotate(15)">
-      <polygon points="18,0 9,15.588 -9,15.588 -18,0 -9,-15.588 9,-15.588" fill="#4f6bf7" opacity="0.1" stroke="#4f6bf7" stroke-width="1.5"/>
-      <circle cx="0" cy="0" r="3" fill="#4f6bf7" opacity="0.45"/>
-    </g>
-    <!-- NW -->
-    <g transform="translate(-121.2, -70) rotate(15)">
-      <polygon points="18,0 9,15.588 -9,15.588 -18,0 -9,-15.588 9,-15.588" fill="#4f6bf7" opacity="0.1" stroke="#4f6bf7" stroke-width="1.5"/>
-      <circle cx="0" cy="0" r="3" fill="#4f6bf7" opacity="0.45"/>
-    </g>
-    <!-- N -->
-    <g transform="translate(0, -140) rotate(15)">
-      <polygon points="18,0 9,15.588 -9,15.588 -18,0 -9,-15.588 9,-15.588" fill="#4f6bf7" opacity="0.1" stroke="#4f6bf7" stroke-width="1.5"/>
-      <circle cx="0" cy="0" r="3" fill="#4f6bf7" opacity="0.45"/>
-    </g>
-    <!-- SE -->
-    <g transform="translate(121.2, -70) rotate(15)">
-      <polygon points="18,0 9,15.588 -9,15.588 -18,0 -9,-15.588 9,-15.588" fill="#4f6bf7" opacity="0.1" stroke="#4f6bf7" stroke-width="1.5"/>
-      <circle cx="0" cy="0" r="3" fill="#4f6bf7" opacity="0.45"/>
-    </g>
-  </g>
-
-  <!-- Core hexagon outline -->
-  <polygon points="55,0 27.5,47.63 -27.5,47.63 -55,0 -27.5,-47.63 27.5,-47.63" fill="none" stroke="url(#brandGrad)" stroke-width="4" transform="translate(256, 256) rotate(15)" filter="url(#glow)"/>
-
-  <!-- Inner filled hexagon -->
-  <polygon points="28,0 14,24.25 -14,24.25 -28,0 -14,-24.25 14,-24.25" fill="url(#brandGrad)" transform="translate(256, 256) rotate(45)"/>
-
-  <!-- Center dot -->
-  <circle cx="256" cy="256" r="8" fill="#4f6bf7"/>
 </svg>

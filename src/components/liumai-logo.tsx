@@ -1,82 +1,102 @@
-/** 六脉 icon-only logo — six energy meridians with animated pulse effects, no text. */
+/** 六脉 (Liumai) brand mark — a hexagonal network core with six radial meridians.
+ *
+ * Flat, monochrome and stroke-only: six equal short strokes radiate from a
+ * hexagon core (pulse + network node). Colour comes from `currentColor`, so the
+ * mark is brand blue on light surfaces and ice-blue on dark ones, and callers
+ * may override the tone with any `text-*` utility.
+ *
+ * Motion is opt-out (`animated`, default on) and deliberately restrained: a
+ * 2.4s pulse travels around the six meridians while the core breathes on its
+ * own 3s clock. Timing and amplitudes live in the `.lm-mark` rules in
+ * globals.css — this component only passes the phased-animation inputs.
+ * `prefers-reduced-motion: reduce` stops the loops and leaves the static mark.
+ * Marks under 32px skip the sweep (only the core breathes) so 26–28px chrome
+ * icons do not shimmer.
+ */
 
-import type { FC } from "react";
+import type { CSSProperties, FC } from "react";
 
-interface Props { size?: number; className?: string }
+interface Props {
+  size?: number;
+  className?: string;
+  /** Accessible label; defaults to the short brand name. */
+  label?: string;
+  /** Animate the mark. Default: true; reduced-motion users see the static art. */
+  animated?: boolean;
+}
 
-export const LiumaiLogo: FC<Props> = ({ size = 32, className }) => (
-  <svg width={size} height={size} viewBox="0 0 512 512" fill="none"
-    xmlns="http://www.w3.org/2000/svg" className={className} aria-label="六脉" role="img">
-    <defs>
-      <linearGradient id="lioBgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-        <stop offset="0%" stopColor="#0B0F19" /><stop offset="100%" stopColor="#1A1A2E" />
-      </linearGradient>
-      <linearGradient id="lioCoreGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-        <stop offset="0%" stopColor="#06B6D4" /><stop offset="100%" stopColor="#8B5CF6" />
-      </linearGradient>
-      <linearGradient id="lioLineGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-        <stop offset="0%" stopColor="#3B82F6" /><stop offset="100%" stopColor="#06B6D4" />
-      </linearGradient>
-      <linearGradient id="lioNodeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-        <stop offset="0%" stopColor="#1E3A8A" /><stop offset="100%" stopColor="#312E81" />
-      </linearGradient>
-      <filter id="lioGlowStrong" x="-50%" y="-50%" width="200%" height="200%">
-        <feGaussianBlur stdDeviation="4" result="blur" /><feComposite in="SourceGraphic" in2="blur" operator="over" />
-      </filter>
-      <filter id="lioGlowSoft" x="-50%" y="-50%" width="200%" height="200%">
-        <feGaussianBlur stdDeviation="8" result="blur" /><feComposite in="SourceGraphic" in2="blur" operator="over" />
-      </filter>
-      <filter id="lioGlowBeam" x="-50%" y="-50%" width="200%" height="200%">
-        <feGaussianBlur stdDeviation="15" result="blur" /><feComposite in="SourceGraphic" in2="blur" operator="over" />
-      </filter>
-    </defs>
+/** Uniform stroke weight for the core and all six meridians. */
+const STROKE = 3.1;
 
-    <rect width="512" height="512" rx="40" fill="url(#lioBgGrad)" />
+/** Pointy-top hexagon, radius 7, centred in a 48×48 box. */
+const CORE = "24,17 30.06,20.5 30.06,27.5 24,31 17.94,27.5 17.94,20.5";
 
-    {/* Orbital rings */}
-    <circle cx="256" cy="256" r="180" fill="none" stroke="#3B82F6" strokeWidth="1.5" strokeDasharray="8 12" opacity="0.3" />
-    <circle cx="256" cy="256" r="190" fill="none" stroke="#8B5CF6" strokeWidth="1" strokeDasharray="4 16" opacity="0.2" />
+/** Six short meridians pointing at the hexagon vertices (x1, y1, x2, y2). */
+const MERIDIANS: Array<[number, number, number, number]> = [
+  [24, 13.1, 24, 7.4],
+  [33.44, 18.55, 38.38, 15.7],
+  [33.44, 29.45, 38.38, 32.3],
+  [24, 34.9, 24, 40.6],
+  [14.56, 29.45, 9.62, 32.3],
+  [14.56, 18.55, 9.62, 15.7],
+];
 
-    {/* Static meridians */}
-    <g fill="none">
-      {[[320,300,377.2,326],[256,330,256,396],[192,300,134.8,326],[192,212,134.8,186],[256,182,256,116],[320,212,377.2,186]].map(([cx,cy,ex,ey], i) => (
-        <g key={i}>
-          <path d={`M 256 256 Q ${cx} ${cy}, ${ex} ${ey}`} stroke="url(#lioLineGrad)" strokeWidth="3" opacity="0.6" />
-          <path d={`M 256 256 Q ${cx} ${cy}, ${ex} ${ey}`} stroke="#06B6D4" strokeWidth="2" strokeDasharray="1 10" strokeLinecap="round" />
-        </g>
-      ))}
-    </g>
+/** Unit vector pointing outward along each meridian. The CSS keyframes own the
+ *  amplitude (`--lm-shift`), so the direction stays derived from the geometry. */
+const MERIDIAN_DIRECTIONS = MERIDIANS.map(([x1, y1, x2, y2]) => {
+  const length = Math.hypot(x2 - x1, y2 - y1);
+  return [(x2 - x1) / length, (y2 - y1) / length] as const;
+});
 
-    {/* Terminal nodes */}
-    <g transform="translate(256, 256)">
-      {[[121.2,70],[0,140],[-121.2,70],[-121.2,-70],[0,-140],[121.2,-70]].map(([x, y], i) => (
-        <g key={i} transform={`translate(${x}, ${y}) rotate(15)`}>
-          <polygon points="20,0 10,17.32 -10,17.32 -20,0 -10,-17.32 10,-17.32" fill="url(#lioNodeGrad)" stroke="#06B6D4" strokeWidth="2" />
-          <circle cx="0" cy="0" r="4" fill="#FFF" opacity="0.8" />
-        </g>
-      ))}
-    </g>
+const DEFAULT_TONE = "lm-brand-mark";
 
-    {/* Core */}
-    <circle cx="256" cy="256" r="60" fill="#06B6D4" opacity="0.1" filter="url(#lioGlowBeam)" />
-    <circle cx="256" cy="256" r="50" fill="none" stroke="#8B5CF6" strokeWidth="2" strokeDasharray="15 20" opacity="0.8" />
-    <polygon points="45,0 22.5,38.97 -22.5,38.97 -45,0 -22.5,-38.97 22.5,-38.97" fill="none" stroke="url(#lioCoreGrad)" strokeWidth="3" transform="translate(256, 256) rotate(15)" filter="url(#lioGlowStrong)" />
-    <polygon points="25,0 12.5,21.65 -12.5,21.65 -25,0 -12.5,-21.65 12.5,-21.65" fill="#3B82F6" opacity="0.6" transform="translate(256, 256) rotate(45)" />
-    <circle cx="256" cy="256" r="10" fill="#FFF" filter="url(#lioGlowStrong)" />
-    <path d="M 246 256 L 266 256 M 256 246 L 256 266" stroke="#0B0F19" strokeWidth="2" />
+export const LiumaiLogo: FC<Props> = ({ size = 32, className, label = "六脉", animated = true }) => {
+  // Keep the auto-adapting brand tone unless the caller already picked one.
+  const hasCustomTone = /(^|\s)text-/.test(className ?? "");
 
-    {/* Animated energy pulses — six meridians */}
-    <g fill="none">
-      {[[320,300,377.2,326,0],[256,330,256,396,0.5],[192,300,134.8,326,1],[192,212,134.8,186,1.5],[256,182,256,116,2],[320,212,377.2,186,2.5]].map(([cx,cy,ex,ey,delay], i) => (
-        <g key={i}>
-          <path d={`M 256 256 Q ${cx} ${cy}, ${ex} ${ey}`} stroke="#00FFFF" strokeWidth="8" strokeLinecap="round" strokeDasharray="8 250" opacity="0.6" filter="url(#lioGlowSoft)">
-            <animate attributeName="stroke-dashoffset" from="0" to="-260" dur="2.5s" repeatCount="indefinite" begin={`${delay}s`} />
-          </path>
-          <path d={`M 256 256 Q ${cx} ${cy}, ${ex} ${ey}`} stroke="#FFF" strokeWidth="3" strokeLinecap="round" strokeDasharray="1 250" filter="url(#lioGlowStrong)">
-            <animate attributeName="stroke-dashoffset" from="0" to="-260" dur="2.5s" repeatCount="indefinite" begin={`${delay}s`} />
-          </path>
-        </g>
-      ))}
-    </g>
-  </svg>
-);
+  // Small marks (< 32px) only breathe; the sweep would alias at that scale.
+  const motionClass = animated
+    ? `lm-mark--motion${size < 32 ? " lm-mark--small" : ""}${size >= 64 ? " lm-mark--large" : ""}`
+    : "";
+
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 48 48"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      role="img"
+      aria-label={label}
+      className={`shrink-0 ${hasCustomTone ? "" : DEFAULT_TONE} ${className ?? ""}`}
+    >
+      <g
+        className={`lm-mark ${motionClass}`.trim()}
+        fill="none"
+        stroke="currentColor"
+        strokeWidth={STROKE}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <polygon className="lm-mark-core" points={CORE} />
+        {MERIDIANS.map(([x1, y1, x2, y2], i) => (
+          <line
+            key={`${x1}-${y1}`}
+            className="lm-mark-meridian"
+            x1={x1}
+            y1={y1}
+            x2={x2}
+            y2={y2}
+            style={
+              {
+                "--lm-i": i,
+                "--lm-dx": MERIDIAN_DIRECTIONS[i][0],
+                "--lm-dy": MERIDIAN_DIRECTIONS[i][1],
+              } as CSSProperties
+            }
+          />
+        ))}
+      </g>
+    </svg>
+  );
+};

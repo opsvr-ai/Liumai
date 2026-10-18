@@ -82,8 +82,12 @@ services:
       WECOM_AGENT_ID: ${WECOM_AGENT_ID:-}
       REDIS_URL: redis://:${REDIS_PASSWORD:-liumai_redis_secret}@redis:6379/0
       RCA_MAX_CONCURRENCY: ${RCA_MAX_CONCURRENCY:-5}
+      # Agent artifacts: Hermes writes here on the host, the backend serves them.
+      HERMES_FILES_DIR: /data/hermes-files
+      HERMES_FILES_HOST_PATH: ${HERMES_FILES_HOST_PATH:-E:\dev\Liumai\hermes-files}
     volumes:
       - ./hermes-skills:/opt/hermes-skills:ro
+      - ./hermes-files:/data/hermes-files
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     networks:

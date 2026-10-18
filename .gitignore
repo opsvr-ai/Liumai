@@ -28,3 +28,7 @@ docker/
 .DS_Store
 Thumbs.db
 data/
+
+# Hermes 产物目录（保留 .gitkeep）
+hermes-files/*
+!hermes-files/.gitkeep
