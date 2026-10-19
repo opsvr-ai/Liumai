@@ -1,0 +1,37 @@
+# ============================================================
+# 六脉 (Liumai) — Python backend
+# ============================================================
+# Build:  docker build -t liumai-backend -f docker/Dockerfile.backend .
+# Run:    docker compose up -d backend
+# ============================================================
+
+FROM python:3.12-slim
+
+LABEL org.opencontainers.image.title="六脉 Backend"
+LABEL org.opencontainers.image.description="RCA fault delimitation platform API"
+
+WORKDIR /app
+
+# ---- System dependencies ----
+# libpq-dev required for psycopg2 / asyncpg compilation
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Python dependencies (cached layer) ----
+# Copy pip config first (mirror preference, falls back to PyPI)
+COPY docker/pip.conf /etc/pip.conf
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# ---- Application source ----
+COPY backend/ .
+
+# ---- Runtime ----
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

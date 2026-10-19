@@ -22,13 +22,12 @@ memory/
 .design/update-cache.json
 
 # Docker
-docker/
 
 # OS files
 .DS_Store
 Thumbs.db
 data/
 
-# Hermes ²úÎïÄ¿Â¼£¨±£Áô .gitkeep£©
+# Hermes äº§ç‰©ç›®å½•ï¼ˆä¿ç•™ .gitkeepï¼‰
 hermes-files/*
 !hermes-files/.gitkeep
