@@ -193,7 +193,17 @@ async def test_source(
         adapter = get_adapter(ds.type, ds.config or {})
         ok, msg = await adapter.test_connection()
     except ValueError as exc:
-        ok, msg = False, str(exc)
+        ok, msg = False, f"数据源配置无效：{exc}"
+    except Exception as exc:  # noqa: BLE001 - never 500 on a connectivity test
+        logger.warning(
+            "DataSource test crashed: id={} type={!r} err={}", ds.id, ds.type, exc
+        )
+        ok, msg = False, (
+            f"测试连接失败（{ds.type}）：{exc}。"
+            "请检查地址、端口、认证信息以及本服务到该地址的网络可达性"
+        )
+    if not ok:
+        logger.info("DataSource test failed: id={} type={!r} msg={!r}", ds.id, ds.type, msg)
     return {"ok": ok, "message": msg}
 
 

@@ -311,6 +311,13 @@ export default function DataSourcesPage() {
                 <label className="text-xs font-medium">URL</label>
                 <Input value={formConfig.url ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, url: e.target.value }))}
                   placeholder={formType === "prometheus" ? "http://localhost:9090" : "http://zabbix.example.com"} />
+                {formType === "prometheus" && (
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">
+                    填根地址：<span className="font-mono">http://host:9090</span>；VictoriaMetrics 填{" "}
+                    <span className="font-mono">http://host:8481/select/0/prometheus</span>。
+                    不要带 <span className="font-mono">/api/v1/query</span> 等查询路径（路径前缀可保留）。
+                  </p>
+                )}
               </div>
             )}
             {formType === "clickhouse" && (
@@ -319,6 +326,9 @@ export default function DataSourcesPage() {
                   <div className="space-y-1"><label className="text-xs font-medium">主机</label><Input value={formConfig.host ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, host: e.target.value }))} placeholder="localhost" /></div>
                   <div className="space-y-1"><label className="text-xs font-medium">端口</label><Input value={formConfig.port ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, port: e.target.value }))} placeholder="8123" /></div>
                 </div>
+                <p className="text-[11px] leading-relaxed text-muted-foreground">
+                  使用 HTTP 端口，默认 8123（或 clickhouse 配置中的 http_port）；不要填 9000（原生 TCP 端口，平台无法通过它连接）。
+                </p>
                 <div className="space-y-1"><label className="text-xs font-medium">数据库</label><Input value={formConfig.database ?? ""} onChange={(e) => setFormConfig((p) => ({ ...p, database: e.target.value }))} placeholder="default" /></div>
               </>
             )}

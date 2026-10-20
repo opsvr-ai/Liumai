@@ -215,8 +215,98 @@ class BaseAdapter(ABC):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Prometheus
+# URL normalisation + diagnostics helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
+_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+
+# Prometheus API paths users paste instead of the root address.  Longest first
+# so "/api/v1/query_range" is stripped before "/api/v1".
+_PROM_STRIP_SUFFIXES = (
+    "/api/v1/query_range",
+    "/api/v1/query",
+    "/api/v1/status/buildinfo",
+    "/api/v1/status/config",
+    "/api/v1/status/runtimeinfo",
+    "/api/v1",
+)
+
+_PROM_ROOT_HINT = (
+    "Prometheus 根地址（可带 /prometheus 或 VictoriaMetrics 的 "
+    "/select/0/prometheus 前缀，不要带 /api/v1/... 查询路径）"
+)
+
+
+def _short_text(text: Any, limit: int = 160) -> str:
+    """Collapse *text* into a short single-line diagnostic fragment."""
+    cleaned = " ".join(str(text or "").split())
+    return cleaned[:limit] + ("…" if len(cleaned) > limit else "")
+
+
+def _split_url(raw: str) -> tuple[str, str, str]:
+    """Return ``(scheme, netloc, path)`` for user-supplied input.
+
+    Query strings and fragments are dropped (they never belong to a base URL)
+    and a missing scheme defaults to ``http://``.
+    """
+    from urllib.parse import urlsplit
+
+    text = str(raw or "").strip()
+    if not text:
+        return "", "", ""
+    # Ignore query strings / fragments: "…/api/v1/query?query=up" → "…/api/v1/query".
+    text = text.split("#", 1)[0].split("?", 1)[0].strip()
+    if not _SCHEME_RE.match(text):
+        text = f"http://{text}"
+    parts = urlsplit(text)
+    return parts.scheme.lower(), parts.netloc, parts.path or ""
+
+
+def _normalize_prom_url(raw: str) -> str:
+    """Normalise a Prometheus URL to a query-free root address.
+
+    * trailing ``/`` is removed;
+    * a pasted query/API path (``/api/v1/query``, ``/api/v1/query_range``,
+      ``/api/v1/status/buildinfo``, …) is stripped back to the base;
+    * real path prefixes such as ``/prometheus`` or VictoriaMetrics'
+      ``/select/0/prometheus`` are preserved untouched;
+    * ``?query=...`` query strings are ignored.
+    """
+    scheme, netloc, path = _split_url(raw)
+    if not netloc:
+        return ""
+    path = path.rstrip("/")
+    lowered = path.lower()
+    for _ in range(8):
+        for suffix in _PROM_STRIP_SUFFIXES:
+            if lowered.endswith(suffix):
+                path = path[: -len(suffix)].rstrip("/")
+                lowered = path.lower()
+                break
+        else:
+            break
+    return f"{scheme}://{netloc}{path}"
+
+
+def _prom_prefixed_base(base: str) -> str:
+    """Return ``{base}/prometheus`` unless *base* already is that prefix."""
+    if base.lower().rstrip("/").endswith("/prometheus"):
+        return ""
+    return f"{base}/prometheus"
+
+
+def _normalize_clickhouse_url(raw: str) -> str:
+    """Normalise a ClickHouse HTTP endpoint.
+
+    A missing scheme defaults to ``http://``; only ``http``/``https`` are used
+    because the platform talks to ClickHouse over its HTTP interface (the
+    native protocol on port 9000 is never used).
+    """
+    scheme, netloc, path = _split_url(raw)
+    if not netloc:
+        return ""
+    return f"{'https' if scheme == 'https' else 'http'}://{netloc}{path.rstrip('/')}"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Prometheus
@@ -238,29 +328,134 @@ class PrometheusAdapter(BaseAdapter):
         return {}
 
     def _base_url(self) -> str:
-        return (self.config.get("url") or "").rstrip("/")
+        return _normalize_prom_url(self.config.get("url") or "")
+
+    def _timeout_seconds(self) -> int:
+        try:
+            return max(1, int(self.config.get("timeout_secs") or 30))
+        except (TypeError, ValueError):
+            return 30
+
+    @staticmethod
+    def _success_message(kind: str, base: str, response: httpx.Response) -> str:
+        if kind == "buildinfo":
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = {}
+            data = payload.get("data") if isinstance(payload, dict) else None
+            version = data.get("version") if isinstance(data, dict) else None
+            if not version and isinstance(payload, dict):
+                version = payload.get("version")
+            if version:
+                return f"连接成功：Prometheus {version}（{base}）"
+            return f"Prometheus 兼容端点可用（{base}）"
+        return (
+            f"Prometheus 兼容端点可用（{base}）："
+            "/api/v1/status/buildinfo 不可用，但 /api/v1/query 返回正常"
+        )
 
     async def test_connection(self) -> tuple[bool, str]:
-        url = self._base_url()
-        if not url:
-            return False, "未配置 Prometheus URL"
+        raw = str(self.config.get("url") or "").strip()
+        if not raw:
+            return False, f"未配置 Prometheus URL：请填写{_PROM_ROOT_HINT}，例如 http://host:9090"
+        base = self._base_url()
+        if not base:
+            return False, (
+                f"Prometheus URL 无效：{_short_text(raw)}；请填写{_PROM_ROOT_HINT}，"
+                "例如 http://host:9090"
+            )
+        headers = self._auth_headers()
+        timeout = self._timeout_seconds()
+        # buildinfo → query (buildinfo 不存在时) → {base}/prometheus 前缀（404 时）
+        candidates: list[tuple[str, str]] = [
+            (f"{base}/api/v1/status/buildinfo", "buildinfo"),
+            (f"{base}/api/v1/query?query=up", "query"),
+        ]
+        attempted: list[str] = []
+        last_error = ""
         try:
-            async with self._http_client() as c:
-                r = await c.get(f"{url}/api/v1/status/buildinfo", headers=self._auth_headers())
-            if r.status_code == 200:
-                data = r.json()
-                ver = data.get("data", {}).get("version", "unknown")
-                return True, f"Prometheus {ver}"
-            return False, f"HTTP {r.status_code}: {r.text[:200]}"
-        except Exception as exc:
-            return False, f"连接失败: {exc}"
+            async with self._http_client() as client:
+                index = 0
+                while index < len(candidates):
+                    url, kind = candidates[index]
+                    index += 1
+                    try:
+                        r = await client.get(url, headers=headers)
+                    except httpx.TimeoutException:
+                        return False, (
+                            f"连接超时（>{timeout}s）：{url} 无响应。"
+                            "请确认 Prometheus 与本服务网络互通、端口正确，或调大超时时间"
+                        )
+                    except httpx.ConnectError as exc:
+                        return False, (
+                            f"无法连接 {url}（{_short_text(exc)}）。"
+                            "请确认主机/端口正确且内网可达（检查防火墙、安全组、反向代理）"
+                        )
+                    except httpx.HTTPError as exc:
+                        return False, f"请求 Prometheus 失败：{url}（{_short_text(exc)}）"
+
+                    attempted.append(f"{url} → HTTP {r.status_code}")
+                    status_code = r.status_code
+                    if status_code == 200:
+                        return True, self._success_message(kind, base, r)
+                    if status_code in (401, 403):
+                        return False, (
+                            f"认证失败（HTTP {status_code}）：请检查用户名/密码（Basic）"
+                            f"或 Token（Bearer）是否正确；URL: {url}；"
+                            f"原始响应: {_short_text(r.text)}"
+                        )
+                    if status_code == 400:
+                        last_error = (
+                            f"HTTP 400 路径错误：{url} 不是可用的 Prometheus API 路径。"
+                            "URL 可能填成了查询路径（如 /api/v1/query），应填"
+                            f"{_PROM_ROOT_HINT}；原始响应: {_short_text(r.text)}"
+                        )
+                        continue
+                    if status_code in (404, 405):
+                        # Only one prefix retry, and only when the base has no API path yet.
+                        if len(candidates) == 2 and "/api/v1" not in base.lower():
+                            prefixed = _prom_prefixed_base(base)
+                            if prefixed:
+                                candidates.append(
+                                    (f"{prefixed}/api/v1/status/buildinfo", "buildinfo")
+                                )
+                        continue
+                    last_error = (
+                        f"HTTP {status_code}：Prometheus 返回异常；"
+                        f"URL: {url}；原始响应: {_short_text(r.text)}"
+                    )
+        except Exception as exc:  # noqa: BLE001 - always return a diagnostic instead of raising
+            return False, f"测试 Prometheus 连接失败：{_short_text(exc)}（URL: {base}）"
+
+        hint = f"已尝试: {'; '.join(attempted)}。"
+        if last_error:
+            return False, f"{last_error}。{hint}"
+        return False, (
+            f"连接失败：{hint}请确认填写的是{_PROM_ROOT_HINT}，"
+            "且反向代理已将 /api/v1 转发到 Prometheus"
+        )
 
     async def execute_query(self, query: str, params: dict | None = None) -> QueryResult:
-        url = f"{self._base_url()}/api/v1/query"
-        async with self._http_client() as c:
-            r = await c.get(url, params={"query": query}, headers=self._auth_headers())
-        r.raise_for_status()
-        data = r.json()
+        base = self._base_url()
+        if not base:
+            raise ValueError(f"未配置或无法解析 Prometheus URL，请填写{_PROM_ROOT_HINT}")
+        urls = [f"{base}/api/v1/query"]
+        prefixed = _prom_prefixed_base(base)
+        if prefixed and "/api/v1" not in base.lower():
+            urls.append(f"{prefixed}/api/v1/query")
+        headers = self._auth_headers()
+        response: httpx.Response | None = None
+        async with self._http_client() as client:
+            for idx, url in enumerate(urls):
+                response = await client.get(url, params={"query": query}, headers=headers)
+                if response.status_code == 404 and idx + 1 < len(urls):
+                    continue
+                break
+        if response is None:  # pragma: no cover - defensive
+            raise ValueError("Prometheus 查询未发起")
+        response.raise_for_status()
+        data = response.json()
         results = data.get("data", {}).get("result", [])
         rows = [
             {"metric": item.get("metric", {}), "value": item.get("value", [None, None])[1]}
@@ -338,9 +533,15 @@ class ClickHouseAdapter(BaseAdapter):
     type_slug = "clickhouse"
 
     def _base_url(self) -> str:
-        host = self.config.get("host", "localhost")
-        port = self.config.get("port", 8123)
-        return f"http://{host}:{port}"
+        raw = str(self.config.get("url") or "").strip()
+        if raw:
+            return _normalize_clickhouse_url(raw)
+        host = str(self.config.get("host") or "").strip() or "localhost"
+        if _SCHEME_RE.match(host) or host.count(":") == 1:
+            # host already carries a scheme or "host:port"
+            return _normalize_clickhouse_url(host)
+        port = str(self.config.get("port") or "").strip() or "8123"
+        return _normalize_clickhouse_url(f"{host}:{port}")
 
     def _auth_params(self) -> dict[str, str]:
         user = self.config.get("user", "default")
@@ -350,14 +551,97 @@ class ClickHouseAdapter(BaseAdapter):
             params["password"] = pwd
         return params
 
-    async def test_connection(self) -> tuple[bool, str]:
+    def _timeout_seconds(self) -> int:
         try:
-            async with self._http_client() as c:
-                r = await c.get(f"{self._base_url()}/ping", params=self._auth_params())
-            ok = r.text.strip() == "Ok"
-            return ok, f"ClickHouse {'在线' if ok else '异常'}: {r.text.strip()[:100]}"
-        except Exception as exc:
-            return False, f"连接失败: {exc}"
+            return max(1, int(self.config.get("timeout_secs") or 30))
+        except (TypeError, ValueError):
+            return 30
+
+    _NATIVE_PORT_HINT = (
+        "检测到 ClickHouse 原生 TCP 端口 9000（或原生协议）：本平台通过 HTTP 接口访问，"
+        "请改用 HTTP 端口 8123（或 clickhouse 配置中的 http_port）"
+    )
+
+    def _native_port_hint(self) -> str:
+        """Warn when the config points at the native protocol port instead of HTTP."""
+        raw = " ".join(str(self.config.get(k) or "") for k in ("url", "host", "port"))
+        native = (
+            str(self.config.get("port") or "").strip() == "9000"
+            or re.search(r":9000(?=$|[/?#\s])", raw) is not None
+            or "tcp://" in raw.lower()
+            or "clickhouse://" in raw.lower()
+        )
+        return self._NATIVE_PORT_HINT if native else ""
+
+    @staticmethod
+    async def _server_version(
+        client: httpx.AsyncClient, base: str, auth: dict[str, str],
+    ) -> str:
+        """Best-effort version lookup; empty string when unavailable."""
+        try:
+            r = await client.get(
+                f"{base}/",
+                params={**auth, "query": "SELECT version()", "default_format": "TabSeparated"},
+            )
+        except httpx.HTTPError:
+            return ""
+        if r.status_code != 200:
+            return ""
+        return r.text.strip().split("\n")[0].strip()[:40]
+
+    async def test_connection(self) -> tuple[bool, str]:
+        base = self._base_url()
+        if not base:
+            return False, "未配置 ClickHouse 地址：请填写主机 + HTTP 端口（默认 8123）"
+        auth = self._auth_params()
+        timeout = self._timeout_seconds()
+        hint = self._native_port_hint()
+        suffix = f"（{hint}）" if hint else ""
+        try:
+            async with self._http_client() as client:
+                # 1) HTTP /ping (works on 8123 and any custom http_port)
+                r = await client.get(f"{base}/ping", params=auth)
+                if r.status_code == 200 and r.text.strip().lower().startswith("ok"):
+                    version = await self._server_version(client, base, auth)
+                    label = f"ClickHouse 在线（HTTP {base}）"
+                    return True, f"{label}，版本 {version}" if version else label
+                if r.status_code in (401, 403):
+                    return False, (
+                        f"认证失败（HTTP {r.status_code}）：请检查 user/password 是否正确；"
+                        f"目标 {base}{suffix}；原始响应: {_short_text(r.text)}"
+                    )
+
+                # 2) Fall back to a plain HTTP query when /ping is disabled/proxied away.
+                ping_note = f"/ping 返回 HTTP {r.status_code}: {_short_text(r.text)}"
+                r2 = await client.get(f"{base}/", params={**auth, "query": "SELECT 1"})
+                if r2.status_code == 200:
+                    version = await self._server_version(client, base, auth)
+                    label = f"ClickHouse 在线（HTTP {base}）：{ping_note}，但 SELECT 1 正常"
+                    return True, f"{label}，版本 {version}" if version else label
+                if r2.status_code in (401, 403):
+                    return False, (
+                        f"认证失败（HTTP {r2.status_code}）：请检查 user/password 是否正确；"
+                        f"目标 {base}{suffix}；原始响应: {_short_text(r2.text)}"
+                    )
+                return False, (
+                    f"ClickHouse 不可用：{ping_note}；GET /?query=SELECT 1 返回 "
+                    f"HTTP {r2.status_code}: {_short_text(r2.text)}。"
+                    f"请确认 {base} 是 ClickHouse 的 HTTP 端口（默认 8123，或 http_port），"
+                    f"且服务已启动{suffix}"
+                )
+        except httpx.TimeoutException:
+            return False, (
+                f"连接超时（>{timeout}s）：{base} 无响应。请确认 ClickHouse 与本服务处于同一内网、"
+                f"端口已放通（防火墙/安全组），必要时调大超时时间{suffix}"
+            )
+        except httpx.ConnectError as exc:
+            return False, (
+                f"无法连接 {base}（{_short_text(exc)}）：连接被拒绝通常是端口不对或服务未启动。"
+                "请确认主机可达并使用 HTTP 端口 8123（或 clickhouse 的 http_port），"
+                f"不要使用 9000 原生端口{suffix}"
+            )
+        except httpx.HTTPError as exc:
+            return False, f"请求 ClickHouse 失败：{base}（{_short_text(exc)}）"
 
     async def execute_query(self, query: str, params: dict | None = None) -> QueryResult:
         url = self._base_url()
