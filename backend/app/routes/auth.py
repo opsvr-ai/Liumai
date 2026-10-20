@@ -86,6 +86,31 @@ def _auto_create_failure_detail(exc: Exception) -> str:
     )
 
 
+def _clean_profile_value(value: str | None) -> str | None:
+    """Trim an LDAP profile value; blank values are stored as NULL."""
+    text = (value or "").strip()
+    return text or None
+
+
+_LDAP_PROFILE_FIELDS = ("display_name", "email", "department")
+
+
+def _sync_ldap_profile(user: User, ldap_user: LdapUser) -> bool:
+    """Mirror non-empty LDAP profile values onto an existing local account.
+
+    Empty LDAP values never clear a populated local field.  Returns True when
+    at least one field changed so the caller can decide whether to flush.
+    """
+    changed = False
+    for field in _LDAP_PROFILE_FIELDS:
+        incoming = _clean_profile_value(getattr(ldap_user, field, None))
+        if incoming is None or getattr(user, field) == incoming:
+            continue
+        setattr(user, field, incoming)
+        changed = True
+    return changed
+
+
 async def _create_ldap_user(db: AsyncSession, ldap_user: LdapUser) -> User:
     """Create the local mirror account for a successfully authenticated user."""
     from app.models import Team
@@ -101,6 +126,9 @@ async def _create_ldap_user(db: AsyncSession, ldap_user: LdapUser) -> User:
         role=UserRole.OPERATOR,
         team_id=team.id,
         auth_type=AuthType.LDAP,
+        display_name=_clean_profile_value(ldap_user.display_name),
+        email=_clean_profile_value(ldap_user.email),
+        department=_clean_profile_value(ldap_user.department),
     )
     db.add(user)
     await db.flush()
@@ -113,6 +141,10 @@ async def _ensure_ldap_local_user(
 ) -> User:
     """Return the local account for an LDAP login, auto-creating it if allowed."""
     if existing is not None:
+        # Every successful LDAP login refreshes the mirrored profile fields;
+        # role/team entitlements are managed locally and stay untouched.
+        if _sync_ldap_profile(existing, ldap_user):
+            await db.flush()
         return existing
 
     from app.services.ldap import _ldap_auto_create_user
@@ -358,6 +390,37 @@ async def get_permissions(
     )
 
 
+class CurrentUserOut(BaseModel):
+    """Current-user profile (``GET /api/auth/me``), including LDAP-mirrored fields."""
+    id: int
+    username: str
+    display_name: str | None = None
+    email: str | None = None
+    department: str | None = None
+    role: str
+    auth_type: str
+    team_id: int
+    avatar_url: str | None = None
+
+
+@router.get("/me", response_model=CurrentUserOut)
+async def get_current_user_profile(
+    user: User = Depends(get_current_user),
+) -> CurrentUserOut:
+    """Return the authenticated user's profile with mirrored LDAP fields."""
+    return CurrentUserOut(
+        id=user.id,
+        username=user.username,
+        display_name=user.display_name,
+        email=user.email,
+        department=user.department,
+        role=role_key(user),
+        auth_type=user.auth_type.value,
+        team_id=user.team_id,
+        avatar_url=user.avatar_url,
+    )
+
+
 class ChangePasswordRequest(BaseModel):
     old_password: str = Field(..., min_length=1)
     new_password: str = Field(..., min_length=6)
@@ -395,6 +458,9 @@ class LdapConfig(BaseModel):
     bind_password: str = ""
     bind_password_set: bool = False  # read-only flag: a password is stored
     username_attr: str = "uid"
+    display_name_attr: str = "displayName"
+    email_attr: str = "mail"
+    department_attr: str = "department"
     auto_create_user: bool = True
 
 
@@ -431,6 +497,17 @@ async def get_ldap_config(
         bind_password="",  # Never return the actual password
         bind_password_set=bool(_get("ldap_bind_password", "")),
         username_attr=_get("ldap_username_attr", "uid"),
+        display_name_attr=(
+            (_get("ldap_display_name_attr", "displayName") or "").strip()
+            or "displayName"
+        ),
+        email_attr=(
+            (_get("ldap_email_attr", "mail") or "").strip() or "mail"
+        ),
+        department_attr=(
+            (_get("ldap_department_attr", "department") or "").strip()
+            or "department"
+        ),
         auto_create_user=_get("ldap_auto_create_user", "true") == "true",
     )
 
@@ -451,6 +528,9 @@ async def save_ldap_config(
         "ldap_user_filter": body.user_filter,
         "ldap_bind_dn": body.bind_dn,
         "ldap_username_attr": body.username_attr,
+        "ldap_display_name_attr": (body.display_name_attr or "").strip() or "displayName",
+        "ldap_email_attr": (body.email_attr or "").strip() or "mail",
+        "ldap_department_attr": (body.department_attr or "").strip() or "department",
         "ldap_auto_create_user": "true" if body.auto_create_user else "false",
     }
 

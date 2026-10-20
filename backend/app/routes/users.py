@@ -21,12 +21,33 @@ router = APIRouter()
 class UserOut(BaseModel):
     id: int
     username: str
+    display_name: str | None = None
+    email: str | None = None
+    department: str | None = None
     role: str
     auth_type: str
     team_id: int
     last_active_at: str | None = None
     created_at: str | None = None
     model_config = {"from_attributes": True}
+
+
+def _user_out(user: User) -> UserOut:
+    """Serialise a user row, including the LDAP-mirrored profile fields."""
+    return UserOut(
+        id=user.id,
+        username=user.username,
+        display_name=user.display_name,
+        email=user.email,
+        department=user.department,
+        role=user.role.value,
+        auth_type=user.auth_type.value,
+        team_id=user.team_id,
+        last_active_at=(
+            user.last_active_at.isoformat() if user.last_active_at else None
+        ),
+        created_at=user.created_at.isoformat() if user.created_at else None,
+    )
 
 
 class UserCreate(BaseModel):
@@ -49,16 +70,7 @@ async def list_users(
 ) -> list[UserOut]:
     """List all users (admin only)."""
     rows = await db.execute(select(User).order_by(User.id))
-    return [
-        UserOut(
-            id=u.id, username=u.username, role=u.role.value,
-            auth_type=u.auth_type.value,
-            team_id=u.team_id,
-            last_active_at=u.last_active_at.isoformat() if u.last_active_at else None,
-            created_at=u.created_at.isoformat() if u.created_at else None,
-        )
-        for u in rows.scalars()
-    ]
+    return [_user_out(u) for u in rows.scalars()]
 
 
 @router.post("", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -84,7 +96,7 @@ async def create_user(
     db.add(user)
     await db.flush()
     await db.refresh(user)
-    return UserOut(id=user.id, username=user.username, role=user.role.value, auth_type=user.auth_type.value, team_id=user.team_id)
+    return _user_out(user)
 
 
 @router.put("/{user_id}", response_model=UserOut)
@@ -108,7 +120,7 @@ async def update_user(
         user.team_id = body.team_id
     await db.flush()
     await db.refresh(user)
-    return UserOut(id=user.id, username=user.username, role=user.role.value, auth_type=user.auth_type.value, team_id=user.team_id)
+    return _user_out(user)
 
 
 @router.delete("/{user_id}")
@@ -135,12 +147,30 @@ async def delete_user(
 class UserProfileOut(BaseModel):
     id: int
     username: str
+    display_name: str | None = None
+    email: str | None = None
+    department: str | None = None
     role: str
     auth_type: str
     team_id: int
     avatar_url: str | None = None
     created_at: str | None = None
     model_config = {"from_attributes": True}
+
+
+def _profile_out(user: User) -> UserProfileOut:
+    return UserProfileOut(
+        id=user.id,
+        username=user.username,
+        display_name=user.display_name,
+        email=user.email,
+        department=user.department,
+        role=user.role.value,
+        auth_type=user.auth_type.value,
+        team_id=user.team_id,
+        avatar_url=user.avatar_url,
+        created_at=user.created_at.isoformat() if user.created_at else None,
+    )
 
 
 class UserProfileUpdate(BaseModel):
@@ -152,15 +182,7 @@ async def get_my_profile(
     user: User = Depends(get_current_user),
 ) -> UserProfileOut:
     """Return the current user's profile."""
-    return UserProfileOut(
-        id=user.id,
-        username=user.username,
-        role=user.role.value,
-        auth_type=user.auth_type.value,
-        team_id=user.team_id,
-        avatar_url=user.avatar_url,
-        created_at=user.created_at.isoformat() if user.created_at else None,
-    )
+    return _profile_out(user)
 
 
 @router.put("/me", response_model=UserProfileOut)
@@ -174,15 +196,7 @@ async def update_my_profile(
         user.avatar_url = body.avatar_url
     await db.flush()
     await db.refresh(user)
-    return UserProfileOut(
-        id=user.id,
-        username=user.username,
-        role=user.role.value,
-        auth_type=user.auth_type.value,
-        team_id=user.team_id,
-        avatar_url=user.avatar_url,
-        created_at=user.created_at.isoformat() if user.created_at else None,
-    )
+    return _profile_out(user)
 
 
 @router.get("/me/sessions")

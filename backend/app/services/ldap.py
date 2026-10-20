@@ -42,9 +42,35 @@ _ldap_bind_password: str = settings.LDAP_BIND_PASSWORD
 _ldap_username_attr: str = settings.LDAP_USERNAME_ATTR
 _ldap_auto_create_user: bool = settings.LDAP_AUTO_CREATE_USER
 
+# Profile attributes mirrored onto the local user.  The attribute *names* are
+# admin-configurable (settings → 认证安全); these are the shipped defaults.
+_DEFAULT_DISPLAY_NAME_ATTR = "displayName"
+_DEFAULT_EMAIL_ATTR = "mail"
+_DEFAULT_DEPARTMENT_ATTR = "department"
+
+# Common aliases tried, in order, when the configured attribute is missing or
+# empty.  The canonical default is included so a custom name still falls back.
+_DISPLAY_NAME_ATTR_ALIASES: tuple[str, ...] = ("displayName", "cn")
+_EMAIL_ATTR_ALIASES: tuple[str, ...] = ("mail", "userPrincipalName")
+_DEPARTMENT_ATTR_ALIASES: tuple[str, ...] = (
+    "department",
+    "physicalDeliveryOfficeName",
+    "ou",
+)
+
+_ldap_display_name_attr: str = _DEFAULT_DISPLAY_NAME_ATTR
+_ldap_email_attr: str = _DEFAULT_EMAIL_ATTR
+_ldap_department_attr: str = _DEFAULT_DEPARTMENT_ATTR
+
 # Constants
 _CONNECT_TIMEOUT = 5  # seconds
 _RECEIVE_TIMEOUT = 10  # seconds
+
+
+def _config_attr(value: str | None, default: str) -> str:
+    """Normalise an admin-supplied attribute name, falling back to *default*."""
+    return (value or "").strip() or default
+
 
 # ── Diagnostic vocabulary ───────────────────────────────────────────────────
 # ``stage`` values are part of the ``POST /api/auth/ldap-test-user`` contract.
@@ -142,6 +168,7 @@ def reload_ldap_config(db_entries: dict[str, str]) -> None:
     """Reload LDAP config from DB values (called after admin saves config)."""
     global _ldap_enabled, _ldap_server, _ldap_base_dn, _ldap_user_filter
     global _ldap_bind_dn, _ldap_bind_password, _ldap_username_attr, _ldap_auto_create_user
+    global _ldap_display_name_attr, _ldap_email_attr, _ldap_department_attr
 
     _ldap_enabled = db_entries.get("ldap_enabled", "false") == "true"
     _ldap_server = db_entries.get("ldap_server", settings.LDAP_SERVER)
@@ -151,6 +178,15 @@ def reload_ldap_config(db_entries: dict[str, str]) -> None:
     _ldap_bind_password = db_entries.get("ldap_bind_password", settings.LDAP_BIND_PASSWORD)
     _ldap_username_attr = db_entries.get("ldap_username_attr", settings.LDAP_USERNAME_ATTR)
     _ldap_auto_create_user = db_entries.get("ldap_auto_create_user", "true") == "true"
+    _ldap_display_name_attr = _config_attr(
+        db_entries.get("ldap_display_name_attr"), _DEFAULT_DISPLAY_NAME_ATTR,
+    )
+    _ldap_email_attr = _config_attr(
+        db_entries.get("ldap_email_attr"), _DEFAULT_EMAIL_ATTR,
+    )
+    _ldap_department_attr = _config_attr(
+        db_entries.get("ldap_department_attr"), _DEFAULT_DEPARTMENT_ATTR,
+    )
     logger.info("LDAP config reloaded (enabled={})", _ldap_enabled)
 
 
@@ -160,6 +196,7 @@ class LdapUser:
     username: str
     display_name: str | None = None
     email: str | None = None
+    department: str | None = None
     groups: list[str] | None = None
 
 
@@ -485,32 +522,88 @@ def _bind_as(ldap3_mod: Any, server: Any, user: str | None, password: str | None
         )
 
 
-def _entry_attr(entry: Any, name: str) -> Any:
-    """Read an attribute value from an ldap3 Entry without raising."""
+def _entry_raw(entry: Any, name: str) -> Any:
+    """Read one attribute from an ldap3 Entry without raising.
+
+    ldap3 exposes attributes as ``entry[attr]`` (a ``KeyError`` for unknown
+    names) and wraps values in objects with a ``.value`` attribute.  The
+    ``getattr`` fallback keeps duck-typed test doubles working.  ``hasattr`` is
+    deliberately not used: ldap3's Entry answers attribute access in ways that
+    make ``hasattr`` unreliable.
+    """
+    if not name:
+        return None
     try:
-        holder = getattr(entry, name)
-    except Exception:  # noqa: BLE001 — ldap3 raises KeyError/AttributeError
+        holder = entry[name]
+    except Exception:  # noqa: BLE001 — KeyError / TypeError / AttributeError
         try:
-            holder = entry[name]
+            holder = getattr(entry, name)
         except Exception:  # noqa: BLE001
             return None
-    value = getattr(holder, "value", holder)
-    if isinstance(value, (list, tuple)):
-        return value[0] if value else None
+    return getattr(holder, "value", holder)
+
+
+def _entry_attr(entry: Any, name: str) -> Any:
+    """Read one scalar attribute (multi-valued attributes yield the first)."""
+    value = _entry_raw(entry, name)
+    if isinstance(value, (list, tuple, set)):
+        return next(iter(value), None)
     return value
 
 
+def _entry_profile_value(
+    entry: Any, configured: str, aliases: tuple[str, ...],
+) -> str | None:
+    """Resolve a profile field: configured attribute first, then common aliases.
+
+    Empty/blank values count as missing so they never overwrite a populated
+    local field.  Multi-valued attributes take their first value.
+    """
+    names: list[str] = []
+    for candidate in (configured, *aliases):
+        name = (candidate or "").strip()
+        if name and name not in names:
+            names.append(name)
+
+    for name in names:
+        value = _entry_attr(entry, name)
+        if value is None:
+            continue
+        if isinstance(value, bytes):
+            try:
+                value = value.decode(errors="replace")
+            except Exception:  # noqa: BLE001 — never fail a login on decoding
+                value = str(value)
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
 def _entry_groups(entry: Any) -> list[str] | None:
-    try:
-        holder = getattr(entry, "memberOf")
-    except Exception:  # noqa: BLE001
-        return None
-    value = getattr(holder, "value", holder)
+    value = _entry_raw(entry, "memberOf")
     if value is None:
         return None
     if isinstance(value, (list, tuple, set)):
         return [str(item) for item in value]
     return [str(value)]
+
+
+def _ldap_user_from_entry(username: str, entry: Any) -> LdapUser:
+    """Build the mirror profile from a matched directory entry."""
+    return LdapUser(
+        username=username,
+        display_name=_entry_profile_value(
+            entry, _ldap_display_name_attr, _DISPLAY_NAME_ATTR_ALIASES,
+        ),
+        email=_entry_profile_value(
+            entry, _ldap_email_attr, _EMAIL_ATTR_ALIASES,
+        ),
+        department=_entry_profile_value(
+            entry, _ldap_department_attr, _DEPARTMENT_ATTR_ALIASES,
+        ),
+        groups=_entry_groups(entry),
+    )
 
 
 def _search_user(
@@ -695,16 +788,9 @@ async def _authenticate_via_search(
     _safe_unbind(user_conn)
 
     entry = search.entry
-    display_name = _entry_attr(entry, "displayName")
-    email = _entry_attr(entry, "mail")
     return LdapAuthResult(
         ok=True,
-        user=LdapUser(
-            username=username,
-            display_name=str(display_name) if display_name is not None else None,
-            email=str(email) if email is not None else None,
-            groups=_entry_groups(entry),
-        ),
+        user=_ldap_user_from_entry(username, entry),
         stage=STAGE_USER_BIND,
         detail="LDAP 认证成功（目录搜索 + 用户绑定）",
         filter_used=search.filter_used,
@@ -733,10 +819,19 @@ async def _authenticate_via_direct_bind(
     attempts: list[_BindOutcome] = []
     filters_tried: list[str] = []
 
-    async def _success(detail: str, bound_as: str, filter_used: str | None = None) -> LdapAuthResult:
+    async def _success(
+        detail: str,
+        bound_as: str,
+        filter_used: str | None = None,
+        entry: Any = None,
+    ) -> LdapAuthResult:
         return LdapAuthResult(
             ok=True,
-            user=LdapUser(username=username),
+            user=(
+                _ldap_user_from_entry(username, entry)
+                if entry is not None
+                else LdapUser(username=username)
+            ),
             stage=STAGE_USER_BIND,
             detail=detail,
             filter_used=filter_used,
@@ -786,6 +881,7 @@ async def _authenticate_via_direct_bind(
                         "LDAP 认证成功（匿名搜索 + 用户绑定）",
                         "dn",
                         filter_used=search.filter_used,
+                        entry=search.entry,
                     )
                 attempts.append(outcome)
                 if outcome.category == ERR_SERVICE_UNAVAILABLE:

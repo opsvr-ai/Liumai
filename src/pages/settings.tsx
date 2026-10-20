@@ -727,6 +727,26 @@ export default function SettingsPage() {
                     <div><label className="text-xs text-muted-foreground mb-1 block">Bind DN（可选）</label><Input value={ldapConfig.bind_dn} onChange={(e) => updateCfg("bind_dn", e.target.value)} placeholder="cn=admin,dc=example,dc=com" /></div>
                     <div><label className="text-xs text-muted-foreground mb-1 block">Bind Password</label><Input type="password" value={ldapConfig.bind_password} onChange={(e) => updateCfg("bind_password", e.target.value)} placeholder={ldapConfig.bind_password_set ? "已保存（留空则不修改）" : "请输入服务账号密码"} /><p className="text-[11px] text-muted-foreground mt-1">{ldapConfig.bind_password_set ? "密码已保存，只有填写新值才会覆盖" : "尚未保存密码"}</p></div>
                     <div><label className="text-xs text-muted-foreground mb-1 block">用户名属性</label><Input value={ldapConfig.username_attr} onChange={(e) => updateCfg("username_attr", e.target.value)} placeholder="uid" /></div>
+                    <div className="rounded-lg border border-border/60 p-3 space-y-3">
+                      <p className="text-[11px] text-muted-foreground">同步字段属性（用户登录/自动建号时写入姓名、邮箱、部门）</p>
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        <div>
+                          <label className="text-xs text-muted-foreground mb-1 block">姓名属性</label>
+                          <Input value={ldapConfig.display_name_attr ?? "displayName"} onChange={(e) => updateCfg("display_name_attr", e.target.value)} placeholder="displayName" />
+                          <p className="text-[11px] text-muted-foreground/60 mt-0.5">默认 displayName，回退 cn</p>
+                        </div>
+                        <div>
+                          <label className="text-xs text-muted-foreground mb-1 block">邮箱属性</label>
+                          <Input value={ldapConfig.email_attr ?? "mail"} onChange={(e) => updateCfg("email_attr", e.target.value)} placeholder="mail" />
+                          <p className="text-[11px] text-muted-foreground/60 mt-0.5">默认 mail，回退 userPrincipalName</p>
+                        </div>
+                        <div>
+                          <label className="text-xs text-muted-foreground mb-1 block">部门属性</label>
+                          <Input value={ldapConfig.department_attr ?? "department"} onChange={(e) => updateCfg("department_attr", e.target.value)} placeholder="department" />
+                          <p className="text-[11px] text-muted-foreground/60 mt-0.5">默认 department，回退 physicalDeliveryOfficeName / ou</p>
+                        </div>
+                      </div>
+                    </div>
                     <label className="flex items-center gap-3 cursor-pointer"><input type="checkbox" checked={ldapConfig.auto_create_user} onChange={(e) => updateCfg("auto_create_user", e.target.checked)} className="h-4 w-4 rounded border-border/60 accent-interactive-primary" /><span className="text-sm">LDAP 用户首次登录时自动创建本地账号</span></label>
                     <div className="flex items-center gap-2 pt-2 border-t border-border/50">
                       <Button size="sm" onClick={handleSaveLdap} disabled={cfgSaving}><Save className="h-3.5 w-3.5 mr-1" />{cfgSaving ? "保存中…" : "保存"}</Button>

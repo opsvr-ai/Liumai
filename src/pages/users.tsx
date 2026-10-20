@@ -222,9 +222,16 @@ export default function UsersPage() {
                         <Badge variant="secondary" className="text-[10px] px-1.5">{AUTH_LABELS[u.auth_type] ?? u.auth_type}</Badge>
                       </div>
                       <div className="flex items-center gap-2 mt-0.5">
+                        {u.display_name && <span className="text-xs text-text-secondary truncate max-w-[14rem]">{u.display_name}</span>}
                         <Badge variant={ROLE_META[u.role]?.variant ?? "outline"} className="gap-1"><Shield className="h-3 w-3" />{ROLE_META[u.role]?.label ?? u.role}</Badge>
                         {u.created_at && <span className="text-xs text-muted-foreground/60">{new Date(u.created_at).toLocaleDateString("zh-CN")}</span>}
                       </div>
+                      {(u.email || u.department) && (
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-0.5 text-[11px] text-muted-foreground/70">
+                          {u.department && <span className="truncate max-w-[14rem]">{u.department}</span>}
+                          {u.email && <span className="truncate">{u.email}</span>}
+                        </div>
+                      )}
                     </div>
                     <div className="flex items-center gap-1 shrink-0">
                       {u.auth_type === "LOCAL" && (

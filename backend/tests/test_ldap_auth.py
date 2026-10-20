@@ -145,6 +145,11 @@ def fake_ldap(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(ldap_service, "_ldap_bind_password", "")
     monkeypatch.setattr(ldap_service, "_ldap_username_attr", "uid")
     monkeypatch.setattr(ldap_service, "_ldap_auto_create_user", True)
+    monkeypatch.setattr(
+        ldap_service, "_ldap_display_name_attr", "displayName",
+    )
+    monkeypatch.setattr(ldap_service, "_ldap_email_attr", "mail")
+    monkeypatch.setattr(ldap_service, "_ldap_department_attr", "department")
     yield
 
 
@@ -229,6 +234,126 @@ def test_search_mode_falls_back_to_samaccountname(monkeypatch: pytest.MonkeyPatc
     assert result.user.groups == ["CN=Ops,OU=Groups,DC=corp,DC=example,DC=com"]
     # Only the matched DN was used for the user rebind; no DN is in the result.
     assert ALICE_DN not in result.detail
+
+
+def _search_auth_with(
+    monkeypatch: pytest.MonkeyPatch, entry: _Entry,
+) -> ldap_service.LdapAuthResult:
+    """Run search-mode auth against *entry* (service bind + user rebind)."""
+    monkeypatch.setattr(ldap_service, "_ldap_bind_dn", SERVICE_DN)
+    monkeypatch.setattr(ldap_service, "_ldap_bind_password", "svcpass")
+
+    def bind(user: str | None, password: str | None) -> bool:
+        if (user, password) == (SERVICE_DN, "svcpass"):
+            return True
+        return (user, password) == (ALICE_DN, "correct")
+
+    state.bind_handler = bind
+    state.search_handler = lambda filt: [entry] if "sAMAccountName=alice" in filt else []
+    return run(ldap_service.authenticate_ldap_detailed("alice", "correct"))
+
+
+def test_profile_fields_read_with_default_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _Entry(
+        ALICE_DN,
+        {
+            "displayName": "Alice",
+            "mail": "alice@corp.example.com",
+            "department": "平台运维部",
+        },
+    )
+    result = _search_auth_with(monkeypatch, entry)
+
+    assert result.ok is True and result.user is not None
+    assert result.user.display_name == "Alice"
+    assert result.user.email == "alice@corp.example.com"
+    assert result.user.department == "平台运维部"
+
+
+def test_profile_fields_read_with_custom_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ldap_service, "_ldap_display_name_attr", "preferredName")
+    monkeypatch.setattr(ldap_service, "_ldap_email_attr", "corpMail")
+    monkeypatch.setattr(ldap_service, "_ldap_department_attr", "orgUnit")
+    entry = _Entry(
+        ALICE_DN,
+        {
+            # Configured attributes win over the built-in aliases.
+            "preferredName": "Alice Custom",
+            "displayName": "Alice Alias",
+            "corpMail": "custom@corp.example.com",
+            "orgUnit": "SRE",
+        },
+    )
+    result = _search_auth_with(monkeypatch, entry)
+
+    assert result.user is not None
+    assert result.user.display_name == "Alice Custom"
+    assert result.user.email == "custom@corp.example.com"
+    assert result.user.department == "SRE"
+
+
+def test_profile_fields_take_first_list_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _Entry(
+        ALICE_DN,
+        {
+            "displayName": ["Alice", "Alice B"],
+            "mail": ["alice@corp.example.com", "alice2@corp.example.com"],
+            "department": ["平台运维部", "SRE"],
+        },
+    )
+    result = _search_auth_with(monkeypatch, entry)
+
+    assert result.user is not None
+    assert result.user.display_name == "Alice"
+    assert result.user.email == "alice@corp.example.com"
+    assert result.user.department == "平台运维部"
+
+
+def test_profile_fields_fall_back_to_common_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _Entry(
+        ALICE_DN,
+        {
+            "cn": "Alice CN",
+            "userPrincipalName": "alice@corp.example.com",
+            "physicalDeliveryOfficeName": "运维中心",
+        },
+    )
+    result = _search_auth_with(monkeypatch, entry)
+
+    assert result.user is not None
+    assert result.user.display_name == "Alice CN"
+    assert result.user.email == "alice@corp.example.com"
+    assert result.user.department == "运维中心"
+
+
+def test_profile_fields_use_ou_when_department_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _Entry(ALICE_DN, {"ou": "研发部"})
+    result = _search_auth_with(monkeypatch, entry)
+
+    assert result.user is not None
+    assert result.user.department == "研发部"
+
+
+def test_profile_fields_blank_values_never_win(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = _Entry(ALICE_DN, {"displayName": "", "cn": "Fallback Name", "mail": "  "})
+    result = _search_auth_with(monkeypatch, entry)
+
+    assert result.user is not None
+    assert result.user.display_name == "Fallback Name"
+    assert result.user.email is None
+    assert result.user.department is None
 
 
 def test_search_mode_no_result_reports_user_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -553,3 +678,94 @@ def test_ldap_test_user_endpoint_existing_ldap_account(
     assert response.stage == "user_bind"
     assert "已存在" in response.detail
     assert "secret" not in response.detail
+
+
+# ── Local mirror sync (display_name / email / department) ───────────────────
+
+def test_create_ldap_user_mirrors_profile_fields() -> None:
+    db = _FakeDb(existing=None, team=Team(id=1, name="Default Team"))
+    ldap_user = ldap_service.LdapUser(
+        username="alice",
+        display_name=" Alice ",
+        email="alice@corp.example.com",
+        department="平台运维部",
+    )
+
+    user = run(auth_routes._create_ldap_user(db, ldap_user))
+
+    assert user.display_name == "Alice"
+    assert user.email == "alice@corp.example.com"
+    assert user.department == "平台运维部"
+    assert user.auth_type == AuthType.LDAP
+
+
+def test_existing_user_profile_is_refreshed_on_login() -> None:
+    existing = User(
+        username="alice",
+        role=UserRole.OPERATOR,
+        team_id=1,
+        auth_type=AuthType.LDAP,
+        display_name="Old Name",
+        email="old@corp.example.com",
+        department=None,
+    )
+    ldap_user = ldap_service.LdapUser(
+        username="alice",
+        display_name="Alice New",
+        email=None,  # must not clear the stored address
+        department="平台运维部",
+    )
+
+    returned = run(
+        auth_routes._ensure_ldap_local_user(_FakeDb(existing=existing), existing, ldap_user)
+    )
+
+    assert returned is existing
+    assert existing.display_name == "Alice New"
+    assert existing.email == "old@corp.example.com"
+    assert existing.department == "平台运维部"
+
+
+def test_profile_sync_is_noop_when_values_match() -> None:
+    existing = User(
+        username="alice",
+        role=UserRole.OPERATOR,
+        team_id=1,
+        auth_type=AuthType.LDAP,
+        display_name="Alice",
+        email="alice@corp.example.com",
+        department="平台运维部",
+    )
+    ldap_user = ldap_service.LdapUser(
+        username="alice",
+        display_name="Alice",
+        email="alice@corp.example.com",
+        department="平台运维部",
+    )
+
+    assert auth_routes._sync_ldap_profile(existing, ldap_user) is False
+
+
+def test_reload_ldap_config_profile_attributes() -> None:
+    ldap_service.reload_ldap_config({})
+    assert ldap_service._ldap_display_name_attr == "displayName"
+    assert ldap_service._ldap_email_attr == "mail"
+    assert ldap_service._ldap_department_attr == "department"
+
+    ldap_service.reload_ldap_config({
+        "ldap_display_name_attr": " cn ",
+        "ldap_email_attr": "userPrincipalName",
+        "ldap_department_attr": "physicalDeliveryOfficeName",
+    })
+    assert ldap_service._ldap_display_name_attr == "cn"
+    assert ldap_service._ldap_email_attr == "userPrincipalName"
+    assert ldap_service._ldap_department_attr == "physicalDeliveryOfficeName"
+
+    # Blank/absent values fall back to the shipped defaults.
+    ldap_service.reload_ldap_config({
+        "ldap_display_name_attr": "  ",
+        "ldap_email_attr": "",
+    })
+    assert ldap_service._ldap_display_name_attr == "displayName"
+    assert ldap_service._ldap_email_attr == "mail"
+    assert ldap_service._ldap_department_attr == "department"

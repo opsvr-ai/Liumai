@@ -188,6 +188,13 @@ export default function ProfilePage() {
                     <Badge variant="default">{roleLabel[profile.role] || profile.role}</Badge>
                     <Badge variant="outline">{authLabel[profile.auth_type] || profile.auth_type}</Badge>
                   </div>
+                  {(profile.display_name || profile.email || profile.department) && (
+                    <div className="mt-2 space-y-0.5 text-xs text-text-secondary">
+                      {profile.display_name && <p>姓名：{profile.display_name}</p>}
+                      {profile.email && <p>邮箱：{profile.email}</p>}
+                      {profile.department && <p>部门：{profile.department}</p>}
+                    </div>
+                  )}
                   <p className="text-xs text-muted-foreground mt-1">点击头像上传新图片（支持 PNG/JPG/GIF/WebP，≤2MB）</p>
                 </div>
               </div>

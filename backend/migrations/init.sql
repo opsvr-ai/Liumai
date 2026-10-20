@@ -67,6 +67,9 @@ CREATE TABLE IF NOT EXISTS users (
     role            user_role    NOT NULL DEFAULT 'VIEWER',
     auth_type       auth_type    NOT NULL DEFAULT 'LDAP',
     avatar_url      VARCHAR(512),
+    display_name    VARCHAR(255),
+    email           VARCHAR(255),
+    department      VARCHAR(255),
     last_active_at  TIMESTAMPTZ,
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
@@ -132,6 +135,9 @@ INSERT INTO teams (id, name)
 ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash VARCHAR(255);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_type auth_type NOT NULL DEFAULT 'LDAP';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(512);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS department VARCHAR(255);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active_at TIMESTAMPTZ;
 
 -- First admin account is created dynamically via the setup endpoint
@@ -189,6 +195,9 @@ INSERT INTO system_config (key, value) VALUES
     ('ldap_bind_dn', ''),
     ('ldap_bind_password', ''),
     ('ldap_username_attr', 'uid'),
+    ('ldap_display_name_attr', 'displayName'),
+    ('ldap_email_attr', 'mail'),
+    ('ldap_department_attr', 'department'),
     ('ldap_auto_create_user', 'true')
 ON CONFLICT (key) DO NOTHING;
 

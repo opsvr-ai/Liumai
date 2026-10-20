@@ -123,6 +123,10 @@ class User(Base):
         default=AuthType.LDAP,
     )
     avatar_url = Column(String(512), nullable=True, default=None)
+    # ── LDAP/AD profile mirror (synced on login; never used for auth) ────────
+    display_name = Column(String(255), nullable=True, default=None)
+    email = Column(String(255), nullable=True, default=None)
+    department = Column(String(255), nullable=True, default=None)
     last_active_at = Column(DateTime(timezone=True), nullable=True, default=None)
     created_at = Column(
         DateTime(timezone=True),

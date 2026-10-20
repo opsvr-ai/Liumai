@@ -1163,6 +1163,12 @@ export interface LdapConfig {
   /** Read-only: a bind password is already stored (never returned). */
   bind_password_set?: boolean;
   username_attr: string;
+  /** LDAP attribute → local display_name (default: displayName, falls back to cn). */
+  display_name_attr: string;
+  /** LDAP attribute → local email (default: mail, falls back to userPrincipalName). */
+  email_attr: string;
+  /** LDAP attribute → local department (default: department, falls back to physicalDeliveryOfficeName/ou). */
+  department_attr: string;
   auto_create_user: boolean;
 }
 
@@ -1650,6 +1656,9 @@ export interface DistilledKnowledgeOut {
 export interface UserOut {
   id: number;
   username: string;
+  display_name?: string | null;
+  email?: string | null;
+  department?: string | null;
   role: string;
   auth_type: string;
   team_id: number;
@@ -1811,6 +1820,9 @@ export const chatHistory = {
 export interface ProfileData {
   id: number;
   username: string;
+  display_name?: string | null;
+  email?: string | null;
+  department?: string | null;
   role: string;
   auth_type: string;
   team_id: number;
