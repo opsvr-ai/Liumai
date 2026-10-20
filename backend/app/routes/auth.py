@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import re
+import secrets as _secrets
+import string as _string
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import (
@@ -23,7 +26,15 @@ from app.auth import (
 )
 from app.models import AuthType, User, UserRole
 from app.models.database import get_db_session
-from app.services.ldap import authenticate_ldap, test_ldap_connection
+from app.services.ldap import (
+    LDAP_UNAVAILABLE_ERRORS,
+    STAGE_AUTO_CREATE,
+    STAGE_SERVICE_BIND,
+    LdapAuthResult,
+    LdapUser,
+    authenticate_ldap_detailed,
+    test_ldap_connection,
+)
 
 router = APIRouter()
 
@@ -43,6 +54,86 @@ class LoginResponse(BaseModel):
     username: str
     role: str
     auth_type: str
+
+
+# ── LDAP local-account provisioning ────────────────────────────────────────
+
+
+def _auto_create_failure_detail(exc: Exception) -> str:
+    """Turn a DB failure during LDAP provisioning into an actionable message.
+
+    The raw exception is logged server-side; the client gets enough detail to
+    tell a unique-constraint clash from a team/role problem without leaking SQL.
+    """
+    text = str(exc).lower()
+    if (
+        isinstance(exc, IntegrityError)
+        or "unique constraint" in text
+        or "duplicate key" in text
+    ):
+        return (
+            "域认证成功，但自动创建本地账号失败：用户名唯一约束冲突"
+            "（本地已存在同名账号或并发创建）。请联系管理员核对该账号。"
+        )
+    if "foreign key" in text or "team" in text or "role" in text:
+        return (
+            "域认证成功，但自动创建本地账号失败：默认团队或角色关联无效。"
+            "请检查团队数据后重试。"
+        )
+    return (
+        "域认证成功，但自动创建本地账号失败"
+        f"（{type(exc).__name__}）。请联系管理员查看后端日志。"
+    )
+
+
+async def _create_ldap_user(db: AsyncSession, ldap_user: LdapUser) -> User:
+    """Create the local mirror account for a successfully authenticated user."""
+    from app.models import Team
+
+    team = await db.get(Team, 1)
+    if team is None:
+        team = Team(id=1, name="Default Team")
+        db.add(team)
+        await db.flush()
+
+    user = User(
+        username=ldap_user.username,
+        role=UserRole.OPERATOR,
+        team_id=team.id,
+        auth_type=AuthType.LDAP,
+    )
+    db.add(user)
+    await db.flush()
+    await db.refresh(user)
+    return user
+
+
+async def _ensure_ldap_local_user(
+    db: AsyncSession, existing: User | None, ldap_user: LdapUser,
+) -> User:
+    """Return the local account for an LDAP login, auto-creating it if allowed."""
+    if existing is not None:
+        return existing
+
+    from app.services.ldap import _ldap_auto_create_user
+
+    if not _ldap_auto_create_user:
+        # Do not reveal that LDAP itself succeeded when provisioning is off.
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    try:
+        return await _create_ldap_user(db, ldap_user)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — unique/team/role failures matter
+        logger.exception(
+            "LDAP auto-create failed for username={} (type={})",
+            ldap_user.username, type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=_auto_create_failure_detail(exc),
+        ) from exc
 
 
 # ── Setup (first-time admin creation) ──────────────────────────────────────
@@ -68,10 +159,6 @@ def _validate_password_strength(pw: str) -> str | None:
     if not any(c in "!@#$%^&*()_+-=[]{}|;:,.<>?/~`" for c in pw):
         return "密码必须包含至少一个特殊字符 (!@#$% 等)"
     return None
-
-
-import secrets as _secrets
-import string as _string
 
 
 def _generate_secure_password(length: int = 20) -> str:
@@ -202,7 +289,7 @@ async def login(
         )
 
     # 3. LDAP auth — enterprise users
-    from app.services.ldap import _ldap_enabled, _ldap_auto_create_user
+    from app.services.ldap import _ldap_enabled
 
     # Mitigate timing side-channel: always run bcrypt against a dummy hash when
     # the user does NOT exist, so response time does not leak valid usernames.
@@ -210,33 +297,32 @@ async def login(
         verify_password(body.password, HASH_DUMMY)
 
     if _ldap_enabled:
-        ldap_user = await authenticate_ldap(body.username, body.password)
-        if ldap_user:
-            if user is None:
-                if _ldap_auto_create_user:
-                    # Ensure default team exists
-                    from app.models import Team
-                    team_row = await db.get(Team, 1)
-                    if team_row is None:
-                        team_row = Team(id=1, name="Default Team")
-                        db.add(team_row)
-                        await db.flush()
-                    default_team = team_row.id
-                    user = User(
-                        username=ldap_user.username,
-                        role=UserRole.OPERATOR,
-                        team_id=default_team,
-                        auth_type=AuthType.LDAP,
-                    )
-                    db.add(user)
-                    await db.flush()
-                    await db.refresh(user)
-                else:
-                    raise HTTPException(status_code=401, detail="用户名或密码错误")
+        try:
+            result = await authenticate_ldap_detailed(body.username, body.password)
+        except Exception:  # noqa: BLE001 — infrastructure failure, not bad creds
+            logger.exception("LDAP authentication raised in login route")
+            raise HTTPException(
+                status_code=503,
+                detail="LDAP 认证服务异常，请稍后重试或联系管理员",
+            )
+
+        if result.ok and result.user is not None:
+            user = await _ensure_ldap_local_user(db, user, result.user)
             return LoginResponse(
                 token=create_token(user), username=user.username, role=user.role.value,
                 auth_type=user.auth_type.value,
             )
+
+        # Service/config failures are NOT wrong passwords: surface a 503 with
+        # the classified Chinese reason so users stop resetting valid passwords.
+        if result.error in LDAP_UNAVAILABLE_ERRORS:
+            raise HTTPException(
+                status_code=503,
+                detail=result.detail or "LDAP 服务不可用或配置错误，请联系管理员",
+            )
+
+        # Unknown user, bad password, locked/expired account → uniform 401.
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
 
     # 4. Neither local nor LDAP matched
     raise HTTPException(status_code=401, detail="用户名或密码错误")
@@ -387,6 +473,107 @@ async def save_ldap_config(
     # Mask password in response
     body.bind_password = ""
     return body
+
+
+# ── Domain-user login diagnostics (admin) ──────────────────────────────────
+
+class LdapTestUserRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    password: str = Field(..., min_length=1)
+
+
+class LdapTestUserResponse(BaseModel):
+    """Contract for ``POST /api/auth/ldap-test-user``.
+
+    ``stage`` is one of:
+    ``service_bind`` / ``search`` / ``user_bind`` / ``auto_create``.
+    ``detail`` is a Chinese explanation and never contains the password or a
+    full distinguished name.
+    """
+
+    ok: bool
+    stage: str
+    detail: str
+
+
+@router.post("/ldap-test-user", response_model=LdapTestUserResponse)
+async def test_ldap_user_login(
+    body: LdapTestUserRequest,
+    db: AsyncSession = Depends(get_db_session),
+    _admin: User = Depends(require_admin),
+) -> LdapTestUserResponse:
+    """Diagnose a domain-user login end-to-end without logging the password.
+
+    Runs the same LDAP chain as ``/login`` and then verifies the local-account
+    provisioning step.  Auto-creation is exercised inside a savepoint and rolled
+    back, so a successful test does not create a user.
+    """
+    result: LdapAuthResult = await authenticate_ldap_detailed(
+        body.username, body.password,
+    )
+    if not result.ok or result.user is None:
+        return LdapTestUserResponse(
+            ok=False,
+            stage=result.stage or STAGE_SERVICE_BIND,
+            detail=result.detail or "LDAP 认证失败",
+        )
+
+    row = await db.execute(select(User).where(User.username == result.user.username))
+    existing: User | None = row.scalar_one_or_none()
+
+    if existing is not None:
+        if existing.auth_type == AuthType.LDAP:
+            return LdapTestUserResponse(
+                ok=True,
+                stage="user_bind",
+                detail=f"LDAP 认证成功；本地账号已存在（角色 {role_key(existing)}）",
+            )
+        return LdapTestUserResponse(
+            ok=False,
+            stage=STAGE_AUTO_CREATE,
+            detail=(
+                "LDAP 认证成功，但本地已存在同名 LOCAL 账号；"
+                "登录会走本地密码校验，域密码不会生效。请更换用户名或由管理员处理该账号。"
+            ),
+        )
+
+    from app.services.ldap import _ldap_auto_create_user
+
+    if not _ldap_auto_create_user:
+        return LdapTestUserResponse(
+            ok=False,
+            stage=STAGE_AUTO_CREATE,
+            detail=(
+                "LDAP 认证成功，但未开启「LDAP 用户首次登录时自动创建本地账号」，"
+                "当前配置下登录会被拒绝（401）。"
+            ),
+        )
+
+    # Exercise the real create path inside a savepoint, then roll it back.
+    try:
+        nested = await db.begin_nested()
+        try:
+            await _create_ldap_user(db, result.user)
+            await nested.rollback()
+        except Exception:
+            await nested.rollback()
+            raise
+    except Exception as exc:  # noqa: BLE001 — this endpoint reports, not raises
+        logger.exception(
+            "LDAP test-user auto-create failed for username={} (type={})",
+            result.user.username, type(exc).__name__,
+        )
+        return LdapTestUserResponse(
+            ok=False,
+            stage=STAGE_AUTO_CREATE,
+            detail=_auto_create_failure_detail(exc),
+        )
+
+    return LdapTestUserResponse(
+        ok=True,
+        stage=STAGE_AUTO_CREATE,
+        detail="LDAP 认证成功，自动创建本地账号校验通过（测试未写入数据库）。",
+    )
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

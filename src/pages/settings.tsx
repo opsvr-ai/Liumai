@@ -19,7 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { authApi, chatModes, hermesDiscovery, type ChatModeOut, type HermesConfig, type HermesInfo, type HermesProbeAttempt, type HermesTestResult, type LdapConfig, type LdapStatus, type LlmConfig, type LlmModelInfo } from "@/lib/api";
+import { authApi, chatModes, hermesDiscovery, type ChatModeOut, type HermesConfig, type HermesInfo, type HermesProbeAttempt, type HermesTestResult, type LdapConfig, type LdapStatus, type LdapTestUserResult, type LlmConfig, type LlmModelInfo } from "@/lib/api";
 import { useAuth } from "@/components/auth/auth-context";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -38,6 +38,13 @@ const CATEGORIES: SettingsCategory[] = [
 ];
 
 /** Human labels for the Hermes capability flags shown in the settings panel. */
+const LDAP_STAGE_LABELS: Record<string, string> = {
+  service_bind: "服务绑定",
+  search: "目录搜索",
+  user_bind: "用户绑定",
+  auto_create: "自动建号",
+};
+
 const FEATURE_LABELS: Record<string, string> = {
   chat_completions_streaming: "对话流式",
   responses_api: "Responses",
@@ -106,6 +113,12 @@ export default function SettingsPage() {
   const [cfgLoading, setCfgLoading] = useState(true);
   const [cfgSaving, setCfgSaving] = useState(false);
   const [cfgExpanded, setCfgExpanded] = useState(false);
+
+  /* ── Domain-user login diagnostic ──────────────────────── */
+  const [ldapTestOpen, setLdapTestOpen] = useState(false);
+  const [ldapTestForm, setLdapTestForm] = useState({ username: "", password: "" });
+  const [ldapTestRunning, setLdapTestRunning] = useState(false);
+  const [ldapTestResult, setLdapTestResult] = useState<LdapTestUserResult | null>(null);
 
   /* ── Hermes config form ────────────────────────────────── */
   const [hermesConfig, setHermesConfig] = useState<HermesConfig | null>(null);
@@ -288,6 +301,36 @@ export default function SettingsPage() {
     try { await authApi.saveLdapConfig(ldapConfig); toast.success("LDAP 配置已保存"); loadLdapStatus(); }
     catch (e: any) { toast.error(`保存失败: ${e.message}`); }
     finally { setCfgSaving(false); }
+  }
+
+  function openLdapTestUser() {
+    setLdapTestOpen(true);
+    setLdapTestResult(null);
+  }
+
+  function closeLdapTestUser() {
+    setLdapTestOpen(false);
+    setLdapTestResult(null);
+    setLdapTestForm({ username: "", password: "" });
+  }
+
+  async function handleTestLdapUser() {
+    if (!ldapTestForm.username.trim() || !ldapTestForm.password) {
+      toast.error("请填写域用户名和密码");
+      return;
+    }
+    setLdapTestRunning(true);
+    setLdapTestResult(null);
+    try {
+      const result = await authApi.ldapTestUser(ldapTestForm);
+      setLdapTestResult(result);
+      if (result.ok) toast.success("域用户登录测试通过");
+      else toast.error(result.detail);
+    } catch (e: any) {
+      toast.error(`测试失败: ${e.message}`);
+    } finally {
+      setLdapTestRunning(false);
+    }
   }
 
   async function handleSaveCache() {
@@ -688,6 +731,7 @@ export default function SettingsPage() {
                     <div className="flex items-center gap-2 pt-2 border-t border-border/50">
                       <Button size="sm" onClick={handleSaveLdap} disabled={cfgSaving}><Save className="h-3.5 w-3.5 mr-1" />{cfgSaving ? "保存中…" : "保存"}</Button>
                       <Button variant="ghostMuted" size="sm" onClick={loadLdapStatus} disabled={ldapLoading}><FlaskConical className="h-3.5 w-3.5 mr-1" />测试连接</Button>
+                      <Button variant="ghostMuted" size="sm" onClick={openLdapTestUser}><Key className="h-3.5 w-3.5 mr-1" />测试域用户登录</Button>
                     </div>
                     {!ldapLoading && ldapStatus && <p className={`text-xs ${ldapStatus.ok ? "text-status-resolved" : "text-status-active"}`}>{ldapStatus.message}</p>}
                   </>) : (<p className="text-sm text-muted-foreground">加载失败</p>)}
@@ -736,6 +780,65 @@ export default function SettingsPage() {
           </>
         )}
       </div>
+
+      {/* ── Domain-user login diagnostic dialog ─────────── */}
+      {ldapTestOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-md space-y-4 rounded-xl bg-surface-primary p-6 shadow-xl">
+            <div>
+              <h3 className="text-sm font-semibold text-text-primary">测试域用户登录</h3>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                走与登录页相同的 LDAP 链路（搜索 / 绑定 / 自动建号），密码不会记录。
+                自动建号只做校验，不会真的写入账号。
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-[11px] text-muted-foreground">域用户名</label>
+              <Input
+                value={ldapTestForm.username}
+                onChange={(e) => setLdapTestForm((f) => ({ ...f, username: e.target.value }))}
+                placeholder="sAMAccountName，例如 zhangsan"
+                autoComplete="off"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-[11px] text-muted-foreground">域密码</label>
+              <Input
+                type="password"
+                value={ldapTestForm.password}
+                onChange={(e) => setLdapTestForm((f) => ({ ...f, password: e.target.value }))}
+                placeholder="仅用于本次测试"
+                autoComplete="off"
+                onKeyDown={(e) => { if (e.key === "Enter") void handleTestLdapUser(); }}
+              />
+            </div>
+            {ldapTestResult && (
+              <div className={cn(
+                "space-y-1.5 rounded-lg border px-3 py-2.5",
+                ldapTestResult.ok
+                  ? "border-status-resolved/30 bg-status-resolved/5"
+                  : "border-status-active/30 bg-status-active/5",
+              )}>
+                <div className="flex items-center gap-2">
+                  <Badge variant={ldapTestResult.ok ? "default" : "outline"} className="text-[10px]">
+                    {ldapTestResult.ok ? "通过" : "失败"}
+                  </Badge>
+                  <span className="text-[11px] text-muted-foreground">
+                    阶段：{LDAP_STAGE_LABELS[ldapTestResult.stage] ?? ldapTestResult.stage}
+                  </span>
+                </div>
+                <p className="text-xs leading-relaxed text-text-secondary">{ldapTestResult.detail}</p>
+              </div>
+            )}
+            <div className="flex justify-end gap-2">
+              <Button variant="ghostMuted" size="sm" onClick={closeLdapTestUser}>关闭</Button>
+              <Button size="sm" onClick={() => void handleTestLdapUser()} disabled={ldapTestRunning}>
+                <FlaskConical className="h-3.5 w-3.5 mr-1" />{ldapTestRunning ? "测试中…" : "开始测试"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Mode editor dialog ───────────────────────────── */}
       {modeEditor && (

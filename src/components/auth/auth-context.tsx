@@ -20,6 +20,27 @@ interface AuthState {
   isAdmin: boolean;
 }
 
+/**
+ * Extract the human-readable FastAPI error message.
+ *
+ * The backend wraps errors as ``{detail, error: {message}}``; rendering the raw
+ * JSON would show LDAP diagnostics as an unreadable blob on the login page.
+ */
+async function readErrorMessage(res: Response, fallback: string): Promise<string> {
+  const raw = await res.text().catch(() => "");
+  try {
+    const parsed = JSON.parse(raw) as {
+      detail?: unknown;
+      error?: { message?: unknown };
+    };
+    const detail = parsed.detail ?? parsed.error?.message;
+    if (typeof detail === "string" && detail.trim()) return detail;
+  } catch {
+    // Plain-text proxy response — fall through.
+  }
+  return raw.trim() || fallback;
+}
+
 const AuthContext = createContext<AuthState>({
   token: null, username: null, role: null, authType: null,
   login: async () => {}, setup: async (_u, _p, _c) => {}, checkSetup: async () => false,
@@ -48,7 +69,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       body: JSON.stringify({ username: user, password }),
     });
     if (!res.ok) {
-      throw new Error(await res.text().catch(() => "登录失败"));
+      throw new Error(await readErrorMessage(res, "登录失败"));
     }
     const data = await res.json() as { token: string; username: string; role: string; auth_type?: string };
     localStorage.setItem("liumai_token", data.token);
@@ -68,8 +89,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       body: JSON.stringify({ username: user, password, password_confirm: passwordConfirm }),
     });
     if (!res.ok) {
-      const msg = await res.text().catch(() => "初始化失败");
-      throw new Error(msg);
+      throw new Error(await readErrorMessage(res, "初始化失败"));
     }
     const data = await res.json() as { token: string; username: string; role: string; auth_type?: string };
     localStorage.setItem("liumai_token", data.token);

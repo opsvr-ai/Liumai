@@ -1164,6 +1164,14 @@ export interface LdapConfig {
   auto_create_user: boolean;
 }
 
+/** Result of POST /auth/ldap-test-user (admin-only domain login diagnostic). */
+export interface LdapTestUserResult {
+  ok: boolean;
+  /** service_bind | search | user_bind | auto_create */
+  stage: string;
+  detail: string;
+}
+
 export interface HermesConfig {
   url: string;
   api_key: string;
@@ -1252,6 +1260,10 @@ export const authApi = {
   },
   saveLdapConfig(data: LdapConfig) {
     return request<LdapConfig>("PUT", "/auth/ldap-config", data);
+  },
+  /** Admin-only: test an actual domain-user login through the full LDAP chain. */
+  ldapTestUser(data: { username: string; password: string }) {
+    return request<LdapTestUserResult>("POST", "/auth/ldap-test-user", data);
   },
   getHermesConfig() {
     return request<HermesConfig>("GET", "/auth/hermes-config");
