@@ -1160,6 +1160,8 @@ export interface LdapConfig {
   user_filter: string;
   bind_dn: string;
   bind_password: string;
+  /** Read-only: a bind password is already stored (never returned). */
+  bind_password_set?: boolean;
   username_attr: string;
   auto_create_user: boolean;
 }

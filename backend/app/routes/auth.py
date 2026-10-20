@@ -393,6 +393,7 @@ class LdapConfig(BaseModel):
     user_filter: str = "(uid={username})"
     bind_dn: str = ""
     bind_password: str = ""
+    bind_password_set: bool = False  # read-only flag: a password is stored
     username_attr: str = "uid"
     auto_create_user: bool = True
 
@@ -428,6 +429,7 @@ async def get_ldap_config(
         user_filter=_get("ldap_user_filter", "(uid={username})"),
         bind_dn=_get("ldap_bind_dn", ""),
         bind_password="",  # Never return the actual password
+        bind_password_set=bool(_get("ldap_bind_password", "")),
         username_attr=_get("ldap_username_attr", "uid"),
         auto_create_user=_get("ldap_auto_create_user", "true") == "true",
     )
@@ -452,9 +454,16 @@ async def save_ldap_config(
         "ldap_auto_create_user": "true" if body.auto_create_user else "false",
     }
 
-    # Only update password if one was provided (non-empty)
-    if body.bind_password and body.bind_password.strip():
-        entries["ldap_bind_password"] = body.bind_password.strip()
+    # Resolve the bind password.  The UI never receives the stored value, so an
+    # empty field means "keep what is already saved"; it must NOT wipe the
+    # password and it must NOT drop it from the runtime reload either (the old
+    # code only added it when non-empty, so saving unrelated settings silently
+    # reset the in-memory password to the env default until restart).
+    current = {r.key: r.value for r in (await db.execute(select(SystemConfig))).scalars()}
+    stored_pw = current.get("ldap_bind_password", "")
+    incoming_pw = (body.bind_password or "").strip()
+    resolved_pw = incoming_pw or stored_pw
+    entries["ldap_bind_password"] = resolved_pw
 
     for key, value in entries.items():
         row = await db.get(SystemConfig, key)
@@ -472,6 +481,7 @@ async def save_ldap_config(
 
     # Mask password in response
     body.bind_password = ""
+    body.bind_password_set = bool(resolved_pw)
     return body
 
 
