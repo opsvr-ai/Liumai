@@ -19,7 +19,7 @@ import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
-import { authApi, chatModes, hermesDiscovery, type ChatModeOut, type HermesConfig, type HermesInfo, type LdapConfig, type LdapStatus, type LlmConfig, type LlmModelInfo } from "@/lib/api";
+import { authApi, chatModes, hermesDiscovery, type ChatModeOut, type HermesConfig, type HermesInfo, type HermesProbeAttempt, type HermesTestResult, type LdapConfig, type LdapStatus, type LlmConfig, type LlmModelInfo } from "@/lib/api";
 import { useAuth } from "@/components/auth/auth-context";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -54,6 +54,45 @@ const FEATURE_LABELS: Record<string, string> = {
   memory_write_api: "记忆写入",
 };
 
+/**
+ * Compact list of URLs the backend tried while probing Hermes health.
+ * Diagnostics only — never dump the full response body into the UI.
+ */
+function ProbeAttemptList({ attempts }: { attempts?: HermesProbeAttempt[] | null }) {
+  if (!attempts?.length) return null;
+  return (
+    <div className="rounded-md border border-border/60 bg-surface-secondary/40 px-2.5 py-2">
+      <div className="mb-1 text-[10px] text-muted-foreground">探测明细（{attempts.length} 次）</div>
+      <ul className="space-y-1">
+        {attempts.map((attempt, index) => {
+          const reachable = attempt.status != null && attempt.status >= 200 && attempt.status < 400;
+          return (
+            <li key={`${attempt.url}-${index}`} className="text-[10px] leading-snug">
+              <div className="flex items-start gap-1.5">
+                <span
+                  className={cn(
+                    "shrink-0 rounded px-1 py-px font-mono",
+                    reachable ? "bg-status-resolved/10 text-status-resolved" : "bg-status-active/10 text-status-active",
+                  )}
+                >
+                  {attempt.status != null ? `HTTP ${attempt.status}` : "ERR"}
+                </span>
+                <span className="min-w-0 break-all font-mono text-text-secondary">{attempt.url}</span>
+                {attempt.auth === "none" && <span className="shrink-0 text-muted-foreground">无 Auth</span>}
+              </div>
+              {attempt.error && (
+                <div className="mt-0.5 break-all text-muted-foreground" title={attempt.error}>
+                  {attempt.error.length > 180 ? `${attempt.error.slice(0, 180)}…` : attempt.error}
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const { username, role } = useAuth();
   const [activeCat, setActiveCat] = useState("ai");
@@ -74,6 +113,8 @@ export default function SettingsPage() {
   const [hermesSaving, setHermesSaving] = useState(false);
   const [hermesExpanded, setHermesExpanded] = useState(true);
   const [hermesTesting, setHermesTesting] = useState(false);
+  /** Last POST /auth/hermes-test result — drives the inline diagnostics panel. */
+  const [hermesTest, setHermesTest] = useState<HermesTestResult | null>(null);
   /** Rich capability report from GET /chat/hermes-info. */
   const [hermesInfo, setHermesInfo] = useState<HermesInfo | null>(null);
 
@@ -221,13 +262,21 @@ export default function SettingsPage() {
 
   async function handleTestHermes() {
     setHermesTesting(true);
+    setHermesTest(null);
     try {
-      const info = await chatModes.hermesInfo();
-      setHermesInfo(info);
-      if (info.ok) {
-        toast.success(`Hermes ${info.version ?? ""} 运行正常 · ${info.latency_ms ?? "?"}ms`);
+      const result = await authApi.testHermes();
+      setHermesTest(result);
+      if (result.ok) {
+        if (result.warning) {
+          toast.warning(result.warning);
+        } else {
+          toast.success(`Hermes 运行正常${result.status ? ` (HTTP ${result.status})` : ""} · ${result.latency_ms ?? "?"}ms`);
+        }
+        // Refresh the rich capability report only when the probe succeeded.
+        chatModes.hermesInfo().then(setHermesInfo).catch(() => {});
       } else {
-        toast.error(info.error ?? "Hermes 未就绪");
+        setHermesInfo(null);
+        toast.error(result.message);
       }
     } catch (e: any) { toast.error(`测试失败: ${e.message}`); }
     finally { setHermesTesting(false); }
@@ -334,6 +383,24 @@ export default function SettingsPage() {
                       <Button size="sm" onClick={handleSaveHermes} disabled={hermesSaving}><Save className="h-3.5 w-3.5 mr-1" />{hermesSaving ? "保存中…" : "保存"}</Button>
                       <Button variant="ghostMuted" size="sm" onClick={handleTestHermes} disabled={hermesTesting}><FlaskConical className="h-3.5 w-3.5 mr-1" />{hermesTesting ? "测试中…" : "测试连接"}</Button>
                     </div>
+                    {hermesTest && (!hermesTest.ok || hermesTest.warning) && (
+                      <div
+                        className={cn(
+                          "rounded-lg border px-3 py-2 space-y-1.5",
+                          hermesTest.ok
+                            ? "border-amber-500/30 bg-amber-500/10"
+                            : "border-status-active/30 bg-status-active/5",
+                        )}
+                      >
+                        <p className={cn("text-xs font-medium", hermesTest.ok ? "text-amber-700 dark:text-amber-400" : "text-status-active")}>
+                          {hermesTest.message}
+                        </p>
+                        {!hermesTest.ok && hermesTest.hint && (
+                          <p className="text-xs text-text-secondary"><span className="text-muted-foreground">建议：</span>{hermesTest.hint}</p>
+                        )}
+                        {!hermesTest.ok && <ProbeAttemptList attempts={hermesTest.attempts} />}
+                      </div>
+                    )}
                   </>) : (<p className="text-sm text-muted-foreground">加载失败</p>)}
                 </CardContent>
               )}
@@ -359,8 +426,19 @@ export default function SettingsPage() {
                   </div>
                 </CardHeader>
                 <CardContent className="space-y-3">
+                  {hermesInfo.warning && (
+                    <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-700 dark:text-amber-400">
+                      {hermesInfo.warning}
+                    </p>
+                  )}
                   {hermesInfo.error ? (
-                    <p className="text-xs text-status-active">{hermesInfo.error}</p>
+                    <div className="space-y-2">
+                      <p className="text-xs text-status-active">{hermesInfo.error}</p>
+                      {hermesInfo.probe?.hint && (
+                        <p className="text-xs text-text-secondary"><span className="text-muted-foreground">建议：</span>{hermesInfo.probe.hint}</p>
+                      )}
+                      <ProbeAttemptList attempts={hermesInfo.probe?.attempts} />
+                    </div>
                   ) : (
                     <>
                       <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">

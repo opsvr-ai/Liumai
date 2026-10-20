@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import re
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -472,55 +472,86 @@ async def save_hermes_config(
     return HermesConfigOut(url=body.url, api_key=_mask_key(entries["hermes_api_key"]))
 
 
+class HermesTestAttempt(BaseModel):
+    url: str
+    status: int | None = None
+    error: str | None = None
+    auth: str | None = None
+
+
 class HermesTestResult(BaseModel):
     ok: bool
     message: str
+    hint: str | None = None
+    warning: str | None = None
+    url: str | None = None
+    status: int | None = None
+    latency_ms: int | None = None
+    attempts: list[HermesTestAttempt] = Field(default_factory=list)
 
 
 @router.post("/hermes-test", response_model=HermesTestResult)
 async def test_hermes_connection(
     _admin: User = Depends(require_admin),
 ) -> HermesTestResult:
-    """Test Hermes connectivity via its GET /health/detailed endpoint."""
-    from app.services.hermes import _hermes_url, _hermes_api_key
+    """Test Hermes connectivity through the shared health fallback chain.
 
-    import httpx
-    # The stored URL is the OpenAI-compatible base (``http://host:8642/v1``),
-    # but /health/detailed lives at the server root — strip the /v1 suffix
-    # (same as chat.py:hermes_health).  Without this the probe 404s even
-    # when Hermes is perfectly healthy.
-    health_base = _hermes_url.rstrip("/")
-    if health_base.endswith("/v1"):
-        health_base = health_base[:-3]
-    url = f"{health_base}/health/detailed"
-    headers: dict[str, str] = {}
-    if _hermes_api_key:
-        headers["Authorization"] = f"Bearer {_hermes_api_key}"
+    Uses ``HermesClient.get_health_detailed`` (``/health/detailed`` →
+    ``/health`` → ``/v1/health``, Bearer with one unauthenticated retry) so the
+    result matches what the chat layer actually sees.  The response carries the
+    actionable hint and every attempted URL/status; the UI renders those
+    instead of a single opaque "无法获取" message.
+    """
+    from app.services.hermes import HermesClient
 
+    client = HermesClient(timeout=15.0)
+    t0 = time.monotonic()
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-            resp = await client.get(url, headers=headers)
-        if 200 <= resp.status_code < 400:
-            detail = ""
-            try:
-                body = resp.json()
-                detail = f" — {json.dumps(body, ensure_ascii=False)}"
-            except Exception:
-                detail = ""
-            return HermesTestResult(ok=True, message=f"Hermes 服务正常 (HTTP {resp.status_code}){detail}")
-        elif resp.status_code in (401, 403):
-            return HermesTestResult(
-                ok=False,
-                message=f"Hermes 认证失败 (HTTP {resp.status_code}) — API Key 不正确或未配置",
-            )
-        else:
-            return HermesTestResult(ok=False, message=f"Hermes 返回 {resp.status_code}: {resp.text[:200]}")
-    except httpx.ConnectError:
-        return HermesTestResult(ok=False, message="无法连接到 Hermes 服务 — 请检查地址和网络")
-    except httpx.TimeoutException:
-        return HermesTestResult(ok=False, message="连接 Hermes 超时 — 请检查网络延迟")
-    except Exception as exc:
-        return HermesTestResult(ok=False, message=f"连接失败: {exc}")
+        health = await client.get_health_detailed()
+    except Exception as exc:  # defensive: the probe itself never raises
+        logger.exception("hermes-test probe failed")
+        return HermesTestResult(
+            ok=False,
+            message=f"Hermes 连接失败: {exc}",
+            hint="健康探测异常 — 请查看后端日志",
+            latency_ms=round((time.monotonic() - t0) * 1000),
+        )
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            logger.debug("hermes-test: client close failed")
+
+    latency_ms = round((time.monotonic() - t0) * 1000)
+    probe = health.get("_probe") if isinstance(health, dict) else None
+    probe = probe if isinstance(probe, dict) else {}
+    attempts = [HermesTestAttempt(**a) for a in (probe.get("attempts") or [])]
+
+    if probe.get("ok"):
+        status_code = probe.get("status")
+        url = probe.get("url")
+        warning = probe.get("warning")
+        message = f"Hermes 服务正常 (HTTP {status_code}, {url})"
+        if warning:
+            message = f"{message} — {warning}"
+        return HermesTestResult(
+            ok=True,
+            message=message,
+            warning=warning,
+            url=url,
+            status=status_code,
+            latency_ms=latency_ms,
+            attempts=attempts,
+        )
+
+    hint = probe.get("hint") or "健康端点探测失败 — 请检查 API 地址、端口与 API Key"
+    return HermesTestResult(
+        ok=False,
+        message=f"Hermes 连接失败：{hint}",
+        hint=hint,
+        latency_ms=latency_ms,
+        attempts=attempts,
+    )
 
 
 # ── LLM model config (platform-internal use) ────────────────────────────────

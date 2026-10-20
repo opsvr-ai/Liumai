@@ -23,6 +23,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { rca, reportApi } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 
 /* ==========================================================================
@@ -418,12 +419,9 @@ export default function IncidentWorkspacePage() {
         ? `处置建议：${info.recommended_actions.map(toText).filter(Boolean).join("；")}`
         : "",
     ].filter(Boolean);
-    try {
-      await navigator.clipboard.writeText(lines.join("\n"));
-      toast.success("事件摘要已复制");
-    } catch {
-      toast.error("复制失败，请手动选择文本");
-    }
+    const ok = await copyText(lines.join("\n"));
+    if (ok) toast.success("事件摘要已复制");
+    else toast.error("复制失败，请手动选择文本");
   }
 
   function openChat() {

@@ -1169,6 +1169,35 @@ export interface HermesConfig {
   api_key: string;
 }
 
+/** One URL tried by the backend's Hermes health fallback chain. */
+export interface HermesProbeAttempt {
+  url: string;
+  status: number | null;
+  error?: string | null;
+  auth?: string | null;
+}
+
+/** Diagnostic metadata returned with Hermes health results. */
+export interface HermesProbe {
+  ok?: boolean;
+  attempts: HermesProbeAttempt[];
+  resolved_url?: string | null;
+  hint?: string | null;
+  warning?: string | null;
+}
+
+/** Result of POST /auth/hermes-test — failures are HTTP 200 by design. */
+export interface HermesTestResult {
+  ok: boolean;
+  message: string;
+  hint?: string | null;
+  warning?: string | null;
+  url?: string | null;
+  status?: number | null;
+  latency_ms?: number | null;
+  attempts: HermesProbeAttempt[];
+}
+
 export interface LlmConfig {
   base_url: string;
   api_key: string;
@@ -1231,7 +1260,7 @@ export const authApi = {
     return request<HermesConfig>("PUT", "/auth/hermes-config", data);
   },
   testHermes() {
-    return request<{ ok: boolean; message: string }>("POST", "/auth/hermes-test");
+    return request<HermesTestResult>("POST", "/auth/hermes-test");
   },
   getLlmConfig() {
     return request<LlmConfig>("GET", "/auth/llm-config");
@@ -1708,6 +1737,8 @@ export interface HermesInfo {
   ok: boolean;
   latency_ms?: number;
   error?: string;
+  warning?: string;
+  probe?: HermesProbe;
   version?: string;
   platform?: string;
   gateway_state?: string;

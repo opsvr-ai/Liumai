@@ -6,6 +6,7 @@ import { LiumaiLogoFull } from "@/components/liumai-logo-full";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Check, X, KeyRound, Copy, ShieldCheck, ShieldAlert, ShieldQuestion } from "lucide-react";
+import { copyText } from "@/lib/clipboard";
 
 /* ── Password strength helpers ──────────────────────────────── */
 
@@ -84,8 +85,10 @@ export default function LoginPage() {
       setPassword(pw);
       setConfirm(pw);
       setShowPw(true);
-      setCopyLabel("已复制");
-      try { await navigator.clipboard.writeText(pw); } catch { /* clipboard may be blocked */ }
+      // Over plain HTTP ``navigator.clipboard`` is unavailable: use the shared
+      // fallback and only claim success when a copy path actually worked.
+      const copied = await copyText(pw);
+      setCopyLabel(copied ? "已复制" : "复制失败");
       setTimeout(() => setCopyLabel("复制"), 2000);
     } catch { /* endpoint may not exist yet */ }
   }, []);
@@ -223,7 +226,9 @@ export default function LoginPage() {
                 <div className="rounded-lg bg-surface-secondary border border-border/50 px-3 py-2 flex items-center justify-between">
                   <code className="text-[13px] text-text-primary select-all">{genPw}</code>
                   <button type="button" onClick={async () => {
-                    try { await navigator.clipboard.writeText(genPw); setCopyLabel("已复制"); setTimeout(() => setCopyLabel("复制"), 2000); } catch {}
+                    const copied = await copyText(genPw);
+                    setCopyLabel(copied ? "已复制" : "复制失败");
+                    setTimeout(() => setCopyLabel("复制"), 2000);
                   }} className="text-[11px] text-interactive-primary hover:underline ml-2 shrink-0 flex items-center gap-1">
                     <Copy className="h-3 w-3" />{copyLabel}
                   </button>

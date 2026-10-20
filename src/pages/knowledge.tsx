@@ -22,6 +22,7 @@ import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize from "rehype-sanitize";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
 
 /* ════════════════════════════════════════════════════════
    Helpers
@@ -566,7 +567,7 @@ function WebhookTab({ isAdmin, onRefresh }: { isAdmin: boolean; onRefresh: () =>
                 </div>
                 <div className="flex items-center gap-1 shrink-0">
                   <code className="text-[10px] text-muted-foreground bg-surface-primary rounded px-1.5 py-0.5 max-w-[180px] truncate hidden sm:inline">{url}</code>
-                  <Button size="sm" variant="ghost" onClick={() => { navigator.clipboard.writeText(url); toast.success("已复制"); }}><Copy className="h-3.5 w-3.5" /></Button>
+                  <Button size="sm" variant="ghost" onClick={() => { void copyText(url).then((ok) => ok ? toast.success("已复制") : toast.error("复制失败")); }}><Copy className="h-3.5 w-3.5" /></Button>
                   {isAdmin && <Button size="sm" variant="ghost" onClick={() => { knowledgeApi.deleteWebhook(w.source).then(() => load()).catch(() => toast.error("删除失败")); }}><Trash2 className="h-3.5 w-3.5 text-muted-foreground" /></Button>}
                 </div>
               </div>;

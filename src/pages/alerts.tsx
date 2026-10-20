@@ -45,6 +45,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
+import { copyText as copyToClipboard } from "@/lib/clipboard";
 import {
   alertsApi,
   rca,
@@ -473,11 +474,13 @@ export default function AlertsPage() {
     }
   }
 
-  function copyText(text: string, label: string) {
-    navigator.clipboard?.writeText(text).then(
-      () => toast.success(`${label}已复制`),
-      () => toast.error("复制失败"),
-    );
+  async function copyText(text: string, label: string) {
+    // ``navigator.clipboard`` is undefined over plain HTTP (intranet IP), so use
+    // the shared helper — it falls back to execCommand and only claims success
+    // when a copy path actually succeeded.
+    const ok = await copyToClipboard(text);
+    if (ok) toast.success(`${label}已复制`);
+    else toast.error("复制失败");
   }
 
   function updateDraft(mutator: (p: AlertPolicyExt) => void) {

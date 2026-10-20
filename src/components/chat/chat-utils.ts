@@ -7,29 +7,18 @@
  * ========================================================================== */
 
 import type { DisplayMessage } from "@/hooks/useChat";
+import { copyText } from "@/lib/clipboard";
 
-/** Copy text to the clipboard with a legacy fallback for insecure contexts. */
-export async function copyText(text: string): Promise<boolean> {
-  if (!text) return false;
-  try {
-    await navigator.clipboard.writeText(text);
-    return true;
-  } catch {
-    try {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-}
+/**
+ * Copy text to the clipboard with a legacy fallback for insecure contexts.
+ *
+ * Re-exported from ``@/lib/clipboard`` so the message / code-block buttons and
+ * the rest of the app share one implementation.  ``navigator.clipboard`` is
+ * unavailable over plain HTTP on non-localhost origins; the fallback uses a
+ * hidden textarea + ``document.execCommand("copy")`` instead of failing
+ * silently.
+ */
+export { copyText };
 
 /** Relative timestamp for the session sidebar. */
 export function relativeTime(iso: string): string {

@@ -11,6 +11,8 @@ capability is ever lost.
 */
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { toast } from "sonner";
+import { uid } from "@/lib/uid";
 import {
   ApiError,
   chatHistory,
@@ -332,7 +334,7 @@ export function useChat() {
       return [
         ...prev,
         {
-          id: crypto.randomUUID(),
+          id: uid(),
           role: "assistant",
           content,
           isStreaming: true,
@@ -360,7 +362,7 @@ export function useChat() {
       return [
         ...prev,
         {
-          id: crypto.randomUUID(),
+          id: uid(),
           role: "assistant",
           content: "",
           reasoning: content,
@@ -479,15 +481,25 @@ export function useChat() {
         provider?: string;
       },
     ) => {
-      if (!content.trim() || isStreaming) return;
+      const text = content.trim();
+      if (!text) return;
+
+      // A live turn owns the composer: the send button is disabled while
+      // streaming.  If ``isStreaming`` is set without an abort controller or
+      // active run, a previous turn failed before its finally block — settle it
+      // instead of silently swallowing this send.
+      if (isStreaming) {
+        if (abortRef.current || runIdRef.current) return;
+        setIsStreaming(false);
+      }
 
       abortRef.current?.abort();
       const turnToken = ++turnTokenRef.current;
 
       const userMsg: DisplayMessage = {
-        id: crypto.randomUUID(),
+        id: uid(),
         role: "user",
-        content: content.trim(),
+        content: text,
       };
 
       setMessages((prev) => [...prev, userMsg]);
@@ -499,6 +511,11 @@ export function useChat() {
       runIdRef.current = null;
       stoppedRef.current = false;
       answeredApprovalIdsRef.current.clear();
+
+      // Everything after this point can fail (session creation, message
+      // construction, network).  The outer catch guarantees the turn is
+      // surfaced and ``isStreaming`` is released — no silent failures.
+      try {
 
       // Make sure the turn has a platform chat session before anything streams:
       // agent artifacts live in ``hermes-files/<session_id>/`` and the download
@@ -725,11 +742,12 @@ export function useChat() {
           setMessages((prev) => [
             ...prev,
             {
-              id: crypto.randomUUID(),
+              id: uid(),
               role: "error",
               content: msg,
             },
           ]);
+          toast.error(`发送失败: ${msg}`);
         }
       } finally {
         // Only the newest turn may settle shared state: a session switch (or a
@@ -742,6 +760,25 @@ export function useChat() {
         }
         if (abortRef.current === controller) {
           abortRef.current = null;
+        }
+      }
+      } catch (err: unknown) {
+        // Failure before / outside the stream loop (session bootstrap, message
+        // construction, an unexpected throw inside the stream handlers).  Keep
+        // the failure visible and always release the composer.
+        if (turnTokenRef.current === turnToken) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setError(msg);
+          setMessages((prev) => [
+            ...prev,
+            { id: uid(), role: "error", content: msg },
+          ]);
+          setIsStreaming(false);
+          setActiveRunId(null);
+          setPendingApproval(null);
+          runIdRef.current = null;
+          abortRef.current = null;
+          toast.error(`发送失败: ${msg}`);
         }
       }
     },
@@ -1155,7 +1192,7 @@ function _withRunOutput(
   if (lastAssistant === -1) {
     return [
       ...messages,
-      { id: crypto.randomUUID(), role: "assistant", content: output },
+      { id: uid(), role: "assistant", content: output },
     ];
   }
   const last = messages[lastAssistant];
@@ -1167,6 +1204,6 @@ function _withRunOutput(
   }
   return [
     ...messages,
-    { id: crypto.randomUUID(), role: "assistant", content: output },
+    { id: uid(), role: "assistant", content: output },
   ];
 }

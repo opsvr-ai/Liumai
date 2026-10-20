@@ -1999,7 +1999,7 @@ async def hermes_info(
 
     Admin-only: this is the settings screen's engine inspector.
     """
-    from app.services.hermes import _hermes_url, _hermes_api_key, HermesClient
+    from app.services.hermes import _hermes_url, HermesClient
 
     base = {"url": _hermes_url, "ok": False}
 
@@ -2012,8 +2012,27 @@ async def hermes_info(
         health = await client.get_health_detailed()
         latency_ms = round((time.monotonic() - t0) * 1000)
 
-        if not health:
-            return {**base, "latency_ms": latency_ms, "error": "无法获取 /health/detailed"}
+        # ``get_health_detailed`` never raises: it returns the successful body
+        # plus ``_probe`` metadata, or ``{"_probe": {"ok": False}}``.  Surface
+        # every attempted URL and an actionable hint instead of the old opaque
+        # "无法获取 /health/detailed".
+        probe = health.get("_probe") if isinstance(health, dict) else None
+        if not isinstance(probe, dict) or not probe.get("ok"):
+            probe = probe if isinstance(probe, dict) else {}
+            hint = (
+                probe.get("hint")
+                or "健康端点探测失败 — 请检查 API 地址、端口与 API Key"
+            )
+            return {
+                **base,
+                "latency_ms": latency_ms,
+                "error": "Hermes 健康检查失败",
+                "probe": {
+                    "attempts": probe.get("attempts") or [],
+                    "resolved_url": probe.get("resolved_url"),
+                    "hint": hint,
+                },
+            }
 
         caps = await client.get_capabilities()
         models = await client.get_model_options() if caps.get("endpoints", {}).get("model_options") else {}
@@ -2062,9 +2081,10 @@ async def hermes_info(
                 }
                 break
 
-        return {
+        health_status = readiness.get("status") or health.get("status") or "ok"
+        result = {
             **base,
-            "ok": readiness.get("status", "ok") == "ok",
+            "ok": health_status == "ok",
             "latency_ms": latency_ms,
             "version": health.get("version") or caps.get("platform"),
             "platform": health.get("platform"),
@@ -2084,8 +2104,21 @@ async def hermes_info(
                 else None
             ),
         }
+        # Success via a fallback endpoint is usable, but the caller should know
+        # it is missing the detailed payload (readiness checks, disk, …).
+        if probe.get("warning"):
+            result["warning"] = probe["warning"]
+        return result
     except Exception as exc:  # never 500 the settings page on a shape change
         logger.exception("hermes-info failed")
-        return {**base, "error": f"读取 Hermes 能力信息失败: {exc}"}
+        return {
+            **base,
+            "error": f"读取 Hermes 能力信息失败: {exc}",
+            "probe": {
+                "attempts": [],
+                "resolved_url": None,
+                "hint": "读取 Hermes 能力信息失败 — 请查看后端日志",
+            },
+        }
     finally:
         await client.close()

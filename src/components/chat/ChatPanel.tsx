@@ -698,7 +698,14 @@ export const ChatPanel: FC = () => {
     }
     const text = input;
     setInput("");
-    await submitTurn(text);
+    try {
+      await submitTurn(text);
+    } catch (err: unknown) {
+      // Final safety net: the hook surfaces its own failures, but a rejected
+      // send must never disappear silently (nor lose the typed text).
+      setInput((current) => current || text);
+      toast.error(`发送失败: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }, [input, isStreaming, canSteer, handleSteer, submitTurn]);
 
   // A steer hit an already-finished run: resend the text as a normal turn.
@@ -706,7 +713,9 @@ export const ChatPanel: FC = () => {
     if (isStreaming || !pendingResend) return;
     const text = pendingResend;
     setPendingResend(null);
-    void submitTurn(text);
+    void submitTurn(text).catch((err: unknown) => {
+      toast.error(`发送失败: ${err instanceof Error ? err.message : String(err)}`);
+    });
   }, [isStreaming, pendingResend, submitTurn]);
 
   /* ====================================================================

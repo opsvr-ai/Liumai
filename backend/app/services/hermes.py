@@ -193,6 +193,162 @@ def _hermes_error_message(body: bytes | str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Health probe (fallback chain)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Hermes builds differ in *which* health endpoint exists and whether it requires
+# auth: ``/health/detailed`` is bearer-protected on 0.22+ while ``/health`` is
+# public.  A single 404/401 must therefore not be reported as "unreachable";
+# probe the known variants in order and keep every attempt so the settings UI
+# can show what was tried instead of a single opaque error.
+
+HEALTH_PROBE_TIMEOUT = 8.0
+HEALTH_PROBE_CONNECT_TIMEOUT = 5.0
+
+_DNS_ERROR_MARKERS = (
+    "getaddrinfo",
+    "name or service not known",
+    "nodename nor servname",
+    "name resolution",
+    "no address associated",
+    "errno 11001",
+)
+
+
+def _classify_probe_error(exc: httpx.RequestError) -> tuple[str, str]:
+    """Map a transport exception to ``(kind, message)`` for diagnostics."""
+    message = f"{type(exc).__name__}: {exc}"[:400]
+    lowered = message.lower()
+    if any(marker in lowered for marker in _DNS_ERROR_MARKERS):
+        return "dns", message
+    if (
+        isinstance(exc, httpx.TimeoutException)
+        or "timed out" in lowered
+        or "timeout" in lowered
+    ):
+        return "timeout", message
+    if isinstance(exc, httpx.ConnectError) or any(
+        marker in lowered
+        for marker in (
+            "connection refused",
+            "actively refused",
+            "unreachable",
+            "no route to host",
+        )
+    ):
+        return "connect", message
+    return "request", message
+
+
+async def _probe_health_url(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: dict[str, str],
+    *,
+    auth: str,
+) -> dict[str, Any]:
+    """Request one health URL; never raises.
+
+    The returned object contains internal keys (``kind`` / ``body`` / ``text``)
+    plus a public ``attempt`` entry ``{url, status, error, auth}``.
+    """
+    try:
+        resp = await client.get(url, headers=headers)
+    except httpx.RequestError as exc:
+        kind, error = _classify_probe_error(exc)
+        return {
+            "ok": False,
+            "status": None,
+            "kind": kind,
+            "body": None,
+            "attempt": {"url": url, "status": None, "error": error, "auth": auth},
+        }
+
+    body_text = resp.text or ""
+    if 200 <= resp.status_code < 300:
+        try:
+            data: Any = resp.json()
+        except ValueError:
+            data = None
+        return {
+            "ok": True,
+            "status": resp.status_code,
+            "kind": "ok",
+            "body": data,
+            "text": body_text,
+            "attempt": {
+                "url": url,
+                "status": resp.status_code,
+                "error": None,
+                "auth": auth,
+            },
+        }
+
+    # A short body excerpt is often the only clue (e.g. "Invalid gateway API
+    # key"), so keep it in the attempt — never the full response.
+    snippet = " ".join(body_text.split())[:200]
+    error = f"HTTP {resp.status_code}" + (f": {snippet}" if snippet else "")
+    return {
+        "ok": False,
+        "status": resp.status_code,
+        "kind": "http",
+        "body": None,
+        "attempt": {
+            "url": url,
+            "status": resp.status_code,
+            "error": error,
+            "auth": auth,
+        },
+    }
+
+
+def _health_payload(
+    result: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    warning: str | None,
+) -> dict[str, Any]:
+    """Merge a successful health body with its ``_probe`` metadata."""
+    body = result.get("body")
+    if isinstance(body, dict):
+        payload: dict[str, Any] = dict(body)
+    elif body is not None:
+        payload = {"data": body}
+    else:
+        text = (result.get("text") or "").strip()
+        payload = {"body": text[:2000]} if text else {}
+
+    url = result["attempt"]["url"]
+    payload["_probe"] = {
+        "ok": True,
+        "url": url,
+        "status": result.get("status"),
+        "attempts": attempts,
+        "resolved_url": url,
+        "hint": None,
+        "warning": warning,
+    }
+    return payload
+
+
+def _health_hint(attempts: list[dict[str, Any]], kinds: list[str]) -> str:
+    """Turn the probe attempts into one actionable Chinese hint."""
+    statuses = [
+        attempt.get("status")
+        for attempt in attempts
+        if attempt.get("status") is not None
+    ]
+    if "dns" in kinds:
+        return "主机名无法解析"
+    if any(status in (401, 403) for status in statuses):
+        return "API Key 不正确或未配置（Hermes 0.22+ /health/detailed 需鉴权）"
+    if any(kind in ("timeout", "connect") for kind in kinds):
+        return "后端所在主机无法访问该地址（内网 ACL/端口/容器网络）"
+    if statuses and all(status == 404 for status in statuses):
+        return "Hermes 版本不支持这些健康端点，但服务可能正常，请检查 API 版本"
+    return "健康端点探测失败 — 请检查 API 地址、端口与 API Key"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Client
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -929,15 +1085,123 @@ class HermesClient:
             return {}
 
     async def get_health_detailed(self) -> dict[str, Any]:
-        """Fetch ``GET /health/detailed`` (root-level, not under /v1)."""
-        try:
-            resp = await self._client.get(f"{self._root_url()}/health/detailed")
-            resp.raise_for_status()
-            data = resp.json()
-            return data if isinstance(data, dict) else {}
-        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as exc:
-            logger.warning("Hermes /health/detailed unavailable: {}", exc)
-            return {}
+        """Probe Hermes health endpoints, preferring the detailed one.
+
+        Fallback chain (same host, so URL prefixes and ``/v1`` variants are all
+        covered):
+
+        1. ``{root}/health/detailed`` — richest payload, bearer-protected on
+           Hermes 0.22+ (older deployments may answer 401/403/404).
+        2. ``{root}/health`` — public on every known build.
+        3. ``{root}/v1/health`` — some proxies only expose the versioned path.
+
+        Every request carries the Bearer token; a 401/403 is retried **once
+        without** ``Authorization`` because some deployments expose the health
+        routes publicly but reject an unknown token.  Each attempt gets 8 s
+        (5 s connect).  A 2xx from any endpoint ends the chain.
+
+        Never raises.  The returned dict is the successful health body merged
+        with ``_probe`` metadata::
+
+            {
+                ...,  # health payload (version / readiness / …)
+                "_probe": {
+                    "ok": bool,
+                    "url": str | None,
+                    "status": int | None,
+                    "attempts": [{"url", "status", "error", "auth"}, …],
+                    "resolved_url": str | None,
+                    "hint": str | None,
+                    "warning": str | None,
+                },
+            }
+
+        When every probe fails only ``{"_probe": {..., "ok": False}}`` is
+        returned, so callers must check ``_probe.ok`` rather than truthiness.
+        Existing callers keep reading top-level fields such as
+        ``readiness`` / ``version`` unchanged.
+        """
+        root = self._root_url()
+        targets: tuple[tuple[str, str | None], ...] = (
+            (f"{root}/health/detailed", None),
+            (f"{root}/health", "使用 /health 回退（detail 不可用）"),
+            (f"{root}/v1/health", "使用 /v1/health 回退（detail 不可用）"),
+        )
+
+        attempts: list[dict[str, Any]] = []
+        kinds: list[str] = []
+        timeout = httpx.Timeout(
+            HEALTH_PROBE_TIMEOUT, connect=HEALTH_PROBE_CONNECT_TIMEOUT
+        )
+
+        async with httpx.AsyncClient(
+            timeout=timeout, follow_redirects=True
+        ) as probe_client:
+            for url, fallback_warning in targets:
+                result = await _probe_health_url(
+                    probe_client,
+                    url,
+                    self._headers(),
+                    auth="bearer" if self.api_key else "none",
+                )
+                attempts.append(result["attempt"])
+                kinds.append(result["kind"])
+                logger.info(
+                    "Hermes health probe: {} → {}",
+                    url,
+                    result["status"] if result["ok"] else result["attempt"].get("error"),
+                )
+                if result["ok"]:
+                    logger.info(
+                        "Hermes health ok via {} (HTTP {}) after {} attempt(s)",
+                        url,
+                        result["status"],
+                        len(attempts),
+                    )
+                    return _health_payload(result, attempts, fallback_warning)
+
+                # Unknown/stale token: retry the same URL unauthenticated once.
+                if result["status"] in (401, 403) and self.api_key:
+                    noauth = await _probe_health_url(
+                        probe_client,
+                        url,
+                        {"Accept": "application/json"},
+                        auth="none",
+                    )
+                    attempts.append(noauth["attempt"])
+                    kinds.append(noauth["kind"])
+                    logger.info(
+                        "Hermes health probe (no auth): {} → {}",
+                        url,
+                        noauth["status"]
+                        if noauth["ok"]
+                        else noauth["attempt"].get("error"),
+                    )
+                    if noauth["ok"]:
+                        logger.info(
+                            "Hermes health ok via {} without auth after {} attempt(s)",
+                            url,
+                            len(attempts),
+                        )
+                        return _health_payload(noauth, attempts, fallback_warning)
+
+        hint = _health_hint(attempts, kinds)
+        logger.warning(
+            "Hermes health probe failed after {} attempt(s): {}",
+            len(attempts),
+            hint,
+        )
+        return {
+            "_probe": {
+                "ok": False,
+                "url": None,
+                "status": None,
+                "attempts": attempts,
+                "resolved_url": None,
+                "hint": hint,
+                "warning": None,
+            }
+        }
 
     async def get_model_options(self) -> dict[str, Any]:
         """Fetch ``GET /api/model/options`` — providers/models the agent can use.
