@@ -37,7 +37,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import type { ChatApprovalRequest, ChatModeOut } from "@/lib/api";
+import { llmModelLabel, type ChatApprovalRequest, type ChatModeOut } from "@/lib/api";
 import type { ChatApprovalDecision } from "@/hooks/useChat";
 import { cn } from "@/lib/utils";
 
@@ -86,7 +86,7 @@ export interface ComposerProps {
   onEditMode: (mode: ChatModeOut) => void;
   onDeleteMode: (mode: ChatModeOut) => void;
 
-  availableModels: Array<{ id: string }>;
+  availableModels: Array<{ id: string; label?: string }>;
   selectedModel: string;
   onSelectModel: (id: string) => void;
 
@@ -629,7 +629,7 @@ export const Composer: FC<ComposerProps> = ({
                 <option value="">默认模型</option>
                 {availableModels.map((model) => (
                   <option key={model.id} value={model.id}>
-                    {model.id}
+                    {llmModelLabel(model)}
                   </option>
                 ))}
               </select>

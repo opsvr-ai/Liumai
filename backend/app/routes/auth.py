@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import secrets as _secrets
 import string as _string
@@ -833,10 +834,70 @@ async def test_hermes_connection(
 
 # ── LLM model config (platform-internal use) ────────────────────────────────
 
+#: Hard limits enforced when normalizing the user-editable model list.
+MAX_LLM_MODELS = 50
+MAX_LLM_MODEL_FIELD_LEN = 200
+
+
+class LlmModelConfig(BaseModel):
+    """One selectable model: the API model id plus an optional display label."""
+
+    id: str = ""
+    label: str = ""
+
+
+def normalize_llm_models(raw: object) -> list[dict[str, str]]:
+    """Normalize a model list into ``[{id, label}]``.
+
+    Trims both fields, drops empty/duplicate ids, defaults a missing label to
+    the id and caps the list at :data:`MAX_LLM_MODELS` entries / 200 chars per
+    field.  Invalid input degrades to an empty list.
+    """
+    if not isinstance(raw, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, LlmModelConfig):
+            model_id, label = item.id, item.label
+        elif isinstance(item, dict):
+            model_id, label = item.get("id"), item.get("label")
+        elif isinstance(item, str):
+            model_id, label = item, ""
+        else:
+            continue
+        model_id = str(model_id or "").strip()[:MAX_LLM_MODEL_FIELD_LEN]
+        if not model_id or model_id in seen:
+            continue
+        label = str(label or "").strip()[:MAX_LLM_MODEL_FIELD_LEN] or model_id
+        seen.add(model_id)
+        normalized.append({"id": model_id, "label": label})
+        if len(normalized) >= MAX_LLM_MODELS:
+            break
+    return normalized
+
+
+def parse_llm_models(raw: object) -> list[dict[str, str]]:
+    """Parse the stored ``llm_models`` JSON string (invalid/empty -> [])."""
+    if isinstance(raw, list):
+        return normalize_llm_models(raw)
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return []
+    return normalize_llm_models(payload)
+
+
 class LlmConfigOut(BaseModel):
     base_url: str = ""
     api_key: str = ""
+    #: Legacy single-model field (kept in sync with ``models[0].id`` on save).
     model: str = ""
+    #: Multi-model list; an empty list means "not configured, use legacy model".
+    models: list[LlmModelConfig] = Field(default_factory=list)
     welcome_prompt: str = ""
 
 
@@ -849,7 +910,9 @@ async def get_llm_config(
     from app.models.database import async_session_factory
     async with async_session_factory() as s:
         rows = await s.execute(
-            select(SystemConfig).where(SystemConfig.key.in_(["llm_base_url", "llm_api_key", "llm_model"]))
+            select(SystemConfig).where(
+                SystemConfig.key.in_(["llm_base_url", "llm_api_key", "llm_model", "llm_models"])
+            )
         )
         cfg = {r.key: r.value for r in rows.scalars()}
     raw_key = cfg.get("llm_api_key", "")
@@ -857,6 +920,7 @@ async def get_llm_config(
         base_url=cfg.get("llm_base_url", ""),
         api_key=_mask_key(raw_key),
         model=cfg.get("llm_model", ""),
+        models=parse_llm_models(cfg.get("llm_models", "")),
     )
 
 
@@ -866,13 +930,23 @@ async def save_llm_config(
     db: AsyncSession = Depends(get_db_session),
     _admin: User = Depends(require_admin),
 ) -> LlmConfigOut:
-    """Save platform LLM settings."""
+    """Save platform LLM settings.
+
+    ``models`` is normalized before storage.  ``llm_model`` stays the
+    compatibility field: it mirrors ``models[0].id`` when a list is supplied,
+    otherwise the submitted legacy value (or the stored one) is preserved.
+    """
     from app.models import SystemConfig
     current = {r.key: r.value for r in (await db.execute(select(SystemConfig))).scalars()}
+    models = normalize_llm_models(body.models)
+    legacy_model = models[0]["id"] if models else (
+        str(body.model or "").strip() or str(current.get("llm_model", "") or "").strip()
+    )
     entries = {
         "llm_base_url": body.base_url,
         "llm_api_key": _resolve_secret(body.api_key, current.get("llm_api_key")),
-        "llm_model": body.model,
+        "llm_model": legacy_model,
+        "llm_models": json.dumps(models, ensure_ascii=False),
         "welcome_prompt": body.welcome_prompt,
     }
     for key, value in entries.items():
@@ -886,7 +960,8 @@ async def save_llm_config(
     return LlmConfigOut(
         base_url=body.base_url,
         api_key=_mask_key(entries["llm_api_key"]),
-        model=body.model,
+        model=legacy_model,
+        models=models,
         welcome_prompt=body.welcome_prompt,
     )
 

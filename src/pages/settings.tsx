@@ -13,6 +13,9 @@ import {
   Clock,
   Settings,
   Brain,
+  Plus,
+  Trash2,
+  Check,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -44,6 +47,14 @@ const LDAP_STAGE_LABELS: Record<string, string> = {
   user_bind: "用户绑定",
   auto_create: "自动建号",
 };
+
+/** Hide labels that merely repeat the id so the placeholder shows the default. */
+function toEditorModels(models: LlmConfig["models"] | undefined): LlmConfig["models"] {
+  return (models ?? []).map((m) => ({
+    id: m.id,
+    label: m.label && m.label !== m.id ? m.label : "",
+  }));
+}
 
 const FEATURE_LABELS: Record<string, string> = {
   chat_completions_streaming: "对话流式",
@@ -138,7 +149,7 @@ export default function SettingsPage() {
   const [modeSaving, setModeSaving] = useState(false);
 
   /* ── LLM model config ─────────────────────────────────── */
-  const [llmConfig, setLlmConfig] = useState<LlmConfig>({ base_url: "", api_key: "", model: "", welcome_prompt: "" });
+  const [llmConfig, setLlmConfig] = useState<LlmConfig>({ base_url: "", api_key: "", model: "", models: [], welcome_prompt: "" });
   const [llmLoading, setLlmLoading] = useState(true);
   const [llmSaving, setLlmSaving] = useState(false);
   /** Models discovered from the configured endpoint (may be empty). */
@@ -150,8 +161,48 @@ export default function SettingsPage() {
 
   const loadLlmConfig = useCallback(() => {
     setLlmLoading(true);
-    authApi.getLlmConfig().then(setLlmConfig).catch(() => {}).finally(() => setLlmLoading(false));
+    authApi.getLlmConfig()
+      .then((cfg) => {
+        const saved = cfg.models ?? [];
+        setLlmConfig({
+          ...cfg,
+          // Legacy single-model configs stay visible as one editable row.
+          models: saved.length > 0
+            ? toEditorModels(saved)
+            : cfg.model
+              ? [{ id: cfg.model, label: "" }]
+              : [],
+        });
+      })
+      .catch(() => {})
+      .finally(() => setLlmLoading(false));
   }, []);
+
+  function updateLlmModelRow(index: number, patch: Partial<LlmConfig["models"][number]>) {
+    setLlmConfig((prev) => ({
+      ...prev,
+      models: prev.models.map((m, i) => (i === index ? { ...m, ...patch } : m)),
+    }));
+  }
+
+  function addLlmModelRow() {
+    setLlmConfig((prev) =>
+      prev.models.length >= 50 ? prev : { ...prev, models: [...prev.models, { id: "", label: "" }] },
+    );
+  }
+
+  function removeLlmModelRow(index: number) {
+    setLlmConfig((prev) => ({ ...prev, models: prev.models.filter((_, i) => i !== index) }));
+  }
+
+  /** Append a discovered model; already-added ids are highlighted, not duplicated. */
+  function addProbedLlmModel(id: string) {
+    setLlmConfig((prev) => {
+      if (prev.models.some((m) => m.id.trim() === id)) return prev;
+      if (prev.models.length >= 50) return prev;
+      return { ...prev, models: [...prev.models, { id, label: "" }] };
+    });
+  }
 
   const probeLlmModels = useCallback(async (
     baseUrl: string,
@@ -199,7 +250,7 @@ export default function SettingsPage() {
     setLlmSaving(true);
     try {
       const saved = await authApi.saveLlmConfig(llmConfig);
-      setLlmConfig(saved);
+      setLlmConfig({ ...saved, models: toEditorModels(saved.models) });
       toast.success("LLM 配置已保存");
     } catch (e: any) { toast.error(`保存失败: ${e.message}`); }
     finally { setLlmSaving(false); }
@@ -359,8 +410,6 @@ export default function SettingsPage() {
   function updateCfg<K extends keyof LdapConfig>(key: K, value: LdapConfig[K]) {
     setLdapConfig((prev) => (prev ? { ...prev, [key]: value } : prev));
   }
-
-  const selectedLlmModel = llmModels.find((m) => m.id === llmConfig.model);
 
   /* ═══════════════════════════════════════════════════════ */
   return (
@@ -603,7 +652,7 @@ export default function SettingsPage() {
                     />
                   </div>
 
-                  {/* Model discovery — optional; manual entry below always works. */}
+                  {/* Model discovery — optional; the manual list below always works. */}
                   <div className="space-y-2">
                     <div className="flex items-center gap-2">
                       <Button
@@ -616,39 +665,93 @@ export default function SettingsPage() {
                         {llmProbing ? "获取中…" : "获取模型列表"}
                       </Button>
                       {!llmProbing && llmModels.length > 0 && (
-                        <span className="text-[11px] text-muted-foreground">共 {llmModels.length} 个可用模型</span>
+                        <span className="text-[11px] text-muted-foreground">共 {llmModels.length} 个，点击追加</span>
                       )}
                     </div>
                     {llmProbeError && (
-                      <p className="text-xs text-status-active">自动获取失败：{llmProbeError}，可手动填写模型名</p>
+                      <p className="text-xs text-status-active">自动获取失败：{llmProbeError}，可手动添加模型</p>
                     )}
                     {llmModels.length > 0 && (
-                      <div>
-                        <select
-                          value={llmConfig.model}
-                          onChange={(e) => setLlmConfig((p) => ({ ...p, model: e.target.value }))}
-                          className="h-9 w-full rounded-lg border border-border bg-surface-secondary px-3 text-sm text-text-primary"
-                          aria-label="可用模型列表"
-                        >
-                          <option value="">选择模型（可选）</option>
-                          {llmConfig.model && !llmModels.some((m) => m.id === llmConfig.model) && (
-                            <option value={llmConfig.model}>{llmConfig.model}（当前配置，不在列表中）</option>
-                          )}
-                          {llmModels.map((m) => (
-                            <option key={m.id} value={m.id}>{m.id}</option>
-                          ))}
-                        </select>
-                        {selectedLlmModel?.owned_by && (
-                          <p className="text-[11px] text-muted-foreground/70 mt-1">owned_by: {selectedLlmModel.owned_by}</p>
-                        )}
+                      <div className="flex flex-wrap gap-1.5" aria-label="探测到的模型">
+                        {llmModels.map((m) => {
+                          const added = llmConfig.models.some((x) => x.id.trim() === m.id);
+                          return (
+                            <button
+                              key={m.id}
+                              type="button"
+                              onClick={() => addProbedLlmModel(m.id)}
+                              disabled={!added && llmConfig.models.length >= 50}
+                              title={added ? "已在列表中" : m.owned_by ? `owned_by: ${m.owned_by}` : "点击追加到模型列表"}
+                              className={cn(
+                                "inline-flex max-w-full items-center gap-1 rounded-md border px-2 py-1 text-[11px] transition-colors disabled:opacity-50",
+                                added
+                                  ? "border-interactive-primary/40 bg-interactive-primary/10 text-interactive-primary"
+                                  : "border-border text-text-secondary hover:border-interactive-primary/30 hover:text-text-primary",
+                              )}
+                            >
+                              {added && <Check className="h-3 w-3 shrink-0" />}
+                              <span className="truncate">{m.id}</span>
+                            </button>
+                          );
+                        })}
                       </div>
                     )}
                   </div>
 
-                  <div>
-                    <label className="text-xs text-muted-foreground mb-1 block">模型名</label>
-                    <Input value={llmConfig.model} onChange={(e) => setLlmConfig((p) => ({ ...p, model: e.target.value }))} placeholder="gpt-4o-mini" />
-                    <p className="text-[11px] text-muted-foreground mt-0.5">可从上方列表选择，或手动输入</p>
+                  {/* Multi-model list: every row is an API model id + optional label. */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs text-muted-foreground block">模型名</label>
+                      <span className="text-[11px] text-muted-foreground/70">{llmConfig.models.length}/50</span>
+                    </div>
+                    {llmConfig.models.length === 0 ? (
+                      <p className="text-[11px] text-muted-foreground">
+                        未配置多模型{llmConfig.model ? `，当前回退到 ${llmConfig.model}` : ""}；对话中将显示「默认模型」
+                      </p>
+                    ) : (
+                      <div className="space-y-2">
+                        <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] gap-2 text-[11px] text-muted-foreground/70">
+                          <span>模型 ID</span>
+                          <span>显示名称（可选）</span>
+                          <span className="w-7" />
+                        </div>
+                        {llmConfig.models.map((m, index) => (
+                          <div key={index} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] items-center gap-2">
+                            <Input
+                              value={m.id}
+                              maxLength={200}
+                              onChange={(e) => updateLlmModelRow(index, { id: e.target.value })}
+                              placeholder="gpt-4o-mini"
+                              aria-label={`模型 ID ${index + 1}`}
+                            />
+                            <Input
+                              value={m.label}
+                              maxLength={200}
+                              onChange={(e) => updateLlmModelRow(index, { label: e.target.value })}
+                              placeholder="同 ID"
+                              aria-label={`显示名称 ${index + 1}`}
+                            />
+                            <Button
+                              variant="ghostMuted"
+                              size="icon-sm"
+                              onClick={() => removeLlmModelRow(index)}
+                              title="删除模型"
+                              aria-label={`删除模型 ${index + 1}`}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    <Button
+                      variant="ghostMuted"
+                      size="sm"
+                      onClick={addLlmModelRow}
+                      disabled={llmConfig.models.length >= 50}
+                    >
+                      <Plus className="h-3.5 w-3.5 mr-1" />添加模型
+                    </Button>
                   </div>
                   <div>
                     <label className="text-xs text-muted-foreground mb-1 block">欢迎语生成提示词</label>

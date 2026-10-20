@@ -38,8 +38,10 @@ import {
   clearStagedChatImages,
   hermesDiscovery,
   stageChatImages,
+  llmModelLabel,
   type ChatModeOut,
   type ChatSessionSummary,
+  type LlmModelInfo,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
@@ -183,7 +185,7 @@ export const ChatPanel: FC = () => {
   const [activeMode, setActiveMode] = useState<string | null>(
     initialModeFromUrl ? `system:${initialModeFromUrl}` : "system:general",
   );
-  const [availableModels, setAvailableModels] = useState<Array<{ id: string }>>([]);
+  const [availableModels, setAvailableModels] = useState<LlmModelInfo[]>([]);
   const [selectedModel, setSelectedModel] = useState("");
 
   /* ── Custom assistant dialog ──────────────────────────────────────── */
@@ -984,11 +986,14 @@ export const ChatPanel: FC = () => {
   const provider = resolveModeProvider(activeMode, effectiveMode);
   const engineMode = provider !== "llm";
   const engineName = providerLabel(provider);
-  const modelLabel = engineMode ? engineName : selectedModel || "默认模型";
+  /* The dropdown shows the configured label; the id is still what is sent. */
+  const selectedModelInfo = availableModels.find((model) => model.id === selectedModel);
+  const selectedModelLabel = selectedModelInfo ? llmModelLabel(selectedModelInfo) : selectedModel;
+  const modelLabel = engineMode ? engineName : selectedModelLabel || "默认模型";
   const modelHint = engineMode
     ? `引擎：${engineName}（由 ${modeLabel} 调用）`
-    : selectedModel
-      ? `模型：${selectedModel}`
+    : selectedModelLabel
+      ? `模型：${selectedModelLabel}`
       : "模型：默认模型（未指定时由服务端决定）";
   const modeHint = engineMode
     ? `模式：${modeLabel} · 引擎：${engineName}`

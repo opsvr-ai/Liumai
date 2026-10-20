@@ -1214,16 +1214,34 @@ export interface HermesTestResult {
   attempts: HermesProbeAttempt[];
 }
 
+/** One entry of the admin-configured model list. */
+export interface LlmModelChoice {
+  /** API model id sent to the provider (required). */
+  id: string;
+  /** Optional display name; empty means "same as id". */
+  label: string;
+}
+
 export interface LlmConfig {
   base_url: string;
   api_key: string;
+  /** Legacy single-model field; mirrors models[0].id after a save. */
   model: string;
+  /** Admin-configured multiple models; empty = fall back to the legacy model. */
+  models: LlmModelChoice[];
   welcome_prompt: string;
 }
 
 export interface LlmModelInfo {
   id: string;
+  /** Configured display name; remote-only models have no label. */
+  label?: string;
   owned_by: string;
+}
+
+/** Display text for a model: its label when configured, else the raw id. */
+export function llmModelLabel(model: { id: string; label?: string | null }): string {
+  return model.label?.trim() || model.id;
 }
 
 /** Result of POST /auth/llm-models/probe — failures are HTTP 200 by design. */
@@ -1472,7 +1490,7 @@ export const hermesDiscovery = {
     return request<{ ok: boolean; status_code: number; latency_ms: number }>("GET", "/chat/hermes-health");
   },
   listLlmModels() {
-    return request<Array<{ id: string; owned_by: string }>>("GET", "/chat/llm-models");
+    return request<LlmModelInfo[]>("GET", "/chat/llm-models");
   },
 };
 

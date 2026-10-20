@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user, require_admin
 from app.models import ChatMessage, ChatSession, User
 from app.models.database import get_db_session
+from app.routes.auth import parse_llm_models
 from app.services.hermes import HermesClient, HermesRunError
 
 
@@ -41,7 +42,7 @@ async def _load_llm_config(db: AsyncSession) -> dict[str, str]:
     from app.models import SystemConfig
     rows = await db.execute(
         select(SystemConfig).where(
-            SystemConfig.key.in_(["llm_base_url", "llm_api_key", "llm_model"])
+            SystemConfig.key.in_(["llm_base_url", "llm_api_key", "llm_model", "llm_models"])
         )
     )
     return {r.key: r.value for r in rows.scalars()}
@@ -1780,16 +1781,41 @@ async def download_artifact(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+def _parse_remote_models(payload: object) -> list[dict[str, str]]:
+    """Normalize an OpenAI-compatible model-list payload into ``[{id, owned_by}]``."""
+    raw = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(raw, list):
+        return []
+    models: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, str):
+            model_id, owned_by = item, ""
+        elif isinstance(item, dict):
+            model_id = item.get("id") or item.get("model") or ""
+            owned_by = item.get("owned_by") or ""
+        else:
+            continue
+        model_id = str(model_id or "").strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        models.append({"id": model_id, "owned_by": str(owned_by or "")})
+    return models
+
+
 @router.get("/llm-models")
 async def list_llm_models(
     db: AsyncSession = Depends(get_db_session),
     user: User = Depends(get_current_user),
 ) -> list[dict]:
-    """List available models from the configured LLM endpoint.
+    """List selectable models for the chat UI.
 
-    Proxies ``GET /v1/models`` on the configured LLM base URL.  Falls back
-    to returning the single configured model if the endpoint is unreachable
-    or does not support model listing.
+    The admin-configured ``llm_models`` list comes first (with its display
+    label); models discovered on the configured endpoint but not configured
+    follow with an empty label.  When no multi-model list is configured this
+    keeps the legacy behaviour: remote discovery, then the single configured
+    model, then ``gpt-4o``.
     """
     import httpx
 
@@ -1797,8 +1823,9 @@ async def list_llm_models(
     base_url = cfg.get("llm_base_url", "").strip()
     api_key = cfg.get("llm_api_key", "").strip()
     config_model = cfg.get("llm_model", "").strip()
+    configured = parse_llm_models(cfg.get("llm_models", ""))
 
-    models: list[dict] = []
+    remote_models: list[dict[str, str]] = []
 
     # Try to discover models from the configured LLM endpoint
     if base_url:
@@ -1819,21 +1846,34 @@ async def list_llm_models(
             async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=5.0)) as client:
                 resp = await client.get(models_url, headers=headers)
                 if resp.status_code < 400:
-                    data = resp.json()
-                    raw_list: list[dict] = data.get("data", data if isinstance(data, list) else [])
-                    models = [{"id": m.get("id", "unknown"), "owned_by": m.get("owned_by", "")} for m in raw_list]
+                    remote_models = _parse_remote_models(resp.json())
         except Exception:
-            logger.info("LLM model discovery failed — falling back to configured model")
+            logger.info("LLM model discovery failed — falling back to configured models")
 
-    # Fallback: use the single configured model
-    if not models and config_model:
-        models = [{"id": config_model, "owned_by": ""}]
+    if configured:
+        remote_by_id = {m["id"]: m for m in remote_models}
+        configured_ids = {m["id"] for m in configured}
+        merged: list[dict] = [
+            {
+                "id": m["id"],
+                "label": m["label"],
+                "owned_by": remote_by_id.get(m["id"], {}).get("owned_by", ""),
+            }
+            for m in configured
+        ]
+        merged.extend(
+            {"id": m["id"], "label": "", "owned_by": m["owned_by"]}
+            for m in remote_models
+            if m["id"] not in configured_ids
+        )
+        return merged
 
-    # Ultimate fallback
-    if not models:
-        models = [{"id": "gpt-4o", "owned_by": ""}]
-
-    return models
+    # ── No multi-model config: preserve the original single-model behaviour ──
+    if remote_models:
+        return [{"id": m["id"], "label": "", "owned_by": m["owned_by"]} for m in remote_models]
+    if config_model:
+        return [{"id": config_model, "label": "", "owned_by": ""}]
+    return [{"id": "gpt-4o", "label": "", "owned_by": ""}]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
