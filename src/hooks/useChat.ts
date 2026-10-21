@@ -98,17 +98,66 @@ export type ChatSteerResult =
 /** Extra SSE re-subscriptions after a dropped run stream (resumed by seq). */
 const RUN_RECONNECT_ATTEMPTS = 2;
 
-/** Hermes run states that may still produce events (anything else is final). */
-const ACTIVE_RUN_STATUSES = new Set([
-  "queued",
-  "created",
-  "running",
-  "waiting_for_approval",
-  "stopping",
-]);
+/**
+ * How long Hermes keeps a run's SSE backlog.  Re-subscribing with the last
+ * event id is only worthwhile inside this window; after it the replay would be
+ * truncated, so the recovery path falls back to polling ``run-state``.
+ */
+const RUN_EVENT_REPLAY_TTL_MS = 5 * 60 * 1000;
 
-/** Poll cadence while reattached to a run that outlived the browser session. */
-const REATTACH_POLL_MS = 2500;
+/** Poll cadence for ``GET /sessions/{id}/run-state`` after a page return. */
+const RUN_STATE_POLL_MS = 3000;
+
+/** Stop polling an unreachable run after ~2 minutes (40 × 3s). */
+const RUN_STATE_MAX_UNKNOWN_POLLS = 40;
+
+/** Persist the in-flight assistant text at most this often (ms). */
+const PARTIAL_SAVE_INTERVAL_MS = 5000;
+
+/** localStorage keys for the run resume cursor and last visited session. */
+const RUN_SEQ_KEY_PREFIX = "liumai:run-seq:";
+const RUN_SEQ_AT_KEY_PREFIX = "liumai:run-seq-at:";
+const LAST_SESSION_KEY = "liumai:last-session";
+
+/** Read the last SSE sequence number persisted for a run (``null`` if none). */
+function _readRunSeq(runId: string): { seq: number; at: number } | null {
+  try {
+    const rawSeq = localStorage.getItem(`${RUN_SEQ_KEY_PREFIX}${runId}`);
+    if (rawSeq === null) return null;
+    const seq = Number(rawSeq);
+    if (!Number.isFinite(seq) || seq < 0) return null;
+    const rawAt = Number(localStorage.getItem(`${RUN_SEQ_AT_KEY_PREFIX}${runId}`) ?? 0);
+    return { seq, at: Number.isFinite(rawAt) ? rawAt : 0 };
+  } catch {
+    return null;
+  }
+}
+
+/** Remember the newest SSE sequence number seen for a run. */
+function _writeRunSeq(runId: string, seq: number): void {
+  try {
+    localStorage.setItem(`${RUN_SEQ_KEY_PREFIX}${runId}`, String(seq));
+    localStorage.setItem(`${RUN_SEQ_AT_KEY_PREFIX}${runId}`, String(Date.now()));
+  } catch {
+    /* storage unavailable (private mode) — recovery falls back to polling */
+  }
+}
+
+/** Drop the resume cursor once a run is final. */
+function _clearRunSeq(runId: string): void {
+  try {
+    localStorage.removeItem(`${RUN_SEQ_KEY_PREFIX}${runId}`);
+    localStorage.removeItem(`${RUN_SEQ_AT_KEY_PREFIX}${runId}`);
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Highest ``hermes_seq`` in a tool message (falls back to its position). */
+function _toolSeq(message: DisplayMessage): number | null {
+  const seq = message.toolCalls?.[0]?.hermes_seq;
+  return typeof seq === "number" && Number.isFinite(seq) ? seq : null;
+}
 
 /* ==========================================================================
  * Hook
@@ -132,6 +181,12 @@ export function useChat() {
   const [hermesSessionMode, setHermesSessionMode] = useState<string | null>(null);
   /** Active Hermes run id while a Runs-API turn is in flight (``null`` otherwise). */
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  /**
+   * True while the transcript was restored from the backend and we are
+   * reattaching to a run that kept executing server-side (page switch /
+   * reload).  Drives the "正在继续执行…" status bar.
+   */
+  const [recoveringRun, setRecoveringRun] = useState(false);
   /** Pending tool-approval prompt for the active run. */
   const [pendingApproval, setPendingApproval] = useState<ChatApprovalRequest | null>(null);
   /** Probed server capabilities (see {@link ChatRunCapabilities}). */
@@ -162,6 +217,31 @@ export function useChat() {
   const capabilitiesRef = useRef<ChatRunCapabilities>(DEFAULT_RUN_CAPABILITIES);
   /** Current session id for async callbacks fired mid-stream (no stale state). */
   const sessionIdRef = useRef<number | null>(null);
+  /** Latest Hermes linkage / run id for the partial-save bridge. */
+  const hermesSessionIdRef = useRef<string | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
+  const isStreamingRef = useRef(false);
+  /** Highest tool sequence number handed out this turn (first-seen order). */
+  const toolSeqRef = useRef(0);
+  /** Timer holding the 5s partial-save cadence for the current turn. */
+  const partialSaveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /**
+   * Newest run event sequence applied to React state.  It is written to
+   * localStorage only *after* the matching transcript snapshot is persisted,
+   * so a resume cursor can never be ahead of the saved partial answer.
+   */
+  const pendingSeqRef = useRef<number | null>(null);
+  /**
+   * True when the current turn was detached by a route change / unmount
+   * (the Hermes run keeps executing).  The turn's ``finally`` must then keep
+   * the active_run_id link instead of clearing it as a finished run.
+   */
+  const detachedRef = useRef(false);
+  /**
+   * Assistant bubble a restored run keeps appending into.  The saved partial
+   * turn may end with tool rows, so "last message" is not the right target.
+   */
+  const resumeAssistantIdRef = useRef<string | null>(null);
   /**
    * Latest transcript for persistence bridges, which fire while React state
    * updates are still in flight.
@@ -279,71 +359,25 @@ export function useChat() {
     setMessages(next);
   }, []);
 
-  /**
-   * Reattach to the Hermes run recorded on a chat session.
-   *
-   * The run keeps executing server-side while the page is away, so we poll
-   * ``GET /api/chat/runs/{id}`` (the Runs status API) instead of aborting it:
-   * the transcript restored from the backend stays authoritative, and the
-   * run's final output is merged in when it finishes.  Polling (rather than a
-   * fresh SSE subscription) avoids replaying deltas the saved transcript
-   * already contains.
-   */
-  const runReattachPoll = useCallback(
-    (runId: string) => {
-      cancelReattach();
-      resetReasoningAccumulator();
-      const token = reattachTokenRef.current;
-      runIdRef.current = runId;
-      setActiveRunId(runId);
-      setIsStreaming(true);
-      stoppedRef.current = false;
-
-      const tick = async () => {
-        if (reattachTokenRef.current !== token) return;
-        let status: Awaited<ReturnType<typeof chatRuns.status>>;
-        try {
-          status = await chatRuns.status(runId);
-        } catch {
-          // Run expired (404) or Hermes unreachable: drop the stale link but
-          // keep the restored transcript intact.
-          if (reattachTokenRef.current !== token) return;
-          runIdRef.current = null;
-          setActiveRunId(null);
-          setIsStreaming(false);
-          persistSessionLinks({ active_run_id: null });
-          return;
-        }
-        if (reattachTokenRef.current !== token) return;
-
-        if (ACTIVE_RUN_STATUSES.has(status.status)) {
-          reattachTimerRef.current = setTimeout(() => {
-            void tick();
-          }, REATTACH_POLL_MS);
-          return;
-        }
-
-        runIdRef.current = null;
-        setActiveRunId(null);
-        setIsStreaming(false);
-        if (status.status === "failed" && status.error) {
-          setError(status.error);
-        }
-        const output = typeof status.output === "string" ? status.output : "";
-        if (status.status === "completed" && output.trim()) {
-          appendReattachedOutput(output);
-        }
-        persistSessionLinks({ active_run_id: null });
-      };
-
-      void tick();
-    },
-    [appendReattachedOutput, cancelReattach, persistSessionLinks, resetReasoningAccumulator],
-  );
-
-  /** Append a text chunk to the last assistant bubble (or create one). */
+  /** Append a text chunk to the current assistant bubble (or create one). */
   const appendToAssistant = useCallback((content: string) => {
     setMessages((prev) => {
+      // A restored run must keep writing into the bubble it was streaming
+      // into, even when the saved partial turn ends with tool rows.
+      const resumeId = resumeAssistantIdRef.current;
+      if (resumeId) {
+        const resumeIndex = prev.findIndex((m) => m.id === resumeId);
+        if (resumeIndex >= 0) {
+          const next = [...prev];
+          next[resumeIndex] = {
+            ...next[resumeIndex],
+            content: next[resumeIndex].content + content,
+            isStreaming: true,
+          };
+          return next;
+        }
+        resumeAssistantIdRef.current = null;
+      }
       const last = prev[prev.length - 1];
       if (last && last.role === "assistant" && last.isStreaming) {
         return [
@@ -389,6 +423,20 @@ export function useChat() {
     if (!fresh) return;
     const next = deduper.text;
     setMessages((prev) => {
+      const resumeId = resumeAssistantIdRef.current;
+      if (resumeId) {
+        const resumeIndex = prev.findIndex((m) => m.id === resumeId);
+        if (resumeIndex >= 0) {
+          const updated = [...prev];
+          updated[resumeIndex] = {
+            ...updated[resumeIndex],
+            reasoning: next,
+            isStreaming: true,
+          };
+          return updated;
+        }
+        resumeAssistantIdRef.current = null;
+      }
       const last = prev[prev.length - 1];
       const streaming =
         last && last.role === "assistant" && last.isStreaming ? last : null;
@@ -412,64 +460,149 @@ export function useChat() {
     });
   }, []);
 
-  /** Insert or update tool-call messages as separate, visible bubbles.
+  /** Insert or update tool-call messages as separate, visible cards.
    *
-   * Each distinct tool call (keyed by its ``id``) gets its own message
-   * so the user can see every tool Hermes invokes during the agent loop.
-   * Incremental argument chunks update the existing message in place.
+   * Every tool keeps ONE message for its whole lifecycle:
+   * - the first ``started`` event appends it at the end and assigns a stable
+   *   ``hermes_seq`` (first-seen order — parallel batches used to render
+   *   reversed because new rows were inserted *before* the assistant bubble);
+   * - later ``started`` / ``completed`` events match by ``tool_call_id`` and
+   *   update that same row (params, status, result, duration);
+   * - a completion with no matching start becomes a row in arrival order.
    */
   const updateToolCalls = useCallback((toolCalls: ToolCallDelta[]) => {
     setMessages((prev) => {
       const next = [...prev];
 
       for (const tc of toolCalls) {
-        const tcId = tc.id || tc.function?.name || "unknown";
+        const tcId = (tc.id || "").trim();
+        const name = tc.function?.name?.trim() || "tool";
+        const incomingArgs = tc.function?.arguments?.trim() ?? "";
+        // Completed events often carry only a status label ("已完成") or an
+        // empty preview.  Those must never overwrite the parameters captured
+        // from ``tool.started``.
+        const statusOnly =
+          incomingArgs === "已完成" ||
+          incomingArgs === "完成" ||
+          incomingArgs === "执行失败" ||
+          incomingArgs === "失败" ||
+          incomingArgs === "执行中";
+        const status = (tc.hermes_status || "").toLowerCase();
+        const running =
+          status === "running" || status === "started" || status === "in_progress";
+        const finished =
+          status === "completed" ||
+          status === "complete" ||
+          status === "done" ||
+          status === "success" ||
+          status === "failed" ||
+          status === "error" ||
+          status === "failure";
 
-        // Find existing tool message for this call
-        const existingIdx = next.findIndex(
-          (m) => m.role === "tool" && m.id === `tool-${tcId}`,
-        );
+        // 1) Exact lifecycle id, 2) a running row of the same tool when a
+        // completion arrives without an id, 3) a single running row with the
+        // same name (Hermes occasionally changes the id between events).
+        let existingIdx = -1;
+        if (tcId) {
+          existingIdx = next.findIndex(
+            (m) => m.role === "tool" && m.toolCalls?.[0]?.id === tcId,
+          );
+        }
+        if (existingIdx < 0 && finished) {
+          const runningSameName: number[] = [];
+          next.forEach((m, index) => {
+            if (m.role !== "tool" || !m.isStreaming) return;
+            const toolName = m.toolCalls?.[0]?.function?.name || m.content;
+            if (toolName === name) runningSameName.push(index);
+          });
+          if (runningSameName.length === 1) existingIdx = runningSameName[0];
+        }
+        if (existingIdx < 0 && !tcId && running) {
+          // Legacy streams can emit arg deltas before the id is known: update
+          // the newest row of the same tool instead of creating duplicates.
+          for (let index = next.length - 1; index >= 0; index -= 1) {
+            const m = next[index];
+            if (m.role !== "tool" || !m.isStreaming) continue;
+            const toolName = m.toolCalls?.[0]?.function?.name || m.content;
+            if (toolName === name) {
+              existingIdx = index;
+              break;
+            }
+          }
+        }
 
         if (existingIdx >= 0) {
-          // Update in place — preserve hermes_emoji/label/status from earlier
-          // progress events so regular delta chunks don't overwrite them
-          const prevTc = next[existingIdx].toolCalls?.[0];
+          const target = next[existingIdx];
+          const prevTc = target.toolCalls?.[0];
+          const prevArgs = prevTc?.function?.arguments?.trim() ?? "";
+          const nextArgs = statusOnly ? "" : incomingArgs;
+          const args = nextArgs || prevArgs;
+          const startedAt =
+            prevTc?.hermes_started_at ?? (running ? Date.now() : undefined);
+          const duration =
+            tc.hermes_duration_ms ??
+            prevTc?.hermes_duration_ms ??
+            (finished && startedAt ? Date.now() - startedAt : undefined);
           const mergedTc: ToolCallDelta = {
+            ...prevTc,
             ...tc,
+            id: prevTc?.id || tc.id,
+            function: {
+              name: tc.function?.name || prevTc?.function?.name || name,
+              arguments: args,
+            },
             hermes_emoji: tc.hermes_emoji || prevTc?.hermes_emoji,
-            hermes_label: tc.hermes_label || prevTc?.hermes_label,
+            // A started preview is the parameter summary; a completed preview
+            // is the result (``hermes_result``), never the label.
+            hermes_label: running
+              ? tc.hermes_label || nextArgs || prevTc?.hermes_label
+              : prevTc?.hermes_label,
             hermes_status: tc.hermes_status || prevTc?.hermes_status,
+            hermes_result: tc.hermes_result ?? prevTc?.hermes_result,
+            hermes_error: tc.hermes_error ?? prevTc?.hermes_error,
+            hermes_duration_ms: duration,
+            hermes_seq: prevTc?.hermes_seq,
+            hermes_started_at: startedAt,
           };
-          const status = mergedTc.hermes_status;
           next[existingIdx] = {
-            ...next[existingIdx],
+            ...target,
+            content: mergedTc.function?.name || target.content,
             toolCalls: [mergedTc],
-            isStreaming: status === "completed"
-              ? false
-              : status === "running"
-                ? true
-                : tc.function?.arguments
-                  ? !_looksComplete(tc.function.arguments)
-                  : true,
+            isStreaming: running
+              ? true
+              : finished
+                ? false
+                : Boolean(mergedTc.function?.arguments) &&
+                  !_looksComplete(mergedTc.function?.arguments ?? ""),
           };
-        } else {
-          // Insert new tool message at the end of the list, but BEFORE
-          // a currently-streaming assistant bubble if one exists.
-          // This keeps tools scoped to the CURRENT round, not previous ones.
-          let insertAt = next.length;
-          const lastMsg = next[next.length - 1];
-          if (lastMsg && lastMsg.role === "assistant" && lastMsg.isStreaming) {
-            insertAt = next.length - 1;
-          }
-          const toolMsg: DisplayMessage = {
-            id: `tool-${tcId}`,
-            role: "tool",
-            content: tc.function?.name || "调用工具",
-            toolCalls: [tc],
-            isStreaming: true,
-          };
-          next.splice(insertAt, 0, toolMsg);
+          continue;
         }
+
+        // First appearance: append (never prepend) and remember the order.
+        const seq = ++toolSeqRef.current;
+        const mergedTc: ToolCallDelta = {
+          ...tc,
+          id: tcId || `${name}-${seq}`,
+          function: {
+            name,
+            arguments: statusOnly ? "" : incomingArgs,
+          },
+          hermes_seq: seq,
+          hermes_started_at: running ? Date.now() : undefined,
+          hermes_duration_ms: tc.hermes_duration_ms,
+        };
+        next.push({
+          id: `tool-${mergedTc.id}`,
+          role: "tool",
+          content: name,
+          toolCalls: [mergedTc],
+          isStreaming: running
+            ? true
+            : finished
+              ? false
+              : Boolean(mergedTc.function?.arguments) &&
+                !_looksComplete(mergedTc.function?.arguments ?? ""),
+        });
       }
 
       return next;
@@ -507,6 +640,316 @@ export function useChat() {
       }),
     );
   }, []);
+
+  /**
+   * Point the restored run's stream at the assistant bubble it was writing
+   * into.  A saved partial turn often ends with tool rows, so events must keep
+   * appending to that bubble instead of creating a second answer after them.
+   */
+  const markRestoredAssistantStreaming = useCallback(() => {
+    setMessages((prev) => {
+      // Only an assistant bubble belonging to the CURRENT (latest) user turn
+      // may receive the recovered deltas.  Falling back to the previous turn's
+      // answer merged a new run's output into an unrelated old bubble.
+      let lastUser = -1;
+      for (let index = prev.length - 1; index >= 0; index -= 1) {
+        if (prev[index].role === "user") {
+          lastUser = index;
+          break;
+        }
+      }
+      let index = -1;
+      for (let cursor = prev.length - 1; cursor > lastUser; cursor -= 1) {
+        if (prev[cursor].role === "assistant") {
+          index = cursor;
+          break;
+        }
+      }
+      if (index >= 0) {
+        const updated = [...prev];
+        updated[index] = { ...updated[index], isStreaming: true };
+        resumeAssistantIdRef.current = updated[index].id;
+        messagesRef.current = updated;
+        return updated;
+      }
+      const created: DisplayMessage = {
+        id: uid(),
+        role: "assistant",
+        content: "",
+        isStreaming: true,
+      };
+      resumeAssistantIdRef.current = created.id;
+      const updated = [...prev, created];
+      messagesRef.current = updated;
+      return updated;
+    });
+  }, []);
+
+  /** Dispatch one normalised run event onto React state (live + recovery). */
+  const dispatchRunEvent = useCallback(
+    (event: ChatRunEvent, turnToken: number) => {
+      // User pressed 停止, or a session switch superseded this turn — drop late
+      // events instead of polluting the newly restored transcript.
+      if (stoppedRef.current || turnTokenRef.current !== turnToken) return;
+      switch (event.type) {
+        case "delta":
+          appendToAssistant(event.content);
+          break;
+        case "reasoning":
+          appendReasoning(event.content, event.replace === true);
+          break;
+        case "session":
+          setHermesSessionId(event.session_id);
+          hermesSessionIdRef.current = event.session_id;
+          persistSessionLinks({ hermes_session_id: event.session_id });
+          break;
+        case "tool_call":
+          updateToolCalls(event.tool_calls);
+          break;
+        case "approval":
+          // An SSE resume can replay a prompt we already answered — do not
+          // resurrect it (a second resolution would be rejected upstream).
+          if (
+            event.approval.approvalId &&
+            answeredApprovalIdsRef.current.has(event.approval.approvalId)
+          ) {
+            break;
+          }
+          setPendingApproval(event.approval);
+          break;
+        case "done":
+          // Abnormal finishes (context overflow, provider error…) arrive with
+          // an `error` alongside the finish reason.
+          if (event.error) setError(event.error);
+          if (event.usage) attachUsage(event.usage);
+          finishAssistant();
+          break;
+        case "error":
+          setError(event.error);
+          finishAssistant();
+          break;
+      }
+    },
+    [
+      appendReasoning,
+      appendToAssistant,
+      attachUsage,
+      finishAssistant,
+      persistSessionLinks,
+      updateToolCalls,
+    ],
+  );
+
+  /** Persist the in-flight transcript now (5s cadence + page visibility). */
+  const saveStreamingSnapshot = useCallback(
+    (force = false) => {
+      if (!force && !isStreamingRef.current && !activeRunIdRef.current) return;
+      const target = sessionIdRef.current;
+      if (!target) return;
+      const saveable = _saveableMessages(messagesRef.current);
+      if (saveable.length === 0) return;
+      const title = _titleForMessages(messagesRef.current);
+      const links = {
+        hermes_session_id: hermesSessionIdRef.current,
+        active_run_id: activeRunIdRef.current,
+      };
+      const seq = pendingSeqRef.current;
+      const runId = activeRunIdRef.current;
+      void enqueueSessionWrite(async () => {
+        await chatHistory.saveMessages(target, saveable, title, links);
+        // Advance the resume cursor only after the transcript carrying those
+        // events is stored, so a reattach cannot skip un-persisted content.
+        if (runId && seq !== null) _writeRunSeq(runId, seq);
+      });
+    },
+    [enqueueSessionWrite],
+  );
+
+  /** Tear down a recovered run, merging its final output and clearing the link. */
+  const settleRecoveredRun = useCallback(
+    (runId: string | null, opts?: { output?: string; error?: string }) => {
+      cancelReattach();
+      abortRef.current?.abort();
+      abortRef.current = null;
+      runIdRef.current = null;
+      activeRunIdRef.current = null;
+      resumeAssistantIdRef.current = null;
+      pendingSeqRef.current = null;
+      setActiveRunId(null);
+      setIsStreaming(false);
+      setRecoveringRun(false);
+      setPendingApproval(null);
+      if (opts?.error) setError(opts.error);
+      const output = opts?.output?.trim() ?? "";
+      if (output) appendReattachedOutput(output);
+      finishAssistant();
+      if (runId) _clearRunSeq(runId);
+      // Write the completed transcript and drop the stale run link in one
+      // write, so a further reload does not reattach to a finished run.
+      persistSessionLinks({ active_run_id: null });
+    },
+    [appendReattachedOutput, cancelReattach, finishAssistant, persistSessionLinks],
+  );
+
+  /** Poll ``run-state`` every 3s until a recovered run reaches a final state. */
+  const pollRunState = useCallback(
+    (runId: string) => {
+      cancelReattach();
+      resetReasoningAccumulator();
+      const token = reattachTokenRef.current;
+      runIdRef.current = runId;
+      activeRunIdRef.current = runId;
+      setActiveRunId(runId);
+      setIsStreaming(true);
+      setRecoveringRun(true);
+      stoppedRef.current = false;
+      let unknownPolls = 0;
+
+      const tick = async () => {
+        if (reattachTokenRef.current !== token) return;
+        const session = sessionIdRef.current;
+        if (!session) {
+          settleRecoveredRun(runId, { error: "无法恢复执行状态：会话不存在" });
+          return;
+        }
+
+        let state: Awaited<ReturnType<typeof chatHistory.runState>>;
+        try {
+          state = await chatHistory.runState(session);
+        } catch {
+          unknownPolls += 1;
+          if (unknownPolls > RUN_STATE_MAX_UNKNOWN_POLLS) {
+            settleRecoveredRun(runId, {
+              error: "Hermes 无响应，已停止同步执行状态",
+            });
+            return;
+          }
+          reattachTimerRef.current = setTimeout(() => void tick(), RUN_STATE_POLL_MS);
+          return;
+        }
+        if (reattachTokenRef.current !== token) return;
+
+        if (state.hermes_session_id && !hermesSessionIdRef.current) {
+          hermesSessionIdRef.current = state.hermes_session_id;
+          setHermesSessionId(state.hermes_session_id);
+        }
+
+        const status = (state.status || "").toUpperCase();
+        if (status === "COMPLETED") {
+          settleRecoveredRun(runId, { output: state.output });
+          return;
+        }
+        if (status === "FAILED") {
+          settleRecoveredRun(runId, {
+            output: state.output,
+            error: "任务执行失败",
+          });
+          return;
+        }
+        if (status === "CANCELLED") {
+          settleRecoveredRun(runId, { output: state.output });
+          return;
+        }
+        if (!state.active_run_id) {
+          // The link was cleared elsewhere: merge whatever output exists.
+          settleRecoveredRun(runId, { output: state.output });
+          return;
+        }
+        if (status === "UNKNOWN") {
+          unknownPolls += 1;
+          if (unknownPolls > RUN_STATE_MAX_UNKNOWN_POLLS) {
+            settleRecoveredRun(runId, {
+              error: "Hermes 无响应，已停止同步执行状态",
+            });
+            return;
+          }
+        } else {
+          unknownPolls = 0;
+        }
+        reattachTimerRef.current = setTimeout(() => void tick(), RUN_STATE_POLL_MS);
+      };
+
+      void tick();
+    },
+    [cancelReattach, resetReasoningAccumulator, settleRecoveredRun],
+  );
+
+  /**
+   * Prefer an SSE re-subscription (with ``Last-Event-ID``) within Hermes'
+   * replay TTL; otherwise — or when the subscription fails — poll run-state.
+   */
+  const resumeRunEvents = useCallback(
+    async (runId: string, lastSeq: number | null, token: number) => {
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const turnToken = turnTokenRef.current;
+      let terminal = false;
+      pendingSeqRef.current = lastSeq;
+      // Persist the replayed transcript on the same 5s cadence as a live turn
+      // so a second page switch keeps making progress instead of replaying.
+      const saveTimer = setInterval(() => {
+        saveStreamingSnapshot(true);
+      }, PARTIAL_SAVE_INTERVAL_MS);
+      try {
+        for await (const event of chatRunEvents(runId, {
+          signal: controller.signal,
+          lastEventId: lastSeq,
+        })) {
+          if (reattachTokenRef.current !== token) return;
+          if (typeof event.seq === "number") pendingSeqRef.current = event.seq;
+          dispatchRunEvent(event, turnToken);
+          if (event.type === "done" || event.type === "error") terminal = true;
+        }
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        console.warn("[useChat] Runs 事件恢复失败，改用轮询", err);
+      } finally {
+        clearInterval(saveTimer);
+        if (abortRef.current === controller) abortRef.current = null;
+      }
+      if (reattachTokenRef.current !== token) return;
+      if (terminal) {
+        settleRecoveredRun(runId);
+      } else {
+        // Subscription closed without a terminal event (TTL / truncation):
+        // fall back to the pollable run-state endpoint.
+        pollRunState(runId);
+      }
+    },
+    [dispatchRunEvent, pollRunState, saveStreamingSnapshot, settleRecoveredRun],
+  );
+
+  /** Reattach to a run recorded on a restored chat session. */
+  const reattachRun = useCallback(
+    (runId: string) => {
+      cancelReattach();
+      resetReasoningAccumulator();
+      stoppedRef.current = false;
+      markRestoredAssistantStreaming();
+      runIdRef.current = runId;
+      activeRunIdRef.current = runId;
+      setActiveRunId(runId);
+      setIsStreaming(true);
+      setRecoveringRun(true);
+
+      const token = reattachTokenRef.current;
+      const saved = _readRunSeq(runId);
+      const withinTtl =
+        saved !== null && Date.now() - saved.at <= RUN_EVENT_REPLAY_TTL_MS;
+      if (withinTtl) {
+        void resumeRunEvents(runId, saved.seq, token);
+      } else {
+        void pollRunState(runId);
+      }
+    },
+    [
+      cancelReattach,
+      markRestoredAssistantStreaming,
+      pollRunState,
+      resetReasoningAccumulator,
+      resumeRunEvents,
+    ],
+  );
 
   /** Send a user message and stream the assistant's reply. */
   const sendMessage = useCallback(
@@ -548,7 +991,14 @@ export function useChat() {
       setPendingApproval(null);
       setActiveRunId(null);
       setIsStreaming(true);
+      setRecoveringRun(false);
       runIdRef.current = null;
+      activeRunIdRef.current = null;
+      isStreamingRef.current = true;
+      resumeAssistantIdRef.current = null;
+      pendingSeqRef.current = null;
+      detachedRef.current = false;
+      toolSeqRef.current = 0;
       // New turn: reset the synchronous reasoning accumulator so a replayed
       // first chunk from a second source cannot be appended twice.
       resetReasoningAccumulator();
@@ -570,6 +1020,11 @@ export function useChat() {
           const created = await chatHistory.create();
           sessionIdRef.current = created.id;
           setSessionId(created.id);
+          try {
+            localStorage.setItem(LAST_SESSION_KEY, String(created.id));
+          } catch {
+            /* private mode */
+          }
         } catch (err) {
           console.warn("[useChat] 无法创建会话，产物暂存临时目录", err);
         }
@@ -601,6 +1056,15 @@ export function useChat() {
 
       const controller = new AbortController();
       abortRef.current = controller;
+      // Persist the in-flight transcript on a 5s cadence: a reload / page
+      // switch must not lose everything Hermes already produced.  The final
+      // autosave still runs when streaming finishes.
+      if (partialSaveTimerRef.current !== null) {
+        clearInterval(partialSaveTimerRef.current);
+      }
+      partialSaveTimerRef.current = setInterval(() => {
+        saveStreamingSnapshot(true);
+      }, PARTIAL_SAVE_INTERVAL_MS);
 
       // Agent modes go through the Runs API; direct-LLM modes and backends
       // without run support stay on /chat/stream.
@@ -615,55 +1079,29 @@ export function useChat() {
 
       /** Dispatch one normalised stream event onto React state. */
       const applyEvent = (event: ChatRunEvent) => {
-        // User pressed 停止, or a session switch superseded this turn — drop
-        // late events instead of polluting the newly restored transcript.
         if (stoppedRef.current || turnTokenRef.current !== turnToken) return;
         switch (event.type) {
           case "delta":
-            produced = true;
-            appendToAssistant(event.content);
-            break;
           case "reasoning":
-            produced = true;
-            appendReasoning(event.content, event.replace === true);
-            break;
-          case "session":
-            setHermesSessionId(event.session_id);
-            setHermesSessionMode(opts?.mode ?? null);
-            // Persist the continuity token on the chat session right away so
-            // a reload can continue this Hermes conversation.
-            persistSessionLinks({ hermes_session_id: event.session_id });
-            break;
           case "tool_call":
             produced = true;
-            updateToolCalls(event.tool_calls);
+            break;
+          case "session":
+            setHermesSessionMode(opts?.mode ?? null);
             break;
           case "approval":
             // The agent is paused mid-turn: falling back now would start a
             // second run, so count this as output and surface errors instead.
             produced = true;
-            // An SSE resume can replay a prompt we already answered — do not
-            // resurrect it (a second resolution would be rejected upstream).
-            if (
-              event.approval.approvalId &&
-              answeredApprovalIdsRef.current.has(event.approval.approvalId)
-            ) {
-              break;
-            }
-            setPendingApproval(event.approval);
-            break;
-          case "done":
-            // Abnormal finishes (context overflow, provider error…) arrive with
-            // an `error` alongside the finish reason.
-            if (event.error) setError(event.error);
-            if (event.usage) attachUsage(event.usage);
-            finishAssistant();
-            break;
-          case "error":
-            setError(event.error);
-            finishAssistant();
             break;
         }
+        // Remember how far the run stream got.  The cursor is persisted after
+        // the next transcript snapshot (see ``saveStreamingSnapshot``), so a
+        // page switch resumes SSE without skipping un-saved deltas.
+        if (typeof event.seq === "number" && runIdRef.current) {
+          pendingSeqRef.current = event.seq;
+        }
+        dispatchRunEvent(event, turnToken);
       };
 
       /** Legacy path: POST /api/chat/stream. */
@@ -700,12 +1138,21 @@ export function useChat() {
         runCreated = true;
 
         runIdRef.current = created.run_id;
+        activeRunIdRef.current = created.run_id;
         setActiveRunId(created.run_id);
         // Record the running run on the chat session (when one exists): a
         // reload can then reattach instead of silently abandoning it.
         persistSessionLinks({ active_run_id: created.run_id });
+        if (platformSessionId) {
+          try {
+            localStorage.setItem(LAST_SESSION_KEY, String(platformSessionId));
+          } catch {
+            /* private mode */
+          }
+        }
         if (created.session_id) {
           setHermesSessionId(created.session_id);
+          hermesSessionIdRef.current = created.session_id;
           setHermesSessionMode(opts?.mode ?? null);
           persistSessionLinks({ hermes_session_id: created.session_id });
         }
@@ -796,10 +1243,29 @@ export function useChat() {
         // Only the newest turn may settle shared state: a session switch (or a
         // newer turn) may already own isStreaming / activeRunId.
         if (turnTokenRef.current === turnToken) {
+          if (partialSaveTimerRef.current !== null) {
+            clearInterval(partialSaveTimerRef.current);
+            partialSaveTimerRef.current = null;
+          }
+          const finishedRunId = runIdRef.current;
           setIsStreaming(false);
+          setRecoveringRun(false);
+          isStreamingRef.current = false;
           setActiveRunId(null);
+          activeRunIdRef.current = null;
           setPendingApproval(null);
           runIdRef.current = null;
+          resumeAssistantIdRef.current = null;
+          pendingSeqRef.current = null;
+          if (finishedRunId) {
+            // A naturally finished run must not remain reattachable.  A turn
+            // detached by a route change (``detachedRef``) keeps its link: the
+            // agent is still executing and the next visit resumes it.
+            if (!detachedRef.current) {
+              _clearRunSeq(finishedRunId);
+              persistSessionLinks({ active_run_id: null });
+            }
+          }
         }
         if (abortRef.current === controller) {
           abortRef.current = null;
@@ -810,6 +1276,10 @@ export function useChat() {
         // construction, an unexpected throw inside the stream handlers).  Keep
         // the failure visible and always release the composer.
         if (turnTokenRef.current === turnToken) {
+          if (partialSaveTimerRef.current !== null) {
+            clearInterval(partialSaveTimerRef.current);
+            partialSaveTimerRef.current = null;
+          }
           const msg = err instanceof Error ? err.message : String(err);
           setError(msg);
           setMessages((prev) => [
@@ -817,9 +1287,14 @@ export function useChat() {
             { id: uid(), role: "error", content: msg },
           ]);
           setIsStreaming(false);
+          isStreamingRef.current = false;
+          setRecoveringRun(false);
           setActiveRunId(null);
+          activeRunIdRef.current = null;
           setPendingApproval(null);
           runIdRef.current = null;
+          resumeAssistantIdRef.current = null;
+          pendingSeqRef.current = null;
           abortRef.current = null;
           toast.error(`发送失败: ${msg}`);
         }
@@ -830,11 +1305,8 @@ export function useChat() {
       isStreaming,
       hermesSessionId,
       hermesSessionMode,
-      appendToAssistant,
-      appendReasoning,
-      updateToolCalls,
-      attachUsage,
-      finishAssistant,
+      dispatchRunEvent,
+      saveStreamingSnapshot,
       persistSessionLinks,
       resetReasoningAccumulator,
     ],
@@ -856,8 +1328,18 @@ export function useChat() {
     stoppedRef.current = true;
     abortRef.current = null;
     runIdRef.current = null;
+    activeRunIdRef.current = null;
+    isStreamingRef.current = false;
+    resumeAssistantIdRef.current = null;
+    pendingSeqRef.current = null;
+    if (partialSaveTimerRef.current !== null) {
+      clearInterval(partialSaveTimerRef.current);
+      partialSaveTimerRef.current = null;
+    }
+    if (runId) _clearRunSeq(runId);
     resetReasoningAccumulator();
     setIsStreaming(false);
+    setRecoveringRun(false);
     setActiveRunId(null);
     setPendingApproval(null);
     answeredApprovalIdsRef.current.clear();
@@ -890,9 +1372,20 @@ export function useChat() {
     cancelReattach();
     abortRef.current?.abort();
     abortRef.current = null;
+    const endedRunId = runIdRef.current;
     runIdRef.current = null;
+    activeRunIdRef.current = null;
+    isStreamingRef.current = false;
+    resumeAssistantIdRef.current = null;
+    pendingSeqRef.current = null;
+    if (partialSaveTimerRef.current !== null) {
+      clearInterval(partialSaveTimerRef.current);
+      partialSaveTimerRef.current = null;
+    }
+    if (endedRunId) _clearRunSeq(endedRunId);
     resetReasoningAccumulator();
     setIsStreaming(false);
+    setRecoveringRun(false);
     setActiveRunId(null);
     setPendingApproval(null);
     answeredApprovalIdsRef.current.clear();
@@ -995,21 +1488,37 @@ export function useChat() {
   const clearMessages = useCallback(() => {
     turnTokenRef.current += 1;
     abortRef.current?.abort();
+    abortRef.current = null;
     cancelReattach();
     stoppedRef.current = true;
     runIdRef.current = null;
+    activeRunIdRef.current = null;
+    isStreamingRef.current = false;
+    resumeAssistantIdRef.current = null;
+    pendingSeqRef.current = null;
+    if (partialSaveTimerRef.current !== null) {
+      clearInterval(partialSaveTimerRef.current);
+      partialSaveTimerRef.current = null;
+    }
     resetReasoningAccumulator();
     setMessages([]);
     messagesRef.current = [];
     setError(null);
     setIsStreaming(false);
+    setRecoveringRun(false);
     setSessionId(null);
     sessionIdRef.current = null;
     setHermesSessionId(null);
+    hermesSessionIdRef.current = null;
     setHermesSessionMode(null);
     setActiveRunId(null);
     setPendingApproval(null);
     answeredApprovalIdsRef.current.clear();
+    try {
+      localStorage.removeItem(LAST_SESSION_KEY);
+    } catch {
+      /* private mode */
+    }
   }, [cancelReattach, resetReasoningAccumulator]);
 
   /** Load a saved session from the backend (restores its Hermes linkage). */
@@ -1024,7 +1533,16 @@ export function useChat() {
       abortRef.current?.abort();
       abortRef.current = null;
       runIdRef.current = null;
+      activeRunIdRef.current = null;
+      isStreamingRef.current = false;
+      resumeAssistantIdRef.current = null;
+      pendingSeqRef.current = null;
+      if (partialSaveTimerRef.current !== null) {
+        clearInterval(partialSaveTimerRef.current);
+        partialSaveTimerRef.current = null;
+      }
       setActiveRunId(null);
+      setRecoveringRun(false);
       setPendingApproval(null);
       answeredApprovalIdsRef.current.clear();
       setError(null);
@@ -1032,33 +1550,69 @@ export function useChat() {
       resetReasoningAccumulator();
 
       const detail = await chatHistory.get(id);
+      const linkedRun = detail.active_run_id ?? null;
 
-      const restored: DisplayMessage[] = detail.messages.map((m) => ({
-        id: String(m.id),
-        role: m.role as DisplayMessage["role"],
-        content: m.content,
-        toolCalls: (m.tool_calls as ToolCallDelta[] | undefined) ?? undefined,
-      }));
+      // Restore first-seen tool order: older saved turns predate
+      // ``hermes_seq``, so assign one from their stored array order.  Without
+      // a linked run nothing will ever finish these tools — settle stale
+      // "running" rows so the group does not animate forever.
+      let toolSeq = 0;
+      const restored: DisplayMessage[] = detail.messages.map((m) => {
+        const calls = (m.tool_calls as ToolCallDelta[] | undefined) ?? undefined;
+        const withSeq = calls?.map((call) => {
+          const seq =
+            typeof call.hermes_seq === "number" ? call.hermes_seq : toolSeq + 1;
+          toolSeq = Math.max(toolSeq, seq);
+          const status = (call.hermes_status || "").toLowerCase();
+          const staleRunning =
+            !linkedRun &&
+            (status === "running" ||
+              status === "started" ||
+              status === "in_progress");
+          return {
+            ...call,
+            hermes_seq: seq,
+            ...(staleRunning ? { hermes_status: "completed" } : {}),
+          };
+        });
+        return {
+          id: String(m.id),
+          role: m.role as DisplayMessage["role"],
+          content: m.content,
+          toolCalls: withSeq,
+          isStreaming: false,
+        };
+      });
+      toolSeqRef.current = toolSeq;
       messagesRef.current = restored;
       setMessages(restored);
       setSessionId(id);
       sessionIdRef.current = id;
+      try {
+        localStorage.setItem(LAST_SESSION_KEY, String(id));
+      } catch {
+        /* private mode */
+      }
 
       // Adopt the recorded Hermes session instead of clearing it: the next turn
       // continues that agent session (no full-history replay).  A ``null`` mode
       // means "unknown after reload" and the matching logic treats it as
       // reusable; a chat with no recorded session falls back to full history.
       setHermesSessionId(detail.hermes_session_id ?? null);
+      hermesSessionIdRef.current = detail.hermes_session_id ?? null;
       setHermesSessionMode(null);
 
-      const linkedRun = detail.active_run_id ?? null;
       if (linkedRun) {
-        // The run outlived the page: follow it through the Runs status API and
-        // fold its result into the restored transcript.
-        runReattachPoll(linkedRun);
+        // The run outlived the page: show the saved partial content at once,
+        // then resume its SSE stream (TTL) or poll run-state every 3s.
+        reattachRun(linkedRun);
+      } else {
+        // No run to follow: the turn is over, so clear any streaming flag the
+        // restored assistant bubble may have carried (defensive for old rows).
+        finishAssistant();
       }
     },
-    [cancelReattach, resetReasoningAccumulator, runReattachPoll],
+    [cancelReattach, finishAssistant, reattachRun, resetReasoningAccumulator],
   );
 
   /** Persist the current messages to the backend. */
@@ -1092,6 +1646,60 @@ export function useChat() {
     }
   }, [messages, sessionId, hermesSessionId, activeRunId, enqueueSessionWrite]);
 
+  /**
+   * Restore the most relevant session on a fresh page visit.
+   *
+   * When the URL carries no ``session`` parameter we prefer a session that
+   * still has a recorded active run (its agent may be executing right now),
+   * then the session recorded in localStorage, then the newest non-empty one.
+   */
+  const restoreLastSession = useCallback(async (): Promise<number | null> => {
+    if (sessionIdRef.current) return sessionIdRef.current;
+
+    let sessions: Awaited<ReturnType<typeof chatHistory.list>>;
+    try {
+      sessions = await chatHistory.list();
+    } catch {
+      return null;
+    }
+    if (sessions.length === 0) return null;
+
+    let savedId: number | null = null;
+    try {
+      const raw = Number(localStorage.getItem(LAST_SESSION_KEY));
+      if (Number.isFinite(raw) && raw > 0) savedId = raw;
+    } catch {
+      /* private mode */
+    }
+
+    const candidates = sessions.filter((s) => s.message_count > 0).slice(0, 5);
+    let target: number | null = null;
+    for (const candidate of candidates) {
+      try {
+        const state = await chatHistory.runState(candidate.id);
+        const status = (state.status || "").toUpperCase();
+        if (
+          state.active_run_id &&
+          (status === "RUNNING" || status === "QUEUED")
+        ) {
+          target = candidate.id;
+          break;
+        }
+      } catch {
+        /* keep looking */
+      }
+    }
+    if (target === null) {
+      target =
+        savedId !== null && sessions.some((s) => s.id === savedId)
+          ? savedId
+          : (candidates[0]?.id ?? sessions[0]?.id ?? null);
+    }
+    if (target === null) return null;
+    await loadSession(target);
+    return target;
+  }, [loadSession]);
+
   // Keep the async save bridges pointed at the latest committed state.
   useEffect(() => {
     messagesRef.current = messages;
@@ -1099,12 +1707,53 @@ export function useChat() {
   useEffect(() => {
     sessionIdRef.current = sessionId;
   }, [sessionId]);
+  useEffect(() => {
+    hermesSessionIdRef.current = hermesSessionId;
+  }, [hermesSessionId]);
+  useEffect(() => {
+    activeRunIdRef.current = activeRunId;
+  }, [activeRunId]);
+  useEffect(() => {
+    isStreamingRef.current = isStreaming;
+  }, [isStreaming]);
 
-  // No abort-on-unmount: a Hermes run is a server-side resource the user
-  // expects to keep running when navigating away (reload → reattach via the
-  // active_run_id persisted on the chat session).  Only the reattach poll is
-  // torn down here — the run stream itself is intentionally left alone.
-  useEffect(() => () => cancelReattach(), [cancelReattach]);
+  // Persist once when the page is hidden or unloaded: the 5s cadence may not
+  // have fired yet, and a reload must see the latest assistant text.
+  useEffect(() => {
+    const flush = () => saveStreamingSnapshot(true);
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flush();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", flush);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", flush);
+    };
+  }, [saveStreamingSnapshot]);
+
+  // Leaving the page: flush the partial transcript + resume cursor, then drop
+  // only our local subscription.  The Hermes run keeps executing server-side
+  // (no /stop); the active_run_id stored on the session lets the next visit
+  // reattach via SSE or run-state polling.
+  useEffect(
+    () => () => {
+      if (partialSaveTimerRef.current !== null) {
+        clearInterval(partialSaveTimerRef.current);
+        partialSaveTimerRef.current = null;
+      }
+      // The run survives; only this tab's subscription goes away.  Mark the
+      // turn detached so its finally does not clear the reattach link.
+      if (isStreamingRef.current && runIdRef.current) {
+        detachedRef.current = true;
+      }
+      saveStreamingSnapshot(true);
+      abortRef.current?.abort();
+      abortRef.current = null;
+      cancelReattach();
+    },
+    [cancelReattach, saveStreamingSnapshot],
+  );
 
   // Auto-save when streaming finishes — avoids stale-closure issues
   const wasStreaming = useRef(isStreaming);
@@ -1128,6 +1777,8 @@ export function useChat() {
     hermesSessionId,
     /** Run id of the in-flight Runs-API turn (``null`` for legacy turns). */
     activeRunId,
+    /** True while reattaching to a run after a page switch / reload. */
+    recoveringRun,
     /** Pending tool-approval prompt, if the agent is waiting on one. */
     pendingApproval,
     /** Probed server capabilities (stop / steer / approval / runs). */
@@ -1139,6 +1790,7 @@ export function useChat() {
     configureRunCapabilities,
     clearMessages,
     loadSession,
+    restoreLastSession,
     saveCurrentSession,
   } as const;
 }

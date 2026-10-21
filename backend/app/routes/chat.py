@@ -498,7 +498,40 @@ async def chat_stream_endpoint(
                 if event_type == "delta":
                     payload["content"] = event.get("content", "")
                 elif event_type == "reasoning":
-                    payload["content"] = event.get("content", "")
+                    # Invariant: tool progress must never ride the reasoning
+                    # channel.  Older Hermes adapters occasionally tagged a
+                    # tool-progress frame as ``reasoning``; re-route it here so
+                    # the UI's 思考过程 stays pure and the tool card still gets
+                    # the call.  Only a string may become reasoning text.
+                    tool_payload = event.get("tool_calls") or event.get("hermes_status") or event.get("tool")
+                    if tool_payload:
+                        event_type = "tool_call"
+                        raw_calls = event.get("tool_calls") or [
+                            {
+                                "id": (
+                                    event.get("tool_call_id")
+                                    or event.get("toolCallId")
+                                    or event.get("tool")
+                                    or "tool"
+                                ),
+                                "function": {
+                                    "name": event.get("tool") or "tool",
+                                    "arguments": event.get("hermes_label")
+                                    or event.get("label")
+                                    or event.get("content")
+                                    or "",
+                                },
+                            }
+                        ]
+                        for tc in raw_calls:
+                            for key in ("hermes_emoji", "hermes_label", "hermes_status"):
+                                if key in event and key not in tc:
+                                    tc[key] = event[key]
+                        payload["type"] = "tool_call"
+                        payload["tool_calls"] = raw_calls
+                    else:
+                        content = event.get("content")
+                        payload["content"] = content if isinstance(content, str) else ""
                 elif event_type == "session":
                     payload["session_id"] = event.get("session_id")
                 elif event_type == "status":
@@ -1093,6 +1126,23 @@ class ChatSessionDetail(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ChatSessionRunState(BaseModel):
+    """Pollable state of a chat session's Hermes run (page reattach).
+
+    ``status`` is the normalised Hermes run status (``QUEUED`` / ``RUNNING`` /
+    ``COMPLETED`` / ``FAILED`` / ``CANCELLED``).  ``idle`` means the session has
+    no recorded run; ``unknown`` means one is recorded but Hermes could not be
+    asked (unreachable / run expired), so the client keeps the DB record and
+    retries.
+    """
+
+    active_run_id: str | None = None
+    hermes_session_id: str | None = None
+    status: str = "idle"
+    output: str = ""
+    updated_at: datetime
+
+
 class SaveMessagesRequest(BaseModel):
     """Bulk-save messages for a session (upsert: clear + re-insert).
 
@@ -1201,6 +1251,90 @@ async def get_chat_session(
         messages=messages,
         hermes_session_id=row.hermes_session_id,
         active_run_id=row.active_run_id,
+    )
+
+
+#: Hermes run status → the normalised state the chat UI polls for.  Everything
+#: still producing events is "RUNNING" so the UI keeps the status bar alive.
+_RUN_STATE_BY_HERMES_STATUS = {
+    "queued": "QUEUED",
+    "created": "QUEUED",
+    "pending": "QUEUED",
+    "running": "RUNNING",
+    "waiting_for_approval": "RUNNING",
+    "stopping": "RUNNING",
+    "completed": "COMPLETED",
+    "failed": "FAILED",
+    "cancelled": "CANCELLED",
+    "interrupted": "CANCELLED",
+}
+
+
+def _normalised_run_state(raw_status: Any) -> str:
+    """Map a raw Hermes run status onto the UI's run-state vocabulary."""
+    if not isinstance(raw_status, str) or not raw_status.strip():
+        return "unknown"
+    return _RUN_STATE_BY_HERMES_STATUS.get(raw_status.strip().lower(), "unknown")
+
+
+@router.get("/sessions/{session_id}/run-state", response_model=ChatSessionRunState)
+async def get_chat_session_run_state(
+    session_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> ChatSessionRunState:
+    """Return the reattach state of a chat session's in-flight Hermes run.
+
+    Used after a page switch / reload: the transcript lives in the DB, but the
+    agent keeps running server-side, so the client needs the recorded
+    ``active_run_id`` plus the live status and final output.  Hermes is only
+    contacted when a run is recorded; when it is unreachable the DB record is
+    still returned with ``status="unknown"`` so the client can retry.
+    """
+    row = await db.get(ChatSession, session_id)
+    if not row or row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    active_run_id = row.active_run_id
+    status = "idle"
+    output = ""
+
+    if active_run_id:
+        hermes = _get_hermes()
+        if not hermes.base_url:
+            status = "unknown"
+        else:
+            try:
+                run = await hermes.get_run(active_run_id)
+                status = _normalised_run_state(run.get("status"))
+                raw_output = run.get("output")
+                output = raw_output if isinstance(raw_output, str) else ""
+            except HermesRunError as exc:
+                # 404 → the run expired in Hermes (its result is gone); other
+                # codes → temporarily unavailable.  Both keep the DB record so
+                # the client can retry / let the user decide.
+                status = "unknown"
+                logger.info(
+                    "Run state lookup failed: session={} run={} HTTP {}: {}",
+                    session_id,
+                    active_run_id,
+                    exc.status_code,
+                    exc.detail,
+                )
+            except Exception:
+                status = "unknown"
+                logger.exception(
+                    "Run state lookup error: session={} run={}",
+                    session_id,
+                    active_run_id,
+                )
+
+    return ChatSessionRunState(
+        active_run_id=active_run_id,
+        hermes_session_id=row.hermes_session_id,
+        status=status,
+        output=output,
+        updated_at=row.updated_at,
     )
 
 

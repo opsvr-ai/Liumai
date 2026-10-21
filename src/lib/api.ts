@@ -501,10 +501,20 @@ export interface ToolCallDelta {
   };
   /** Hermes-specific: emoji for the tool (e.g. 🌐 👆 📸) */
   hermes_emoji?: string;
-  /** Hermes-specific: human-readable label */
+  /** Hermes-specific: human-readable label (parameter / command summary) */
   hermes_label?: string;
-  /** Hermes-specific: "running" | "completed" */
+  /** Hermes-specific: "running" | "completed" | "failed" */
   hermes_status?: string;
+  /** Completion preview reported by ``tool.completed`` (result summary). */
+  hermes_result?: string;
+  /** Tool error detail (``tool.completed`` with ``error: true``). */
+  hermes_error?: string;
+  /** Wall-clock tool duration in milliseconds, when Hermes reports it. */
+  hermes_duration_ms?: number;
+  /** First-seen order inside the turn (stable across started/completed). */
+  hermes_seq?: number;
+  /** Client clock (ms) when the tool was first seen running. */
+  hermes_started_at?: number;
 }
 
 /** Parsed SSE event from the chat stream endpoint. */
@@ -866,6 +876,22 @@ export interface ChatRunStatus {
   [key: string]: unknown;
 }
 
+/**
+ * Reattach state of a chat session's in-flight Hermes run
+ * (``GET /api/chat/sessions/{id}/run-state``).
+ *
+ * ``status`` is uppercase for a Hermes answer (``QUEUED`` / ``RUNNING`` /
+ * ``COMPLETED`` / ``FAILED`` / ``CANCELLED``); ``idle`` means no run is
+ * recorded and ``unknown`` means Hermes could not be asked (retry later).
+ */
+export interface ChatSessionRunState {
+  active_run_id: string | null;
+  hermes_session_id: string | null;
+  status: string;
+  output: string;
+  updated_at: string | null;
+}
+
 /** A tool-approval prompt raised by a running agent. */
 export interface ChatApprovalRequest {
   /** Hermes ``request_id`` used to resolve this exact prompt ("" if absent). */
@@ -1192,6 +1218,17 @@ export class ReasoningDeduper {
   }
 }
 
+/**
+ * Convert a Hermes ``tool.completed`` duration (seconds, rounded to 3 decimals)
+ * into milliseconds.  Returns ``null`` when the value is absent/unparseable so
+ * the UI can fall back to its own observation window.
+ */
+function _runDurationMs(raw: unknown): number | null {
+  const seconds = typeof raw === "number" ? raw : Number(raw);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.round(seconds * 1000);
+}
+
 /** Map Hermes run usage onto the existing chat usage shape. */
 function _runUsage(
   raw: unknown,
@@ -1246,22 +1283,62 @@ function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
         : null;
     }
     case "tool.started":
-    case "tool.completed": {
-      const completed = name === "tool.completed";
-      const toolName = _runStr(raw.tool) || "tool";
-      const label = completed
-        ? _runStr(raw.preview) || (raw.error ? "执行失败" : "已完成")
-        : _runStr(raw.preview);
+    case "tool.completed":
+    case "tool.failed": {
+      const failed =
+        name === "tool.failed" ||
+        raw.error === true ||
+        (typeof raw.error === "string" && raw.error.length > 0);
+      const completed = name !== "tool.started";
+      const toolName =
+        _runStr(raw.tool) || _runStr(raw.tool_name) || _runStr(raw.name) || "tool";
+      const preview = _runStr(raw.preview);
+      // ``arguments`` is the parameter summary.  Runs events only expose the
+      // started ``preview`` (command / expression); the completed preview is a
+      // *result*, so it must never overwrite the parameters.
+      let argumentsText = "";
+      const rawArgs = raw.arguments ?? raw.args;
+      if (typeof rawArgs === "string") {
+        argumentsText = rawArgs;
+      } else if (rawArgs && typeof rawArgs === "object") {
+        try {
+          argumentsText = JSON.stringify(rawArgs);
+        } catch {
+          argumentsText = "";
+        }
+      } else if (!completed) {
+        argumentsText = preview;
+      }
+      const durationMs = _runDurationMs(raw.duration);
+      const result = completed ? preview : "";
       return {
         type: "tool_call",
         tool_calls: [
           {
-            id: _runStr(raw.tool_call_id) || toolName,
-            // `arguments` is repurposed as the display label, matching the
-            // hermes.tool.progress convention used by /chat/stream.
-            function: { name: toolName, arguments: label },
-            hermes_label: label,
-            hermes_status: completed ? "completed" : "running",
+            id:
+              _runStr(raw.tool_call_id) ||
+              _runStr(raw.call_id) ||
+              _runStr(raw.id) ||
+              toolName,
+            function: { name: toolName, arguments: argumentsText },
+            // Keep the started preview as the label; the completed preview is
+            // the result (see ``hermes_result``).
+            hermes_label: completed ? "" : preview,
+            hermes_status: failed
+              ? "failed"
+              : completed
+                ? "completed"
+                : "running",
+            ...(result ? { hermes_result: result } : {}),
+            ...(failed
+              ? {
+                  hermes_error:
+                    typeof raw.error === "string"
+                      ? raw.error
+                      : _runStr(raw.message) || "执行失败",
+                }
+              : {}),
+            ...(durationMs !== null ? { hermes_duration_ms: durationMs } : {}),
           },
         ],
       };
@@ -1989,6 +2066,17 @@ export const chatHistory = {
   },
   get(sessionId: number) {
     return request<ChatSessionDetail>("GET", `/chat/sessions/${sessionId}`);
+  },
+  /**
+   * Live run state for a session — the page-reattach path.  Always resolves
+   * (Hermes outages surface as ``status: "unknown"``), so callers can poll it
+   * while the agent keeps executing after the tab was hidden.
+   */
+  runState(sessionId: number) {
+    return request<ChatSessionRunState>(
+      "GET",
+      `/chat/sessions/${sessionId}/run-state`,
+    );
   },
   saveMessages(
     sessionId: number,

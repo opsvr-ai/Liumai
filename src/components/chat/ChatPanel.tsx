@@ -145,6 +145,7 @@ export const ChatPanel: FC = () => {
     error,
     sessionId,
     activeRunId,
+    recoveringRun,
     pendingApproval,
     runCapabilities,
     sendMessage,
@@ -154,6 +155,7 @@ export const ChatPanel: FC = () => {
     configureRunCapabilities,
     clearMessages,
     loadSession,
+    restoreLastSession,
   } = useChat();
 
   /* ── Composer / session state ─────────────────────────────────────── */
@@ -179,7 +181,7 @@ export const ChatPanel: FC = () => {
   const typewriterTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   /* ── Modes / models ───────────────────────────────────────────────── */
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const initialModeFromUrl = searchParams.get("mode");
   const [modes, setModes] = useState<ChatModeOut[]>([]);
   const [activeMode, setActiveMode] = useState<string | null>(
@@ -740,8 +742,16 @@ export const ChatPanel: FC = () => {
     setPendingResend(null);
     setApprovalNotice(null);
     resetTransientUi();
+    setSearchParams(
+      (previous) => {
+        const next = new URLSearchParams(previous);
+        next.delete("session");
+        return next;
+      },
+      { replace: true },
+    );
     if (window.innerWidth < 1024) setSidebarOpen(false);
-  }, [clearMessages, resetTransientUi]);
+  }, [clearMessages, resetTransientUi, setSearchParams]);
 
   const handleLoadSession = useCallback(
     async (id: number) => {
@@ -759,6 +769,15 @@ export const ChatPanel: FC = () => {
       prevMessageCountRef.current = 0;
       try {
         await loadSession(id);
+        // Keep the URL in sync so a refresh / re-entry restores the same chat.
+        setSearchParams(
+          (previous) => {
+            const next = new URLSearchParams(previous);
+            next.set("session", String(id));
+            return next;
+          },
+          { replace: true },
+        );
         nearBottomRef.current = true;
         setIsNearBottom(true);
         setHasUnread(false);
@@ -768,8 +787,45 @@ export const ChatPanel: FC = () => {
       }
       if (window.innerWidth < 1024) setSidebarOpen(false);
     },
-    [loadSession, scrollToBottom, sessions],
+    [loadSession, scrollToBottom, sessions, setSearchParams],
   );
+
+  /**
+   * Re-enter recovery: a route remount has no chat state.  If the URL names a
+   * session load it; otherwise restore the newest session (or the one whose
+   * Hermes run is still active).  Runs once per mount.
+   */
+  const restoreAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (restoreAttemptedRef.current) return;
+    restoreAttemptedRef.current = true;
+
+    const urlSession = Number(searchParams.get("session"));
+    if (Number.isFinite(urlSession) && urlSession > 0) {
+      void handleLoadSession(urlSession);
+      return;
+    }
+    void restoreLastSession()
+      .then((id) => {
+        if (id === null) return;
+        setSearchParams(
+          (previous) => {
+            const next = new URLSearchParams(previous);
+            next.set("session", String(id));
+            return next;
+          },
+          { replace: true },
+        );
+        nearBottomRef.current = true;
+        setIsNearBottom(true);
+        scrollToBottom();
+      })
+      .catch(() => {
+        /* no history yet — stay on the empty state */
+      });
+    // Mount-only: re-running on every session update would fight the user.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleDeleteSession = useCallback(
     async (id: number, event: MouseEvent) => {
@@ -1105,6 +1161,24 @@ export const ChatPanel: FC = () => {
           onClear={() => setClearOpen(true)}
           onExport={handleExport}
         />
+
+        {recoveringRun && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex shrink-0 items-center gap-2 border-b border-interactive-primary/20 bg-interactive-primary/[0.045] px-4 py-2 text-[12px] text-text-secondary sm:px-6"
+            data-testid="run-recovery-banner"
+          >
+            <span className="relative flex h-2 w-2 shrink-0" aria-hidden="true">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-interactive-primary opacity-50" />
+              <span className="relative inline-flex h-2 w-2 rounded-full bg-interactive-primary" />
+            </span>
+            <span className="font-medium text-text-secondary">正在继续执行…</span>
+            <span className="truncate text-[11.5px] text-muted-foreground">
+              Hermes 任务仍在运行，生成内容会自动同步到本页
+            </span>
+          </div>
+        )}
 
         <div className="relative flex min-h-0 flex-1 flex-col">
           <div
