@@ -613,11 +613,12 @@ class HermesClient:
 
                     tool_call_buf: dict[int, dict[str, Any]] = {}
                     current_sse_event: str | None = None
-                    # Reasoning already forwarded for this turn.  Reasoning
-                    # chunks are normally incremental, but cumulative
-                    # snapshots/whole-block replays would otherwise duplicate
-                    # the entire thinking text in the UI.
-                    reasoning_seen: str = ""
+                    # Reasoning forwarded for this turn only.  A deduper
+                    # instance is created per ``chat_stream`` call: reusing
+                    # state across requests would swallow the first block of
+                    # the next turn.  It collapses cumulative snapshots,
+                    # whole-block replays and replays split across chunks.
+                    reasoning_deduper = _ReasoningDeduper()
 
                     async for line in resp.aiter_lines():
                         # ── SSE 注释行（`: keepalive`）─────────────────────
@@ -741,15 +742,13 @@ class HermesClient:
                         # answer text.
                         reasoning = _find_reasoning(delta)
                         if reasoning:
-                            # Drop the part we already have: a provider may
-                            # resend the accumulated reasoning instead of one
-                            # incremental token.  Real content is preserved —
-                            # only the unseen suffix is forwarded.
-                            fresh_reasoning = _dedupe_reasoning(
-                                reasoning_seen, reasoning
-                            )
+                            # Drop anything already forwarded: providers may
+                            # resend the accumulated reasoning, a whole block,
+                            # or the same first sentence split across chunks.
+                            # Real content is preserved — only the unseen
+                            # suffix is forwarded.
+                            fresh_reasoning = reasoning_deduper.feed(reasoning)
                             if fresh_reasoning:
-                                reasoning_seen += fresh_reasoning
                                 yield {
                                     "type": "reasoning",
                                     "content": fresh_reasoning,
@@ -1440,10 +1439,31 @@ def _find_reasoning(delta: dict[str, Any]) -> str | None:
     return None
 
 
-#: Smallest reasoning block that may be collapsed as a replay.  Short tokens
-#: (``"的"``, ``"。\n"``, ``" the"``) repeat legitimately in thought streams and
-#: must never be dropped by the de-duplicator.
-REASONING_DEDUP_MIN_CHARS = 24
+#: Smallest overlap that may be collapsed between the accumulated reasoning and
+#: an incoming block.  The floor used to be 24 chars, which let a replayed
+#: *first sentence* (e.g. ``我先去检查一下 Hermes 的运行状态。`` — 20 chars) slip
+#: through and be appended twice.  Single characters are excluded because
+#: tokens such as ``的`` / ``。`` repeat legitimately in a thought stream.
+REASONING_DEDUP_MIN_OVERLAP = 2
+
+#: Upper bound for the cached-suffix overlap scan.  Hermes whole-block
+#: snapshots are at most ~500 chars (``reasoning.available`` preview), so a
+#: longer scan only wastes time on the incremental token path.
+REASONING_DEDUP_MAX_SCAN = 512
+
+#: Minimum shared opening before an incoming block is treated as a restatement
+#: of the visible reasoning.  Short tokens (``The`` / ``the``) repeat
+#: legitimately, so this is stricter than the suffix-overlap floor.
+REASONING_DEDUP_MIN_PREFIX_REPLAY = 8
+
+
+def _common_prefix_length(a: str, b: str) -> int:
+    """Length of the longest common prefix of *a* and *b*."""
+    limit = min(len(a), len(b))
+    index = 0
+    while index < limit and a[index] == b[index]:
+        index += 1
+    return index
 
 
 def _dedupe_reasoning(accumulated: str, chunk: str) -> str:
@@ -1459,9 +1479,11 @@ def _dedupe_reasoning(accumulated: str, chunk: str) -> str:
       (not a delta) and reconnects / some adapters re-send a block that was
       already streamed.
 
-    The guard is deliberately conservative: only blocks that cover a large
-    fraction of the already-seen text (or an exact/cumulative snapshot) are
-    collapsed, so a genuinely repeated short phrase is preserved.
+    Three shapes are collapsed: an exact repeat, a cumulative snapshot (only
+    its unseen suffix is forwarded), and a replayed earlier block / overlapping
+    tail (only the non-overlapping suffix is forwarded).  The overlap is
+    length-aware instead of using a fixed 24-char floor, so a short first
+    sentence replay is caught while a real repeat of one character survives.
     """
     if not chunk:
         return ""
@@ -1474,23 +1496,94 @@ def _dedupe_reasoning(accumulated: str, chunk: str) -> str:
     if chunk.startswith(accumulated):
         return chunk[len(accumulated):]
 
-    # Replayed block: it is (a tail of) what we already appended.  Size the
-    # threshold relative to the accumulated text so a repeated sentence in a
-    # long thought is not mistaken for a replay.
-    replay_min = max(REASONING_DEDUP_MIN_CHARS, int(len(accumulated) * 0.6))
-    if len(chunk) >= replay_min and (
-        accumulated.endswith(chunk) or chunk in accumulated
-    ):
-        return ""
+    # An earlier whole block (including a short first sentence) replayed
+    # verbatim.  Single characters are exempt: they repeat legitimately.
+    if accumulated.startswith(chunk):
+        return "" if len(chunk) >= REASONING_DEDUP_MIN_OVERLAP else chunk
 
-    # An older, shorter snapshot replayed after more reasoning accumulated.
-    if (
-        accumulated.startswith(chunk)
-        and len(chunk) >= max(REASONING_DEDUP_MIN_CHARS, int(len(accumulated) * 0.8))
-    ):
-        return ""
+    # The block re-states the beginning of what is visible and then diverges
+    # (snapshot arriving after some deltas already landed): only its unseen
+    # suffix is forwarded.
+    lcp = _common_prefix_length(accumulated, chunk)
+    if lcp >= REASONING_DEDUP_MIN_PREFIX_REPLAY:
+        return chunk[lcp:]
+
+    # Overlapping tail: the longest suffix of ``accumulated`` that is also a
+    # prefix of ``chunk`` was already forwarded.
+    max_overlap = min(
+        len(accumulated), len(chunk), REASONING_DEDUP_MAX_SCAN
+    )
+    for size in range(max_overlap, REASONING_DEDUP_MIN_OVERLAP - 1, -1):
+        if accumulated.endswith(chunk[:size]):
+            return "" if size == len(chunk) else chunk[size:]
 
     return chunk
+
+
+class _ReasoningDeduper:
+    """Per-stream reasoning de-duplicator.
+
+    ``_dedupe_reasoning`` compares one incoming block with the text already
+    forwarded, which catches whole-block snapshots but not a replay that is
+    split across chunks (a snapshot first, then the same first sentence as
+    several ``delta.reasoning_content`` chunks).  A prefix chunk therefore
+    opens a *probe*: following chunks are buffered while they keep reproducing
+    visible text.  A cumulative replay contributes only its unseen suffix; a
+    diverging thought drops the buffered duplicate prefix and keeps the new
+    chunk, so real content is never lost.
+
+    One instance must be created per ``chat_stream`` call — the state must not
+    leak across turns/requests.
+    """
+
+    def __init__(self) -> None:
+        self.seen = ""
+        self._probe: str | None = None
+
+    def feed(self, chunk: str) -> str:
+        """Return only the unseen part of *chunk* ("" when it is a replay)."""
+        if not chunk:
+            return ""
+
+        seen = self.seen
+        if self._probe is not None:
+            candidate = self._probe + chunk
+            if seen.startswith(candidate):
+                # Still reproducing text that is already visible.
+                self._probe = None if candidate == seen else candidate
+                return ""
+            if candidate.startswith(seen):
+                # The replay was cumulative and now extends the visible text.
+                fresh = candidate[len(seen):]
+                self._probe = None
+                if not fresh:
+                    return ""
+                self.seen = seen + fresh
+                return fresh
+            # Repeated prefix, not a cumulative replay: drop the duplicate
+            # probe and keep only the genuinely new chunk.
+            self._probe = None
+            fresh = _dedupe_reasoning(seen, chunk)
+            if not fresh:
+                return ""
+            self.seen = seen + fresh
+            return fresh
+
+        if (
+            seen
+            and len(chunk) >= REASONING_DEDUP_MIN_OVERLAP
+            and seen.startswith(chunk)
+        ):
+            # Text we already showed is being streamed again; buffer and
+            # compare the following chunks instead of appending it.
+            self._probe = None if chunk == seen else chunk
+            return ""
+
+        fresh = _dedupe_reasoning(seen, chunk)
+        if not fresh:
+            return ""
+        self.seen = seen + fresh
+        return fresh
 
 
 def _find_content(delta: dict[str, Any]) -> str | None:

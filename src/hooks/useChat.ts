@@ -19,7 +19,7 @@ import {
   chatRuns,
   chatRunEvents,
   chatStream,
-  dedupeReasoningChunk,
+  ReasoningDeduper,
   type ChatApprovalRequest,
   type ChatMessage,
   type ChatRunEvent,
@@ -140,8 +140,13 @@ export function useChat() {
   );
 
   const abortRef = useRef<AbortController | null>(null);
-  /** Synchronous accumulator for this turn's reasoning (dedupe survives batching). */
-  const reasoningAccRef = useRef<string>("");
+  /**
+   * Synchronous reasoning accumulator for this turn.  It is a deduper (not
+   * plain React state) because two events can arrive in the same tick: both
+   * must see the text accepted so far, or the first sentence is appended
+   * twice.  It also buffers replays that arrive split across chunks.
+   */
+  const reasoningDeduperRef = useRef<ReasoningDeduper | null>(null);
   /** Run id for control calls; a ref so stop/steer never read stale state. */
   const runIdRef = useRef<string | null>(null);
   /**
@@ -247,6 +252,17 @@ export function useChat() {
     [enqueueSessionWrite],
   );
 
+  /**
+   * Reset the per-turn reasoning accumulator.
+   *
+   * Called when a turn starts, is stopped, or the transcript is switched /
+   * cleared: a stale accumulator would make the next turn's first reasoning
+   * block look like a replay (or let a late event append to the new turn).
+   */
+  const resetReasoningAccumulator = useCallback(() => {
+    reasoningDeduperRef.current?.reset();
+  }, []);
+
   /** Cancel any in-flight reattach poll (session switch / clear / unmount). */
   const cancelReattach = useCallback(() => {
     reattachTokenRef.current += 1;
@@ -276,6 +292,7 @@ export function useChat() {
   const runReattachPoll = useCallback(
     (runId: string) => {
       cancelReattach();
+      resetReasoningAccumulator();
       const token = reattachTokenRef.current;
       runIdRef.current = runId;
       setActiveRunId(runId);
@@ -321,7 +338,7 @@ export function useChat() {
 
       void tick();
     },
-    [appendReattachedOutput, cancelReattach, persistSessionLinks],
+    [appendReattachedOutput, cancelReattach, persistSessionLinks, resetReasoningAccumulator],
   );
 
   /** Append a text chunk to the last assistant bubble (or create one). */
@@ -362,14 +379,15 @@ export function useChat() {
    */
   const appendReasoning = useCallback((content: string, replace = false) => {
     if (!content) return;
-    // Keep the accumulator in a ref: React state updates are batched, so two
-    // events delivered in the same tick (e.g. a delta + its snapshot) used to
-    // read the same stale value and both append the first sentence.
-    const accumulated = reasoningAccRef.current;
-    const fresh = dedupeReasoningChunk(accumulated, content);
+    // One deduper per turn, held in a ref: React state updates are batched, so
+    // two events delivered in the same tick (e.g. a delta + its snapshot) used
+    // to read the same stale value and both append the first sentence.
+    const deduper =
+      reasoningDeduperRef.current ??
+      (reasoningDeduperRef.current = new ReasoningDeduper());
+    const fresh = deduper.feed(content);
     if (!fresh) return;
-    const next = accumulated + fresh;
-    reasoningAccRef.current = next;
+    const next = deduper.text;
     setMessages((prev) => {
       const last = prev[prev.length - 1];
       const streaming =
@@ -533,7 +551,7 @@ export function useChat() {
       runIdRef.current = null;
       // New turn: reset the synchronous reasoning accumulator so a replayed
       // first chunk from a second source cannot be appended twice.
-      reasoningAccRef.current = "";
+      resetReasoningAccumulator();
       stoppedRef.current = false;
       answeredApprovalIdsRef.current.clear();
 
@@ -818,6 +836,7 @@ export function useChat() {
       attachUsage,
       finishAssistant,
       persistSessionLinks,
+      resetReasoningAccumulator,
     ],
   );
 
@@ -837,6 +856,7 @@ export function useChat() {
     stoppedRef.current = true;
     abortRef.current = null;
     runIdRef.current = null;
+    resetReasoningAccumulator();
     setIsStreaming(false);
     setActiveRunId(null);
     setPendingApproval(null);
@@ -854,7 +874,7 @@ export function useChat() {
       });
     }
     controller?.abort();
-  }, [finishAssistant, persistSessionLinks]);
+  }, [finishAssistant, persistSessionLinks, resetReasoningAccumulator]);
 
   /**
    * Tear down the local view of a run the server says is already over.
@@ -871,13 +891,14 @@ export function useChat() {
     abortRef.current?.abort();
     abortRef.current = null;
     runIdRef.current = null;
+    resetReasoningAccumulator();
     setIsStreaming(false);
     setActiveRunId(null);
     setPendingApproval(null);
     answeredApprovalIdsRef.current.clear();
     finishAssistant();
     persistSessionLinks({ active_run_id: null });
-  }, [cancelReattach, finishAssistant, persistSessionLinks]);
+  }, [cancelReattach, finishAssistant, persistSessionLinks, resetReasoningAccumulator]);
 
   /**
    * Inject a supplementary instruction into the running agent
@@ -977,6 +998,7 @@ export function useChat() {
     cancelReattach();
     stoppedRef.current = true;
     runIdRef.current = null;
+    resetReasoningAccumulator();
     setMessages([]);
     messagesRef.current = [];
     setError(null);
@@ -988,7 +1010,7 @@ export function useChat() {
     setActiveRunId(null);
     setPendingApproval(null);
     answeredApprovalIdsRef.current.clear();
-  }, [cancelReattach]);
+  }, [cancelReattach, resetReasoningAccumulator]);
 
   /** Load a saved session from the backend (restores its Hermes linkage). */
   const loadSession = useCallback(
@@ -1007,6 +1029,7 @@ export function useChat() {
       answeredApprovalIdsRef.current.clear();
       setError(null);
       setIsStreaming(false);
+      resetReasoningAccumulator();
 
       const detail = await chatHistory.get(id);
 
@@ -1035,7 +1058,7 @@ export function useChat() {
         runReattachPoll(linkedRun);
       }
     },
-    [cancelReattach, runReattachPoll],
+    [cancelReattach, resetReasoningAccumulator, runReattachPoll],
   );
 
   /** Persist the current messages to the backend. */

@@ -1024,23 +1024,45 @@ function _runStr(value: unknown): string {
   return String(value);
 }
 
-/** Minimum block size for replay de-duplication (see below). */
-const REASONING_DEDUP_MIN_CHARS = 24;
+/** Minimum overlap (chars) between seen text and an incoming block. */
+const REASONING_MIN_OVERLAP = 2;
+
+/**
+ * Minimum shared opening (chars) before an incoming block is treated as a
+ * restatement of the visible reasoning.  Short English tokens ("The", "the")
+ * repeat legitimately, so this is stricter than the suffix-overlap floor.
+ */
+const REASONING_MIN_PREFIX_REPLAY = 8;
+
+/** Upper bound for the overlap scan (Hermes whole-block snapshots are ≤ 500 chars). */
+const REASONING_MAX_OVERLAP_SEARCH = 512;
+
+/** Length of the longest common prefix of *a* and *b*. */
+function commonPrefixLength(a: string, b: string): number {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a.charCodeAt(i) === b.charCodeAt(i)) i += 1;
+  return i;
+}
 
 /**
  * Return only the unseen part of one reasoning block.
  *
  * Hermes streams reasoning incrementally, but two behaviours duplicated the
- * whole thinking text when every block was appended verbatim:
+ * thinking text when every block was appended verbatim:
  *
  * - **cumulative snapshots** — some providers send the reasoning accumulated
  *   so far instead of just the new token(s);
  * - **whole-block replays** — `reasoning.available` is a completed block (not a
  *   delta), and a reconnect may re-send a block that was already applied.
  *
- * The guard is conservative: only an exact/cumulative snapshot or a block
- * covering a large share of what was already shown is collapsed, so a
- * genuinely repeated short phrase survives.
+ * Three shapes are collapsed: an exact repeat, a cumulative snapshot (only its
+ * unseen suffix is returned), and a replayed earlier block / overlapping tail
+ * (only the non-overlapping suffix is returned).  The overlap guard is
+ * deliberately length-aware: the reported bug was a replay of the *first
+ * sentence*, which is shorter than the old 24-char floor, so that floor is
+ * gone — a chunk of 2+ characters that the seen text already starts with (or
+ * ends with) is treated as a replay.
  */
 export function dedupeReasoningChunk(
   accumulated: string,
@@ -1053,28 +1075,108 @@ export function dedupeReasoningChunk(
   // Cumulative snapshot: the chunk already contains everything we streamed.
   if (chunk.startsWith(accumulated)) return chunk.slice(accumulated.length);
 
-  // Replayed block: a large tail/substring of what was already appended.
-  const replayMin = Math.max(
-    REASONING_DEDUP_MIN_CHARS,
-    Math.floor(accumulated.length * 0.6),
-  );
-  if (
-    chunk.length >= replayMin &&
-    (accumulated.endsWith(chunk) || accumulated.includes(chunk))
-  ) {
-    return "";
+  // A whole earlier block replayed — including a short first sentence.  Single
+  // characters are exempt because tokens like "的" / "。" repeat legitimately.
+  if (accumulated.startsWith(chunk)) {
+    return chunk.length >= REASONING_MIN_OVERLAP ? "" : chunk;
   }
 
-  // An older, shorter snapshot replayed after more reasoning accumulated.
-  if (
-    accumulated.startsWith(chunk) &&
-    chunk.length >=
-      Math.max(REASONING_DEDUP_MIN_CHARS, Math.floor(accumulated.length * 0.8))
-  ) {
-    return "";
+  // The block re-states the beginning of what is visible and then diverges.
+  // This is the "snapshot after some deltas" shape: the first sentence already
+  // reached the browser, a later snapshot starts with it again, but the seen
+  // text also holds a partial continuation that the snapshot does not repeat.
+  const lcp = commonPrefixLength(accumulated, chunk);
+  if (lcp >= REASONING_MIN_PREFIX_REPLAY) return chunk.slice(lcp);
+
+  // Overlapping tail: the longest suffix of ``accumulated`` that is also a
+  // prefix of ``chunk`` is already shown.  Snapshots are bounded by Hermes
+  // (~500 chars), so capping the search keeps this O(1) per token.
+  const maxOverlap = Math.min(
+    accumulated.length,
+    chunk.length,
+    REASONING_MAX_OVERLAP_SEARCH,
+  );
+  for (let k = maxOverlap; k >= REASONING_MIN_OVERLAP; k -= 1) {
+    if (accumulated.endsWith(chunk.slice(0, k))) {
+      return k === chunk.length ? "" : chunk.slice(k);
+    }
   }
 
   return chunk;
+}
+
+/**
+ * Stateful reasoning de-duplicator for one chat turn.
+ *
+ * ``dedupeReasoningChunk`` compares one incoming block with the text already
+ * shown, which catches whole-block snapshots but not a replay that is split
+ * across chunks (a snapshot first, then the same first sentence as several
+ * ``reasoning.delta`` chunks).  A prefix chunk therefore opens a *probe*:
+ * following chunks are buffered while they keep reproducing visible text.  A
+ * cumulative replay contributes only its unseen suffix; a diverging thought
+ * drops the buffered duplicate prefix and keeps the new chunk, so real content
+ * is never lost.
+ *
+ * One instance must live for exactly one turn; call {@link reset} when the
+ * turn starts, stops, or the transcript is switched.
+ */
+export class ReasoningDeduper {
+  private seen = "";
+  /** Buffered replay candidate, or null when no replay is in progress. */
+  private probe: string | null = null;
+
+  /** Text accepted for this turn so far. */
+  get text(): string {
+    return this.seen;
+  }
+
+  /** Forget the accumulated text (new turn / stop / session switch). */
+  reset(): void {
+    this.seen = "";
+    this.probe = null;
+  }
+
+  /** Feed one reasoning chunk; returns the fresh text to append ("" = replay). */
+  feed(chunk: string): string {
+    if (!chunk) return "";
+
+    const seen = this.seen;
+    if (this.probe !== null) {
+      const candidate = this.probe + chunk;
+      if (seen.startsWith(candidate)) {
+        // Still reproducing text that is already visible.
+        this.probe = candidate === seen ? null : candidate;
+        return "";
+      }
+      if (candidate.startsWith(seen)) {
+        // The replay was cumulative and now extends the visible text.
+        const fresh = candidate.slice(seen.length);
+        this.probe = null;
+        if (!fresh) return "";
+        this.seen = seen + fresh;
+        return fresh;
+      }
+      // Repeated prefix, not a cumulative replay: drop the duplicate probe
+      // and keep only the genuinely new chunk.
+      this.probe = null;
+      const fresh = dedupeReasoningChunk(seen, chunk);
+      if (!fresh) return "";
+      this.seen = seen + fresh;
+      return fresh;
+    }
+
+    if (seen && chunk.length >= REASONING_MIN_OVERLAP && seen.startsWith(chunk)) {
+      // A block we already showed is being streamed again; buffer and compare
+      // the following chunks instead of appending it.
+      this.probe = chunk === seen ? null : chunk;
+      return "";
+    }
+
+    const fresh = dedupeReasoningChunk(seen, chunk);
+    if (!fresh) return "";
+    this.seen = seen + fresh;
+    return fresh;
+  }
 }
 
 /** Map Hermes run usage onto the existing chat usage shape. */
