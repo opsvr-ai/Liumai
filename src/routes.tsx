@@ -28,6 +28,10 @@ export const APP_ROUTES: AppRoute[] = [
   },
   { path: "/alerts", Component: lazy(() => import("@/pages/alerts")) },
   { path: "/rca", Component: lazy(() => import("@/pages/rca/rca-page")) },
+  {
+    path: "/rca/report/:sessionId",
+    Component: lazy(() => import("@/pages/rca/report-view")),
+  },
   { path: "/history", Component: lazy(() => import("@/pages/history/history-page")) },
   // ── 对话 ──────────────────────────────────────────────────────────────
   { path: "/chat", Component: lazy(() => import("@/pages/chat/chat-page")) },

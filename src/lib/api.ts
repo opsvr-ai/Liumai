@@ -165,6 +165,12 @@ export interface RcaReport {
   top3?: string[];
 }
 
+/** Rendered Markdown report used by the in-app report reader. */
+export interface RcaReportMarkdown {
+  markdown: string;
+  generated_at: string;
+}
+
 export interface RcaReportAlert {
   id: number;
   alert_uid: string | null;
@@ -236,6 +242,13 @@ export const rca = {
   },
   report(sessionId: number) {
     return request<RcaReport>("GET", `/rca/sessions/${sessionId}/report`);
+  },
+  /** Rendered Markdown for the in-app report page (no blob / download). */
+  reportMarkdown(sessionId: number) {
+    return request<RcaReportMarkdown>(
+      "GET",
+      `/rca/sessions/${sessionId}/report/markdown`,
+    );
   },
   sessionAlerts(sessionId: number) {
     return request<RcaReportAlert[]>("GET", `/rca/sessions/${sessionId}/alerts`);

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   Activity,
   Ban,
@@ -7,7 +7,9 @@ import {
   CheckCircle,
   Clock,
   Download,
+  ExternalLink,
   Eye,
+  Loader2,
   PlayCircle,
   RefreshCw,
   Search,
@@ -49,12 +51,52 @@ const labelVariant: Record<string, "secondary" | "success" | "destructive"> = {
   false_positive: "destructive",
 };
 
+/** Readable one-liner for report JSON values (never dump a raw JSON blob). */
+function reportValueText(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    for (const key of [
+      "summary",
+      "title",
+      "content",
+      "description",
+      "detail",
+      "message",
+      "root_cause",
+      "text",
+      "name",
+      "value",
+    ]) {
+      const hit = record[key];
+      if (typeof hit === "string" && hit.trim()) return hit.trim();
+    }
+    const pairs = Object.entries(record)
+      .filter(([, item]) => item !== null && item !== undefined && typeof item !== "object")
+      .slice(0, 3)
+      .map(([key, item]) => `${key}: ${String(item)}`);
+    if (pairs.length > 0) return pairs.join(" · ");
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
 type TabKey = "sessions" | "reports" | "knowledge";
 
 export default function RcaPage() {
   const [searchParams, setSearchParams] = useSearchParams();
+  const navigate = useNavigate();
   const { has } = usePermissions();
-  const [tab, setTab] = useState<TabKey>("sessions");
+  const [tab, setTab] = useState<TabKey>(() => {
+    const requested = searchParams.get("tab");
+    return requested === "reports" || requested === "knowledge" ? requested : "sessions";
+  });
   const [sessions, setSessions] = useState<RcaSessionSummary[]>([]);
   const [queue, setQueue] = useState<QueueStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -63,6 +105,7 @@ export default function RcaPage() {
   const [report, setReport] = useState<RcaReport | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
   const [downloading, setDownloading] = useState<"md" | "html" | null>(null);
+  const [libraryDownloading, setLibraryDownloading] = useState<string | null>(null);
 
   // `/rca?status=running` 的初始筛选（仅接受后端枚举值；非法值按“全部”处理）。
   const [statusFilter, setStatusFilter] = useState<string>(() => {
@@ -253,6 +296,17 @@ export default function RcaPage() {
     }, { replace: true });
   }
 
+  function changeTab(next: TabKey) {
+    setTab(next);
+    setSearchParams((prev) => {
+      const params = new URLSearchParams(prev);
+      params.delete("s");
+      if (next === "sessions") params.delete("tab");
+      else params.set("tab", next);
+      return params;
+    }, { replace: true });
+  }
+
   function closeDetail() {
     setDetailOpen(false);
     setSearchParams((prev) => {
@@ -326,6 +380,22 @@ export default function RcaPage() {
       toast.error(err instanceof Error ? err.message : "下载报告失败");
     } finally {
       setDownloading(null);
+    }
+  }
+
+  // Report-library rows download directly from the list; keep the busy key
+  // per-row so only the active file shows a spinner.
+  async function downloadLibraryReport(sid: number, format: "md" | "html") {
+    const key = `${sid}:${format}`;
+    setLibraryDownloading(key);
+    try {
+      const { blob, filename } = await reportApi.download(sid, format);
+      saveBlob(blob, filename);
+      toast.success(format === "md" ? "Markdown 报告开始下载" : "HTML 报告开始下载");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "下载报告失败");
+    } finally {
+      setLibraryDownloading(null);
     }
   }
 
@@ -413,7 +483,7 @@ export default function RcaPage() {
         </div>
       )}
 
-      <Tabs value={tab} onValueChange={(v) => setTab(String(v) as TabKey)}>
+      <Tabs value={tab} onValueChange={(v) => changeTab(String(v) as TabKey)}>
         <TabsList>
           <TabsTrigger value="sessions">分析会话</TabsTrigger>
           <TabsTrigger value="reports">报告库</TabsTrigger>
@@ -546,6 +616,9 @@ export default function RcaPage() {
                   <Button variant="outline" size="sm" className="h-8 text-xs" onClick={() => void loadReports()}>搜索</Button>
                 </div>
               </div>
+              <p className="text-[11px] text-muted-foreground">
+                点击「查看」进入独立报告页在线阅读根因、证据、处置建议与时间线；下载保留用于归档或分享。
+              </p>
             </CardHeader>
             <CardContent className="p-0">
               {reportsLoading ? (
@@ -553,7 +626,8 @@ export default function RcaPage() {
               ) : reports.length === 0 ? (
                 <p className="text-sm text-muted-foreground py-8 text-center">暂无报告（需 Hermes 配置完成并成功分析一次）</p>
               ) : (
-                <table className="w-full text-sm">
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[860px] text-sm">
                   <thead><tr className="border-b border-border text-muted-foreground text-xs">
                     <th className="w-10 px-4 py-2 font-medium">
                       <input
@@ -597,11 +671,53 @@ export default function RcaPage() {
                           )}
                         </td>
                         <td className="px-4 py-2.5 text-xs">{r.confidence != null ? `${Math.round(r.confidence * 100)}%` : "—"}</td>
-                        <td className="px-4 py-2.5 text-right"><Button variant="ghostMuted" size="icon-sm" onClick={() => void openDetail(r.session_id)}><Eye className="h-3.5 w-3.5" /></Button></td>
+                        <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                          <div className="inline-flex items-center justify-end gap-1">
+                            <Button
+                              size="sm"
+                              onClick={() => navigate(`/rca/report/${r.session_id}`)}
+                              aria-label={`查看报告 #${r.session_id}`}
+                              title={`查看报告 #${r.session_id}`}
+                            >
+                              <Eye className="h-3.5 w-3.5" /> 查看
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="xs"
+                              disabled={libraryDownloading !== null}
+                              onClick={() => void downloadLibraryReport(r.session_id, "md")}
+                              aria-label={`下载报告 #${r.session_id} 的 Markdown`}
+                              title="下载 Markdown"
+                            >
+                              {libraryDownloading === `${r.session_id}:md` ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : (
+                                <Download className="h-3 w-3" />
+                              )}
+                              MD
+                            </Button>
+                            <Button
+                              variant="outline"
+                              size="xs"
+                              disabled={libraryDownloading !== null}
+                              onClick={() => void downloadLibraryReport(r.session_id, "html")}
+                              aria-label={`下载报告 #${r.session_id} 的 HTML`}
+                              title="下载 HTML"
+                            >
+                              {libraryDownloading === `${r.session_id}:html` ? (
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                              ) : (
+                                <Download className="h-3 w-3" />
+                              )}
+                              HTML
+                            </Button>
+                          </div>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
-                </table>
+                  </table>
+                </div>
               )}
             </CardContent>
           </Card>
@@ -718,7 +834,7 @@ export default function RcaPage() {
                       <div>
                         <p className="text-xs font-medium text-muted-foreground mb-1.5">证据链</p>
                         <ul className="space-y-1 text-xs">
-                          {report.evidence.map((e, i) => <li key={i} className="rounded bg-muted/50 px-2 py-1.5">{typeof e === "string" ? e : JSON.stringify(e)}</li>)}
+                          {report.evidence.map((e, i) => <li key={i} className="rounded bg-muted/50 px-2 py-1.5">{reportValueText(e)}</li>)}
                         </ul>
                       </div>
                     )}
@@ -727,7 +843,7 @@ export default function RcaPage() {
                       <div>
                         <p className="text-xs font-medium text-muted-foreground mb-1.5">处置建议</p>
                         <ul className="space-y-1 text-xs list-disc pl-4">
-                          {report.recommended_actions.map((a, i) => <li key={i}>{typeof a === "string" ? a : JSON.stringify(a)}</li>)}
+                          {report.recommended_actions.map((a, i) => <li key={i}>{reportValueText(a)}</li>)}
                         </ul>
                       </div>
                     )}
@@ -750,6 +866,13 @@ export default function RcaPage() {
                     )}
 
                     <div className="flex flex-wrap justify-end gap-2 pt-1">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        onClick={() => navigate(`/rca/report/${detail.id}`)}
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" /> 查看完整报告
+                      </Button>
                       <Button
                         variant="outline"
                         size="sm"

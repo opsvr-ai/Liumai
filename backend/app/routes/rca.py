@@ -159,6 +159,13 @@ class RcaSessionReport(RcaReportOut):
     top3: list[str] = Field(default_factory=list)
 
 
+class RcaReportMarkdown(BaseModel):
+    """Rendered Markdown report for in-app reading (counterpart of the download)."""
+
+    markdown: str
+    generated_at: datetime
+
+
 class QueueStatus(BaseModel):
     """Current RCA queue state."""
 
@@ -610,6 +617,38 @@ async def get_session_report(
         alerts=[_alert_brief(a) for a in alerts_q.scalars()],
         top3=_session_top3(session, report),
     )
+
+
+@router.get("/sessions/{session_id}/report/markdown", response_model=RcaReportMarkdown)
+async def get_session_report_markdown(
+    session_id: int,
+    db: AsyncSession = Depends(get_db_session),
+    user: User = Depends(get_current_user),
+) -> RcaReportMarkdown:
+    """Return the same Markdown as the download endpoint, for in-app reading.
+
+    认证、团队隔离与 404 语义与 ``/report`` / ``/report/download`` 完全一致：
+    跨团队会话按 404 处理；报告不存在时返回同样的人类可读提示。前端因此可以
+    直接渲染 Markdown，而不必下载 blob 再读文本。
+    """
+    session = await _get_scoped_session(db, session_id, user)
+
+    result = await db.execute(select(RcaReport).where(RcaReport.session_id == session_id))
+    report = result.scalar_one_or_none()
+    if report is None:
+        raise HTTPException(status_code=404, detail="该会话尚无报告（分析未完成或失败）")
+
+    events, timeline_total = await _timeline_summary(db, session_id)
+    generated_at = datetime.now(timezone.utc)
+    markdown = _render_report_markdown(
+        session=session,
+        report=report,
+        top3=_session_top3(session, report),
+        events=events,
+        timeline_total=timeline_total,
+        generated_at=generated_at,
+    )
+    return RcaReportMarkdown(markdown=markdown, generated_at=generated_at)
 
 
 @router.get("/sessions/{session_id}/report/download")
