@@ -497,7 +497,7 @@ export interface ToolCallDelta {
 /** Parsed SSE event from the chat stream endpoint. */
 export type ChatStreamEvent =
   | { type: "delta"; content: string }
-  | { type: "reasoning"; content: string }
+  | { type: "reasoning"; content: string; replace?: boolean }
   | { type: "session"; session_id: string }
   | { type: "tool_call"; tool_calls: ToolCallDelta[] }
   | {
@@ -1061,8 +1061,11 @@ function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
       return content ? { type: "delta", content } : null;
     }
     case "reasoning.available": {
+      // Snapshot of the full reasoning so far (not an incremental delta) —
+      // mark it as a replacement so the UI overwrites instead of appending,
+      // which used to duplicate every sentence when Hermes re-sent the snapshot.
       const content = _runStr(raw.text);
-      return content ? { type: "reasoning", content } : null;
+      return content ? { type: "reasoning", content, replace: true } : null;
     }
     case "tool.started":
     case "tool.completed": {

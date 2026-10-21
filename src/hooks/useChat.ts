@@ -350,14 +350,25 @@ export function useChat() {
    * can show a collapsible "思考过程" section instead of blending it into the
    * final text.
    */
-  const appendReasoning = useCallback((content: string) => {
+  const appendReasoning = useCallback((content: string, replace = false) => {
+    if (!content) return;
     setMessages((prev) => {
       const last = prev[prev.length - 1];
+      const current = last && last.role === "assistant" ? last.reasoning ?? "" : "";
+      let next: string;
+      if (replace) {
+        // Snapshot semantics: the payload is the full reasoning so far.
+        if (content === current) return prev;
+        next = content;
+      } else {
+        // Incremental delta; guard against exact / tail duplicates that can
+        // arrive when a stream is replayed after a reconnect.
+        if (content === current) return prev;
+        if (current.endsWith(content)) return prev;
+        next = current + content;
+      }
       if (last && last.role === "assistant" && last.isStreaming) {
-        return [
-          ...prev.slice(0, -1),
-          { ...last, reasoning: (last.reasoning ?? "") + content },
-        ];
+        return [...prev.slice(0, -1), { ...last, reasoning: next }];
       }
       return [
         ...prev,
@@ -365,7 +376,7 @@ export function useChat() {
           id: uid(),
           role: "assistant",
           content: "",
-          reasoning: content,
+          reasoning: next,
           isStreaming: true,
         },
       ];
@@ -582,7 +593,7 @@ export function useChat() {
             break;
           case "reasoning":
             produced = true;
-            appendReasoning(event.content);
+            appendReasoning(event.content, event.replace === true);
             break;
           case "session":
             setHermesSessionId(event.session_id);
