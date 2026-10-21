@@ -140,6 +140,8 @@ export function useChat() {
   );
 
   const abortRef = useRef<AbortController | null>(null);
+  /** Synchronous accumulator for this turn's reasoning (dedupe survives batching). */
+  const reasoningAccRef = useRef<string>("");
   /** Run id for control calls; a ref so stop/steer never read stale state. */
   const runIdRef = useRef<string | null>(null);
   /**
@@ -360,22 +362,21 @@ export function useChat() {
    */
   const appendReasoning = useCallback((content: string, replace = false) => {
     if (!content) return;
+    // Keep the accumulator in a ref: React state updates are batched, so two
+    // events delivered in the same tick (e.g. a delta + its snapshot) used to
+    // read the same stale value and both append the first sentence.
+    const accumulated = reasoningAccRef.current;
+    const fresh = dedupeReasoningChunk(accumulated, content);
+    if (!fresh) return;
+    const next = accumulated + fresh;
+    reasoningAccRef.current = next;
     setMessages((prev) => {
       const last = prev[prev.length - 1];
       const streaming =
         last && last.role === "assistant" && last.isStreaming ? last : null;
-      // A snapshot may arrive just after the bubble finished (e.g. the final
-      // reasoning.available): merge into it instead of creating a second
-      // assistant bubble that would render the same text again.
       const target =
         streaming ??
         (replace && last && last.role === "assistant" ? last : null);
-      const current = target?.reasoning ?? "";
-      const fresh = dedupeReasoningChunk(current, content);
-      if (!fresh) return prev;
-      // A whole-block snapshot may be a fresh round's text; keep the earlier
-      // rounds by appending only the unseen part instead of replacing.
-      const next = current + fresh;
       if (target) {
         const index = prev.lastIndexOf(target);
         return [...prev.slice(0, index), { ...target, reasoning: next }];
@@ -530,6 +531,9 @@ export function useChat() {
       setActiveRunId(null);
       setIsStreaming(true);
       runIdRef.current = null;
+      // New turn: reset the synchronous reasoning accumulator so a replayed
+      // first chunk from a second source cannot be appended twice.
+      reasoningAccRef.current = "";
       stoppedRef.current = false;
       answeredApprovalIdsRef.current.clear();
 
