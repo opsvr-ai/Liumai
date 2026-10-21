@@ -539,10 +539,14 @@ export function useChat() {
           const args = nextArgs || prevArgs;
           const startedAt =
             prevTc?.hermes_started_at ?? (running ? Date.now() : undefined);
+          // Hermes sometimes reports 0 for a tool that clearly ran; prefer a
+          // positive reported duration, else fall back to the start→finish
+          // window observed on this client.
+          const reportedDuration = tc.hermes_duration_ms ?? prevTc?.hermes_duration_ms;
           const duration =
-            tc.hermes_duration_ms ??
-            prevTc?.hermes_duration_ms ??
-            (finished && startedAt ? Date.now() - startedAt : undefined);
+            finished && (!reportedDuration || reportedDuration <= 0) && startedAt
+              ? Math.max(0, Date.now() - startedAt)
+              : reportedDuration;
           const mergedTc: ToolCallDelta = {
             ...prevTc,
             ...tc,

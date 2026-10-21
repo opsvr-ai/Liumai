@@ -1269,6 +1269,32 @@ function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
     case "reasoning.delta":
     case "reasoning.available":
     case "reasoning": {
+      // Invariant: tool progress must never enter the reasoning channel.
+      // A few adapter versions tag a tool frame as ``reasoning.*``; re-route
+      // it to the tool card instead of rendering tool text under 思考过程.
+      const misroutedTool =
+        _runStr(raw.tool_call_id) ||
+        _runStr(raw.call_id) ||
+        _runStr(raw.tool) ||
+        _runStr(raw.tool_name);
+      if (misroutedTool) {
+        const completed = _runStr(raw.status) === "completed";
+        return {
+          type: "tool_call",
+          tool_calls: [
+            {
+              id: misroutedTool,
+              function: {
+                name:
+                  _runStr(raw.tool) || _runStr(raw.tool_name) || "tool",
+                arguments: _runStr(raw.preview) || "",
+              },
+              hermes_label: _runStr(raw.preview),
+              hermes_status: completed ? "completed" : "running",
+            },
+          ],
+        };
+      }
       // ``reasoning.available`` is a whole-block snapshot; ``reasoning.delta``
       // (some adapters) is incremental.  Both reach the UI as ``reasoning``
       // and are de-duplicated by content in ``appendReasoning`` so a snapshot

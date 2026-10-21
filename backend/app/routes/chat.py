@@ -8,6 +8,7 @@ that the frontend chat panel renders in real time.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import mimetypes
@@ -1098,6 +1099,22 @@ async def _llm_direct_stream(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+#: Per-session save locks.  ``POST /sessions/{id}/messages`` replaces the whole
+#: transcript (delete + insert), so two browser tabs finishing a turn at the
+#: same time could interleave and leave a mixed transcript.  The lock is
+#: in-process (one uvicorn worker), which is the deployment shape here.
+_SAVE_LOCKS: dict[tuple[int, int], asyncio.Lock] = {}
+
+
+def _save_lock(user_id: int, session_id: int) -> asyncio.Lock:
+    key = (user_id, session_id)
+    lock = _SAVE_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _SAVE_LOCKS[key] = lock
+    return lock
+
+
 class ChatSessionOut(BaseModel):
     """Serialised chat session (without messages)."""
 
@@ -1230,7 +1247,11 @@ async def get_chat_session(
     msg_rows = await db.execute(
         select(ChatMessage)
         .where(ChatMessage.session_id == session_id)
-        .order_by(ChatMessage.created_at.asc())
+        # ``created_at`` is transaction time, so every row of one save shares
+        # the same timestamp; ordering by it alone returns an arbitrary order
+        # (tools looked reversed after a reload).  ``id`` preserves insertion
+        # order, which is the transcript order the client sent.
+        .order_by(ChatMessage.id.asc())
     )
     messages = [
         {
@@ -1346,42 +1367,48 @@ async def save_messages(
     user: User = Depends(get_current_user),
 ) -> Response:
     """Save messages and/or the Hermes linkage for a session."""
-    row = await db.get(ChatSession, session_id)
-    if not row or row.user_id != user.id:
-        raise HTTPException(status_code=404, detail="会话不存在")
+    # Serialise whole-transcript replaces for this session and commit inside
+    # the lock: the dependency commits after the handler returns, so releasing
+    # earlier would let a second tab's delete/insert interleave with this one.
+    async with _save_lock(user.id, session_id):
+        row = await db.get(ChatSession, session_id)
+        if not row or row.user_id != user.id:
+            raise HTTPException(status_code=404, detail="会话不存在")
 
-    # Replace the transcript only when the caller sent one; a link-only update
-    # (messages omitted) must not wipe the stored conversation.
-    if body.messages is not None:
-        from sqlalchemy import delete
+        # Replace the transcript only when the caller sent one; a link-only
+        # update (messages omitted) must not wipe the stored conversation.
+        if body.messages is not None:
+            from sqlalchemy import delete
 
-        await db.execute(
-            delete(ChatMessage).where(ChatMessage.session_id == session_id)
-        )
-
-        for m in body.messages:
-            db.add(
-                ChatMessage(
-                    session_id=session_id,
-                    role=m.get("role", "user"),
-                    content=m.get("content", ""),
-                    tool_calls=m.get("tool_calls"),
-                )
+            await db.execute(
+                delete(ChatMessage).where(ChatMessage.session_id == session_id)
             )
 
-    # Update title if provided
-    if body.title:
-        row.title = body.title
+            for m in body.messages:
+                db.add(
+                    ChatMessage(
+                        session_id=session_id,
+                        role=m.get("role", "user"),
+                        content=m.get("content", ""),
+                        tool_calls=m.get("tool_calls"),
+                    )
+                )
 
-    # Persist the Hermes linkage.  Only fields the caller actually sent are
-    # touched (explicit null clears), so partial updates from older clients
-    # cannot wipe a session that is still linked to a running agent.
-    if "hermes_session_id" in body.model_fields_set:
-        row.hermes_session_id = body.hermes_session_id
-    if "active_run_id" in body.model_fields_set:
-        row.active_run_id = body.active_run_id
+        # Update title if provided
+        if body.title:
+            row.title = body.title
 
-    row.updated_at = func.now()
+        # Persist the Hermes linkage.  Only fields the caller actually sent are
+        # touched (explicit null clears), so partial updates from older clients
+        # cannot wipe a session that is still linked to a running agent.
+        if "hermes_session_id" in body.model_fields_set:
+            row.hermes_session_id = body.hermes_session_id
+        if "active_run_id" in body.model_fields_set:
+            row.active_run_id = body.active_run_id
+
+        row.updated_at = func.now()
+        await db.commit()
+
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
