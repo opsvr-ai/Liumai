@@ -19,6 +19,7 @@ import {
   chatRuns,
   chatRunEvents,
   chatStream,
+  dedupeReasoningChunk,
   type ChatApprovalRequest,
   type ChatMessage,
   type ChatRunEvent,
@@ -349,26 +350,35 @@ export function useChat() {
    * Reasoning arrives before the answer; it is kept on the message so the UI
    * can show a collapsible "思考过程" section instead of blending it into the
    * final text.
+   *
+   * ``replace`` marks a whole-block snapshot (Hermes ``reasoning.available``)
+   * rather than an incremental delta.  Both forms go through the same
+   * content-level guard: a snapshot that repeats / extends what we already
+   * have contributes only its unseen suffix, so repeated snapshots cannot
+   * duplicate every sentence, while earlier reasoning rounds are never
+   * overwritten (``replace`` used to discard them).
    */
   const appendReasoning = useCallback((content: string, replace = false) => {
     if (!content) return;
     setMessages((prev) => {
       const last = prev[prev.length - 1];
-      const current = last && last.role === "assistant" ? last.reasoning ?? "" : "";
-      let next: string;
-      if (replace) {
-        // Snapshot semantics: the payload is the full reasoning so far.
-        if (content === current) return prev;
-        next = content;
-      } else {
-        // Incremental delta; guard against exact / tail duplicates that can
-        // arrive when a stream is replayed after a reconnect.
-        if (content === current) return prev;
-        if (current.endsWith(content)) return prev;
-        next = current + content;
-      }
-      if (last && last.role === "assistant" && last.isStreaming) {
-        return [...prev.slice(0, -1), { ...last, reasoning: next }];
+      const streaming =
+        last && last.role === "assistant" && last.isStreaming ? last : null;
+      // A snapshot may arrive just after the bubble finished (e.g. the final
+      // reasoning.available): merge into it instead of creating a second
+      // assistant bubble that would render the same text again.
+      const target =
+        streaming ??
+        (replace && last && last.role === "assistant" ? last : null);
+      const current = target?.reasoning ?? "";
+      const fresh = dedupeReasoningChunk(current, content);
+      if (!fresh) return prev;
+      // A whole-block snapshot may be a fresh round's text; keep the earlier
+      // rounds by appending only the unseen part instead of replacing.
+      const next = current + fresh;
+      if (target) {
+        const index = prev.lastIndexOf(target);
+        return [...prev.slice(0, index), { ...target, reasoning: next }];
       }
       return [
         ...prev,

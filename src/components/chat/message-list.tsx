@@ -23,6 +23,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import type { DisplayMessage } from "@/hooks/useChat";
+import { dedupeReasoningChunk } from "@/lib/api";
 import { LiumaiLogo } from "@/components/liumai-logo";
 import { cn } from "@/lib/utils";
 import { clockTime, copyText, fullTime } from "./chat-utils";
@@ -303,10 +304,18 @@ const AssistantTurn: FC<AssistantTurnProps> = ({
   );
 
   const streaming = live || messages.some((message) => message.isStreaming);
-  const reasoning = assistantMessages
-    .map((message) => message.reasoning?.trim() ?? "")
-    .filter(Boolean)
-    .join("\n\n");
+  // Merge reasoning across the turn's assistant bubbles.  A whole-block
+  // snapshot may be stored on a later bubble while earlier bubbles already
+  // hold the same text; keeping only the unseen suffix stops the block from
+  // being rendered twice.
+  const reasoning = assistantMessages.reduce((merged, message) => {
+    const block = message.reasoning?.trim() ?? "";
+    if (!block) return merged;
+    const fresh = dedupeReasoningChunk(merged, block);
+    if (!fresh) return merged;
+    if (!merged) return fresh;
+    return fresh === block ? `${merged}\n\n${fresh}` : `${merged}${fresh}`;
+  }, "");
   const content = assistantMessages
     .map((message) => message.content)
     .filter(Boolean)

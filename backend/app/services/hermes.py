@@ -613,6 +613,11 @@ class HermesClient:
 
                     tool_call_buf: dict[int, dict[str, Any]] = {}
                     current_sse_event: str | None = None
+                    # Reasoning already forwarded for this turn.  Reasoning
+                    # chunks are normally incremental, but cumulative
+                    # snapshots/whole-block replays would otherwise duplicate
+                    # the entire thinking text in the UI.
+                    reasoning_seen: str = ""
 
                     async for line in resp.aiter_lines():
                         # ── SSE 注释行（`: keepalive`）─────────────────────
@@ -736,14 +741,23 @@ class HermesClient:
                         # answer text.
                         reasoning = _find_reasoning(delta)
                         if reasoning:
-                            yield {
-                                "type": "reasoning",
-                                "content": reasoning,
-                                "tool_call": None,
-                                "finish_reason": None,
-                                "usage": None,
-                                "error": None,
-                            }
+                            # Drop the part we already have: a provider may
+                            # resend the accumulated reasoning instead of one
+                            # incremental token.  Real content is preserved —
+                            # only the unseen suffix is forwarded.
+                            fresh_reasoning = _dedupe_reasoning(
+                                reasoning_seen, reasoning
+                            )
+                            if fresh_reasoning:
+                                reasoning_seen += fresh_reasoning
+                                yield {
+                                    "type": "reasoning",
+                                    "content": fresh_reasoning,
+                                    "tool_call": None,
+                                    "finish_reason": None,
+                                    "usage": None,
+                                    "error": None,
+                                }
 
                         # ── Text content ────────────────────────────────────
                         content = _find_content(delta)
@@ -1424,6 +1438,59 @@ def _find_reasoning(delta: dict[str, Any]) -> str | None:
             if parts:
                 return "".join(parts)
     return None
+
+
+#: Smallest reasoning block that may be collapsed as a replay.  Short tokens
+#: (``"的"``, ``"。\n"``, ``" the"``) repeat legitimately in thought streams and
+#: must never be dropped by the de-duplicator.
+REASONING_DEDUP_MIN_CHARS = 24
+
+
+def _dedupe_reasoning(accumulated: str, chunk: str) -> str:
+    """Return only the *new* part of one reasoning chunk.
+
+    Hermes normally streams reasoning incrementally (one token per chunk), but
+    two upstream behaviours duplicated the whole thinking text when every
+    chunk was appended verbatim:
+
+    * **Cumulative snapshots** — some OpenAI-compatible providers send the
+      reasoning accumulated so far instead of just the new token(s).
+    * **Whole-block replays** — ``reasoning.available`` is a completed block
+      (not a delta) and reconnects / some adapters re-send a block that was
+      already streamed.
+
+    The guard is deliberately conservative: only blocks that cover a large
+    fraction of the already-seen text (or an exact/cumulative snapshot) are
+    collapsed, so a genuinely repeated short phrase is preserved.
+    """
+    if not chunk:
+        return ""
+    if not accumulated:
+        return chunk
+    if chunk == accumulated:
+        return ""
+
+    # Cumulative snapshot: the chunk already contains everything we streamed.
+    if chunk.startswith(accumulated):
+        return chunk[len(accumulated):]
+
+    # Replayed block: it is (a tail of) what we already appended.  Size the
+    # threshold relative to the accumulated text so a repeated sentence in a
+    # long thought is not mistaken for a replay.
+    replay_min = max(REASONING_DEDUP_MIN_CHARS, int(len(accumulated) * 0.6))
+    if len(chunk) >= replay_min and (
+        accumulated.endswith(chunk) or chunk in accumulated
+    ):
+        return ""
+
+    # An older, shorter snapshot replayed after more reasoning accumulated.
+    if (
+        accumulated.startswith(chunk)
+        and len(chunk) >= max(REASONING_DEDUP_MIN_CHARS, int(len(accumulated) * 0.8))
+    ):
+        return ""
+
+    return chunk
 
 
 def _find_content(delta: dict[str, Any]) -> str | None:

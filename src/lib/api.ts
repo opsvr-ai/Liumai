@@ -1024,6 +1024,59 @@ function _runStr(value: unknown): string {
   return String(value);
 }
 
+/** Minimum block size for replay de-duplication (see below). */
+const REASONING_DEDUP_MIN_CHARS = 24;
+
+/**
+ * Return only the unseen part of one reasoning block.
+ *
+ * Hermes streams reasoning incrementally, but two behaviours duplicated the
+ * whole thinking text when every block was appended verbatim:
+ *
+ * - **cumulative snapshots** — some providers send the reasoning accumulated
+ *   so far instead of just the new token(s);
+ * - **whole-block replays** — `reasoning.available` is a completed block (not a
+ *   delta), and a reconnect may re-send a block that was already applied.
+ *
+ * The guard is conservative: only an exact/cumulative snapshot or a block
+ * covering a large share of what was already shown is collapsed, so a
+ * genuinely repeated short phrase survives.
+ */
+export function dedupeReasoningChunk(
+  accumulated: string,
+  chunk: string,
+): string {
+  if (!chunk) return "";
+  if (!accumulated) return chunk;
+  if (chunk === accumulated) return "";
+
+  // Cumulative snapshot: the chunk already contains everything we streamed.
+  if (chunk.startsWith(accumulated)) return chunk.slice(accumulated.length);
+
+  // Replayed block: a large tail/substring of what was already appended.
+  const replayMin = Math.max(
+    REASONING_DEDUP_MIN_CHARS,
+    Math.floor(accumulated.length * 0.6),
+  );
+  if (
+    chunk.length >= replayMin &&
+    (accumulated.endsWith(chunk) || accumulated.includes(chunk))
+  ) {
+    return "";
+  }
+
+  // An older, shorter snapshot replayed after more reasoning accumulated.
+  if (
+    accumulated.startsWith(chunk) &&
+    chunk.length >=
+      Math.max(REASONING_DEDUP_MIN_CHARS, Math.floor(accumulated.length * 0.8))
+  ) {
+    return "";
+  }
+
+  return chunk;
+}
+
 /** Map Hermes run usage onto the existing chat usage shape. */
 function _runUsage(
   raw: unknown,
@@ -1040,6 +1093,7 @@ function _runUsage(
  *
  * Observed Hermes 0.22.2 event types (probed against the live gateway):
  *   message.delta{delta}, message.interim{text}, reasoning.available{text},
+ *   reasoning.delta{...} (newer adapters),
  *   tool.started{tool,tool_call_id,preview}, tool.completed{tool,tool_call_id,
  *   preview,error,duration}, approval.request{request_id?,command,description,
  *   choices}, approval.responded, run.steered, run.queued, run.completed
@@ -1060,12 +1114,21 @@ function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
       const content = _runStr(raw.text);
       return content ? { type: "delta", content } : null;
     }
-    case "reasoning.available": {
-      // Snapshot of the full reasoning so far (not an incremental delta) —
-      // mark it as a replacement so the UI overwrites instead of appending,
-      // which used to duplicate every sentence when Hermes re-sent the snapshot.
-      const content = _runStr(raw.text);
-      return content ? { type: "reasoning", content, replace: true } : null;
+    case "reasoning.delta":
+    case "reasoning.available":
+    case "reasoning": {
+      // ``reasoning.available`` is a whole-block snapshot; ``reasoning.delta``
+      // (some adapters) is incremental.  Both reach the UI as ``reasoning``
+      // and are de-duplicated by content in ``appendReasoning`` so a snapshot
+      // cannot repeat text that was already streamed.
+      const content = _runStr(raw.text) || _runStr(raw.delta);
+      return content
+        ? {
+            type: "reasoning",
+            content,
+            replace: name === "reasoning.available",
+          }
+        : null;
     }
     case "tool.started":
     case "tool.completed": {
