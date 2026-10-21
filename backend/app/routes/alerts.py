@@ -687,6 +687,20 @@ async def webhook_info(
         "LASTOCCURRENCE": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
         "SERIAL": "alert-20261017-0001",
     }
+    # 集中监控（Tarsier）实际报文：eventInfo 是字符串化的 Java Map，值里含
+    # 英文逗号 / 等号 / | / 中文标点；解析按「下一个 KEY=」切分，不会截断。
+    java_map_sample = {
+        "eventInfo": (
+            "{SERIAL=HW3224009787-2269, SEVERITY=2, SOURCENAME=应用监控, "
+            "CINAME=5308353857500138, SERVERNAME=EPServer1, CIAPPLICATION=, "
+            "CICATEGORYNAME=应用监控默认丰富, CIID=1000000000454628, "
+            "CITYPE=801, KPINAME=XCP3532B, "
+            "LASTOCCURRENCE=2026-09-14T15:43:12, "
+            "SOURCEEVENTID=RW20260914154312023_20260914154312, "
+            "SUMMARY=错误信息:TCCM记账失败|告警信息(简要): 告警名称: 批次查证记账告警, "
+            "告警联系人: 毕玉朋 , DURATION=null}"
+        )
+    }
     import json as _json
     body = _json.dumps(sample, ensure_ascii=False)
     # 多团队模式下若没有旧的全局令牌，curl 里用占位符提示需要带团队令牌。
@@ -697,6 +711,13 @@ async def webhook_info(
         + (f"-H 'X-Webhook-Token: {curl_token}' " if curl_token else "")
         + f"-d '{body}'"
     )
+    java_body = _json.dumps(java_map_sample, ensure_ascii=False)
+    curl_java_map = (
+        f"curl -X POST '{base}/api/alerts/webhook' "
+        f"-H 'Content-Type: application/json' "
+        + (f"-H 'X-Webhook-Token: {curl_token}' " if curl_token else "")
+        + f"-d '{java_body}'"
+    )
     return {
         "url": f"{base}/api/alerts/webhook",
         "token": token if user.role.value == "ADMIN" else "",
@@ -704,10 +725,20 @@ async def webhook_info(
         "token_mode": token_mode,
         "team_token_count": len(bindings),
         "sample_payload": sample,
+        "java_map_sample": java_map_sample,
         "curl": curl,
+        "curl_java_map": curl_java_map,
+        "notes": [
+            "eventInfo 可以是对象、JSON 字符串，或 Java Map.toString() 字符串（{KEY=value, …}）。",
+            "Java Map 按「下一个 KEY=」切分：值里的英文逗号、等号、|、冒号、中文标点都不会截断字段。",
+            "KEY=VALUE 只按第一个 = 切分；null / 空值视为缺失，自动回退（SUMMARY→SOURCESUMMARY、CIAPPLICATION→CICATEGORYNAME、SERIAL→ID→SOURCEEVENTID）。",
+            "同一 SERIAL 在去重窗口内重复推送返回 duplicate，不会重复触发 RCA。",
+            "支持单条对象或 JSON 数组批量推送，数组逐条返回 status。",
+        ],
         "formats": [
             "Tarsier: SERIAL/CINAME/CIAPPLICATION/SEVERITY/SUMMARY/LASTOCCURRENCE…",
             "Tarsier 多源: {eventInfo: {SUMMARY, SEVERITY, SOURCECINAME…}}",
+            "Java Map 字符串: {eventInfo: \"{SERIAL=…, SEVERITY=2, SUMMARY=含逗号文本}\"}",
             "字段兼容: alertId/alertLevel/alertContent/host_ip/ciApplication…",
             "支持 Java Map.toString() 字符串与 JSON 数组批量推送",
         ],

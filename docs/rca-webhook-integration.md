@@ -107,6 +107,44 @@ Get-Content backend/migrations/20261017_alert_pipeline.sql -Raw |
 ## 四、触发管线（backend/app/services/alert_pipeline.py）
 
 1. **归一化**：`normalize_alert()` 兼容 Tarsier、`eventInfo`、Java Map 字符串、通用字段。
+
+### 4.1 `eventInfo` 为 Java Map 字符串（集中监控 Tarsier 实际报文）
+
+集中监控推送的 `eventInfo` 是**字符串化的 Java Map**（`Map.toString()`），不是嵌套对象：
+
+```json
+{"eventInfo": "{SERIAL=HW3224009787-2269, SEVERITY=2, CINAME=5308353857500138, SUMMARY=错误信息:TCCM记账失败|告警信息(简要): 告警名称: 批次查证记账告警, 告警联系人: 毕玉朋 , CIAPPLICATION=, CICATEGORYNAME=应用监控默认丰富, CIID=1000000000454628, CITYPE=801, KPINAME=XCP3532B, LASTOCCURRENCE=2026-09-14T15:43:12, DURATION=null}"}
+```
+
+解析规则（`_parse_java_map_string` / `_split_java_map_parts`）：
+
+- 去掉外层 `{}`；`KEY=VALUE` 只按**第一个** `=` 切分（值内可含 `=`）；
+- 顶层 ASCII 逗号仅在其后紧跟 `KEY=`（`^\s*[A-Za-z_$][\w.$-]*\s*=`）时才切分，
+  否则视为值的一部分 —— 值内的英文逗号、`|`、`:`、中文标点都不会截断字段；
+- `null` / 空值视为缺失并走回退；嵌套 `{…}`、双引号、转义会被识别，花括号不平衡时
+  退回「仅按 KEY= 前瞻」再解析一次；
+- `eventInfo` 也可以是 JSON 对象、JSON 字符串或已解析的 dict（旧格式兼容）。
+
+字段映射（缺失时回退）：
+
+| 目标 | 来源 |
+|---|---|
+| `alertId` | `SERIAL` → `ID` → `DUPLICATESERIAL` → `SOURCEEVENTID`（空则 `auto-…`） |
+| `content` | `SUMMARY` → `SOURCESUMMARY` |
+| `severity` | `SEVERITY`（数字 1-5）→ `SOURCESEVERITY`（如 `2_2` → 2） |
+| `alertTime` | `LASTOCCURRENCE`（ISO-8601，默认 +08:00） |
+| `source` | `SOURCENAME` |
+| `ci_name` | `CINAME` → `SERVERNAME` → `source` |
+| `ci_application` | `CIAPPLICATION` → `CICATEGORYNAME` |
+| `ci_id` | `CIID` |
+| `ci_type` | `CITYPE`（如 `801`） |
+| `metric` | `KPINAME` |
+| `service_name` | `ci_application` → `ci_name` → `source` |
+| `raw` | 解析后映射 + 原始 `eventInfo` 字符串（`_eventInfo`，截断） |
+
+去重：`dedup_key = rid:<alertId>`，同一 `SERIAL` 在去重窗口（默认 300s）内重复推送返回
+`duplicate`；JSON 数组批量推送逐条处理、逐条返回 `status`。
+
 2. **去重**：`dedup_key()` → `alerts` 表按 `created_at` 窗口查重（默认 300 秒）。
 3. **分类/定级**：`classify_alert()`、`severity_level()`。
 4. **策略判定**：`decide_trigger()`

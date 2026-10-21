@@ -2167,7 +2167,10 @@ export interface WebhookInfo {
   token_mode?: "multi" | "legacy" | "open";
   team_token_count?: number;
   sample_payload: Record<string, unknown>;
+  java_map_sample?: Record<string, unknown>;
   curl: string;
+  curl_java_map?: string;
+  notes?: string[];
   formats: string[];
 }
 

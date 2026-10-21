@@ -559,6 +559,90 @@ def _s(value: Any, default: str = "") -> str:
     return text
 
 
+def _present(value: Any) -> bool:
+    """True when *value* is worth picking (not missing, ``null`` or empty)."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "null", "none", "undefined")
+    return True
+
+
+# ── Java ``Map.toString()`` parsing ─────────────────────────────────────────
+#
+# Tarsier pushes ``eventInfo`` as a *stringified* Java Map, e.g.::
+#
+#   {SEVERITY=2, SUMMARY=错误信息:TCCM记账失败|告警信息(简要): 告警名称: 批次查证记账告警,
+#    告警联系人: 毕玉朋 , SERIAL=HW3224009787-2269}
+#
+# A naive ``text.split(",")`` destroys the SUMMARY value (it contains ASCII
+# commas, ``:``, ``|``, Chinese punctuation and balanced parentheses), so the
+# split is driven by a **next ``KEY=`` look-ahead**: a top-level ASCII comma
+# only starts a new entry when the text right after it matches
+# ``\s*[A-Za-z_$][\w.$-]*\s*=``; any other comma is part of the value and is
+# preserved verbatim.  ``=`` splits at the *first* occurrence (values may
+# contain ``=``), the outer ``{}`` is stripped, ``null``/empty values are kept
+# as empty strings, and nested ``{...}`` groups / double quotes / escapes are
+# respected.  If the braces turn out to be unbalanced (free-text value with a
+# stray ``{``) the split is retried without brace tracking so one malformed
+# value cannot swallow the rest of the map.
+
+_JAVA_MAP_KEY_RE = re.compile(r"^[A-Za-z_$][A-Za-z0-9_.$-]*$")
+_JAVA_MAP_KEY_START_RE = re.compile(r"\s*([A-Za-z_$][A-Za-z0-9_.$-]{0,63})\s*=")
+
+# Field keys that identify a mapping as an alert payload; used to decide whether
+# a wrapper dict still has to be unwrapped.
+_ALERT_FIELD_KEYS = frozenset({
+    "SUMMARY", "SOURCESUMMARY", "SEVERITY", "SOURCESEVERITY", "SERIAL", "ID",
+    "CINAME", "CIAPPLICATION", "CIID", "CITYPE", "LASTOCCURRENCE",
+    "SOURCEEVENTID", "KPINAME", "SOURCENAME",
+    "alertContent", "alertId", "alertLevel", "alertTime", "alertSource",
+    "ciName", "ciApplication", "content", "severity", "message", "source",
+})
+
+
+def _split_java_map_parts(
+    inner: str, *, track_braces: bool = True,
+) -> tuple[list[str], bool]:
+    """Split a Java map body on top-level commas (see module notes above)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    in_quote = False
+    i, n = 0, len(inner)
+    while i < n:
+        ch = inner[i]
+        if in_quote:
+            buf.append(ch)
+            if ch == "\\" and i + 1 < n:
+                buf.append(inner[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_quote = False
+        elif ch == '"':
+            in_quote = True
+            buf.append(ch)
+        elif track_braces and ch == "{":
+            depth += 1
+            buf.append(ch)
+        elif track_braces and ch == "}":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            if _JAVA_MAP_KEY_START_RE.match(inner, i + 1):
+                parts.append("".join(buf))
+                buf = []
+            else:
+                # Comma inside a free-text value (SUMMARY 等) — keep it.
+                buf.append(ch)
+        else:
+            buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts, depth == 0 and not in_quote
+
+
 def _parse_java_map_string(text: str) -> dict[str, str] | None:
     """Parse a Java ``Map.toString()`` value such as ``{SEVERITY=2, CINAME=x}``."""
     if not isinstance(text, str):
@@ -567,34 +651,48 @@ def _parse_java_map_string(text: str) -> dict[str, str] | None:
     if not (t.startswith("{") and t.endswith("}") and "=" in t):
         return None
     inner = t[1:-1]
-    parts: list[str] = []
-    cur: list[str] = []
-    depth = 0
-    in_quote = False
-    for ch in inner:
-        if ch == '"' and (not cur or cur[-1] != "\\"):
-            in_quote = not in_quote
-            cur.append(ch)
-        elif not in_quote:
-            if ch in "([":
-                depth += 1
-            elif ch in ")]":
-                depth = max(0, depth - 1)
-            elif ch == "," and depth == 0:
-                parts.append("".join(cur).strip())
-                cur = []
-                continue
-        cur.append(ch)
-    if cur:
-        parts.append("".join(cur).strip())
+    parts, balanced = _split_java_map_parts(inner)
+    if not balanced:
+        parts, _ = _split_java_map_parts(inner, track_braces=False)
+
     result: dict[str, str] = {}
+    last_key: str | None = None
     for part in parts:
-        if "=" not in part:
+        part = part.strip()
+        if not part:
             continue
-        key, _, value = part.partition("=")
-        if key.strip():
-            result[key.strip()] = value.strip()
+        key, sep, value = part.partition("=")
+        key = key.strip()
+        if sep and _JAVA_MAP_KEY_RE.fullmatch(key):
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                value = value[1:-1]
+            result[key] = value
+            last_key = key
+        elif last_key is not None:
+            # Heuristic misfire: a fragment without ``KEY=`` must not be
+            # dropped, so append it back to the previous value.
+            previous = result.get(last_key) or ""
+            result[last_key] = f"{previous}, {part}" if previous else part
     return result or None
+
+
+def _parse_mapping_string(text: str) -> dict[str, Any] | None:
+    """Parse a stringified mapping: Java ``Map.toString()`` or a JSON object."""
+    if not isinstance(text, str):
+        return None
+    parsed = _parse_java_map_string(text)
+    if parsed:
+        return parsed
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            value = json.loads(stripped)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 def parse_alert_time(value: Any) -> datetime | None:
@@ -639,57 +737,97 @@ def parse_alert_time(value: Any) -> datetime | None:
 def normalize_alert(raw: Any) -> dict[str, Any] | None:
     """Map a Tarsier / Tarsier-multi-source / Zabbix alert to our internal schema."""
     if isinstance(raw, list):
+        # Single-element arrays come from monitoring systems that always push a
+        # list; larger batches are ingested one-by-one by ``/webhook``.
         if len(raw) != 1:
             return None
         raw = raw[0]
 
+    event_info_text: str | None = None
+
     if isinstance(raw, str):
-        parsed = _parse_java_map_string(raw)
-        raw = parsed or raw
+        raw = _parse_mapping_string(raw)
     if not isinstance(raw, dict):
         return None
 
-    if "eventInfo" in raw and isinstance(raw["eventInfo"], (dict, str)):
-        event_info = raw["eventInfo"]
-        raw = _parse_java_map_string(event_info) if isinstance(event_info, str) else event_info
-        if not isinstance(raw, dict):
-            return None
+    # ``eventInfo`` may be a stringified Java Map (Tarsier), a JSON object
+    # string, or an already-parsed dict (legacy / proxy-normalised payloads).
+    for key in ("eventInfo", "eventinfo", "event_info"):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, dict):
+            raw = value
+            break
+        if isinstance(value, str):
+            parsed = _parse_mapping_string(value)
+            if not parsed:
+                # eventInfo 存在但无法解析成映射：保持旧的拒绝语义。
+                return None
+            event_info_text = value.strip()
+            raw = parsed
+            break
+    if not isinstance(raw, dict):
+        return None
 
-    # Nested Java-map values (some Tarsier push formats wrap the payload)
-    for value in list(raw.values()):
-        if isinstance(value, str) and value.strip().startswith("{") and "=" in value:
-            parsed = _parse_java_map_string(value)
-            if parsed:
-                raw = parsed
-                break
+    # Nested Java-map values (some Tarsier push formats wrap the payload).  Only
+    # unwrap when the mapping does not already look like an alert, otherwise a
+    # legitimately nested value could replace the payload.
+    if not (_ALERT_FIELD_KEYS & set(raw)):
+        for value in list(raw.values()):
+            if isinstance(value, str) and value.strip().startswith("{"):
+                parsed = _parse_mapping_string(value)
+                if parsed:
+                    raw = parsed
+                    break
 
     def pick(*keys: str) -> Any:
         for key in keys:
-            if key in raw and raw[key] not in (None, ""):
+            if key in raw and _present(raw[key]):
                 return raw[key]
         return None
 
     ip = _s(pick("SOURCECINAME", "sourceCIName", "host_ip", "hostIp", "ciIP",
-                  "ci_ip", "IP", "CITYPE", "citype"))
-    ci_name = _s(pick("ciName", "ci_name", "CINAME", "ciname", "hostname", "CIAPPLICATION"))
-    app = _s(pick("ciApplication", "ci_application", "CIAPPLICATION", "ciapplication",
-                  "application", "service"))
+                 "ci_ip", "IP", "SOURCEIP", "sourceIp"))
+    # ci_name ← CINAME，回退 SERVERNAME（最后兜底 source，见下方 return）。
+    ci_name = _s(pick("ciName", "ci_name", "CINAME", "ciname", "SERVERNAME",
+                      "servername", "hostname", "HOSTNAME"))
+    # ci_application ← CIAPPLICATION，空则 CICATEGORYNAME（应用监控默认丰富 等）。
+    app = _s(pick("ciApplication", "ci_application", "CIAPPLICATION",
+                  "ciapplication", "CICATEGORYNAME", "cicategoryname",
+                  "CICATEGORYID", "application", "service"))
+    # content ← SUMMARY，空则 SOURCESUMMARY。
     content = _s(pick("alertContent", "alert_content", "SUMMARY", "summary",
-                      "SOURCESUMMARY", "sourceSummary", "alertMessage", "message",
-                      "title"))
+                      "SOURCESUMMARY", "sourceSummary", "alertMessage",
+                      "message", "title"))
+    # severity ← SEVERITY（数字 1-5），回退 SOURCESEVERITY（如 ``2_2``）。
     severity = pick("alertLevel", "alert_level", "SEVERITY", "severity",
-                    "SEVERITY_CODE", "severityCode", "priority") or "normal"
-    alert_time_raw = pick("alertTime", "alert_time", "LASTOCCURRENCE", "lastOccurrence",
-                          "FIRSTOCCURRENCE", "currentTime", "timestamp")
+                    "SEVERITY_CODE", "severityCode", "SOURCESEVERITY",
+                    "sourceseverity", "priority") or "normal"
+    # alertTime ← LASTOCCURRENCE（ISO-8601）。
+    alert_time_raw = pick("alertTime", "alert_time", "LASTOCCURRENCE",
+                          "lastOccurrence", "FIRSTOCCURRENCE", "currentTime",
+                          "timestamp")
     alert_time = parse_alert_time(alert_time_raw) or datetime.now(CST)
-    alert_uid = _s(pick("alertId", "alert_id", "SERIAL", "ID", "DUPLICATESERIAL",
-                        "IDENTIFIER", "SOURCEEVENTID"))
+    # alertId ← SERIAL，回退 ID / DUPLICATESERIAL，空则 SOURCEEVENTID。
+    alert_uid = _s(pick("alertId", "alert_id", "SERIAL", "ID",
+                        "DUPLICATESERIAL", "IDENTIFIER", "SOURCEEVENTID"))
+    # source ← SOURCENAME。
     source = _s(pick("alertSource", "alert_source", "SOURCENAME", "sourceName",
                      "SOURCEID", "sourceId", "source"), "unknown")
+    # metric ← KPINAME。
     metric = _s(pick("metric", "KPINAME", "kpiname", "SOURCEALERTKEY",
                      "sourceAlertKey", "KPIINSTANCE"))
-    ci_id = _s(pick("ciCode", "ci_code", "CIID", "ciid", "CIPRIMARYKEY", "ciPrimaryKey"))
-    ci_type = _s(pick("ciType", "CICATEGORYNAME", "CICATEGORYID"))
+    ci_id = _s(pick("ciCode", "ci_code", "CIID", "ciid", "CIPRIMARYKEY",
+                    "ciPrimaryKey"))
+    # ci_type ← CITYPE。
+    ci_type = _s(pick("ciType", "ci_type", "CITYPE", "citype",
+                      "CICATEGORYNAME"))
+
+    # raw 保留原始报文：解析后的映射 + 原始 eventInfo 字符串（截断），便于排障。
+    raw_payload: dict[str, Any] = dict(raw)
+    if event_info_text:
+        raw_payload.setdefault("_eventInfo", event_info_text[:4000])
 
     return {
         "ip": ip.strip(),
@@ -703,7 +841,7 @@ def normalize_alert(raw: Any) -> dict[str, Any] | None:
         "source": source.strip() or "unknown",
         "metric": metric.strip(),
         "ci_type": ci_type.strip(),
-        "raw": raw,
+        "raw": raw_payload,
     }
 
 

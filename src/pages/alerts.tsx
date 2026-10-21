@@ -1242,10 +1242,49 @@ export default function AlertsPage() {
                           <pre className="max-h-72 overflow-auto border-t border-border/60 p-3 text-[11px] leading-relaxed">{JSON.stringify(webhook.sample_payload, null, 2)}</pre>
                         </details>
 
+                        {/* 集中监控（Tarsier）Java Map 示例（默认折叠） */}
+                        {webhook.java_map_sample && (
+                          <details className="group rounded-lg border border-border/70">
+                            <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2.5 [&::-webkit-details-marker]:hidden">
+                              <span className="flex-1 text-xs font-medium text-text-secondary">
+                                集中监控 Java Map 示例
+                              </span>
+                              <Badge variant="secondary" className="text-[11px]">eventInfo 字符串</Badge>
+                              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+                            </summary>
+                            <div className="space-y-2 border-t border-border/60 p-3">
+                              <p className="text-xs leading-relaxed text-muted-foreground">
+                                集中监控把 <code className="rounded bg-muted px-1 py-0.5 text-[11px]">eventInfo</code>
+                                作为字符串化的 Java Map 推送；值里含英文逗号、等号、<code className="rounded bg-muted px-1 py-0.5 text-[11px]">|</code>
+                                、中文标点时按「下一个 KEY=」切分，不会截断 SUMMARY。
+                              </p>
+                              <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-muted/60 p-3 text-[11px] leading-relaxed text-text-secondary">{JSON.stringify(webhook.java_map_sample, null, 2)}</pre>
+                              {webhook.curl_java_map && (
+                                <div className="flex justify-end">
+                                  <Button
+                                    variant="ghostMuted"
+                                    size="sm"
+                                    className="h-7 text-xs"
+                                    onClick={() => copyText(webhook.curl_java_map!, "命令")}
+                                  >
+                                    <Copy className="h-3 w-3" /> 复制 curl
+                                  </Button>
+                                </div>
+                              )}
+                            </div>
+                          </details>
+                        )}
+
                         <div className="space-y-1 rounded-lg border border-border/60 bg-muted/20 p-3 text-xs leading-relaxed text-muted-foreground">
-                          <p>· 支持单条对象或 JSON 数组批量推送；Tarsier 原生字段与通用字段（alertId / alertLevel / alertContent…）均可。</p>
-                          <p>· 去重窗内重复 alertId 会被忽略；同应用在合并窗口内的新告警会附着到进行中的 RCA，不重复拉起会话。</p>
-                          <p>· 自动模式下按策略判定；人工模式下所有告警先入收件箱，可勾选后触发。</p>
+                          {webhook.notes && webhook.notes.length > 0 ? (
+                            webhook.notes.map((note) => <p key={note}>· {note}</p>)
+                          ) : (
+                            <>
+                              <p>· 支持单条对象或 JSON 数组批量推送；Tarsier 原生字段与通用字段（alertId / alertLevel / alertContent…）均可。</p>
+                              <p>· 去重窗内重复 alertId 会被忽略；同应用在合并窗口内的新告警会附着到进行中的 RCA，不重复拉起会话。</p>
+                              <p>· 自动模式下按策略判定；人工模式下所有告警先入收件箱，可勾选后触发。</p>
+                            </>
+                          )}
                         </div>
                       </>
                     )}
