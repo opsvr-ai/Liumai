@@ -554,16 +554,25 @@ export const MessageList: FC<MessageListProps> = ({
 
   // Terminal reconciliation can enlarge the final answer after the last
   // streamed frame; follow it down so the complete answer is actually visible.
+  // The scroll is repeated on the next frame and after the 60ms render throttle
+  // flushes, otherwise it would stop at the pre-reconcile (shorter) content.
   useEffect(() => {
-    const handler = () => {
+    let settled: number | null = null;
+    const scroll = () => {
       const viewport = rootRef.current?.closest<HTMLElement>(".chat-thin-scroll");
       if (!viewport) return;
-      requestAnimationFrame(() => {
-        viewport.scrollTop = viewport.scrollHeight;
-      });
+      viewport.scrollTop = viewport.scrollHeight;
+    };
+    const handler = () => {
+      if (settled !== null) window.clearTimeout(settled);
+      requestAnimationFrame(() => requestAnimationFrame(scroll));
+      settled = window.setTimeout(scroll, 180);
     };
     window.addEventListener("chat:scroll-bottom", handler);
-    return () => window.removeEventListener("chat:scroll-bottom", handler);
+    return () => {
+      window.removeEventListener("chat:scroll-bottom", handler);
+      if (settled !== null) window.clearTimeout(settled);
+    };
   }, []);
 
   // UI-only timestamp map: restored messages use numeric DB ids and therefore
