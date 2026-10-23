@@ -515,6 +515,16 @@ export interface ToolCallDelta {
   hermes_seq?: number;
   /** Client clock (ms) when the tool was first seen running. */
   hermes_started_at?: number;
+  /**
+   * Sequence of the SSE frame that first announced this call.  It is the
+   * identity fallback when the wire event carries no ``tool_call_id``, so two
+   * calls of the same tool can never collapse into one card.
+   */
+  hermes_event_seq?: number;
+  /** Last frame sequence applied to this call (guards started replays). */
+  hermes_last_seq?: number;
+  /** Wire ids seen for this call (Hermes may add/change one mid-lifecycle). */
+  hermes_call_ids?: string[];
 }
 
 /** Parsed SSE event from the chat stream endpoint. */
@@ -540,6 +550,344 @@ export type ChatStreamEvent =
       hermes?: unknown;
     }
   | { type: "error"; error: string; output?: string };
+
+/* ── Tool-call aggregation ────────────────────────── */
+
+/**
+ * Minimal transcript row the tool-call aggregator operates on.
+ *
+ * The chat hook's ``DisplayMessage`` is structurally compatible, so the same
+ * reducer runs in production and in tests.
+ */
+export interface ToolCallRowLike {
+  id: string;
+  role?: string;
+  content: string;
+  toolCalls?: ToolCallDelta[];
+  isStreaming?: boolean;
+}
+
+/**
+ * Callbacks the aggregator needs from its host.
+ *
+ * ``nextSeq`` allocates the stable first-seen order, ``nextArrival`` allocates
+ * an identity only for a call the wire did not identify, and ``createRow``
+ * turns the generic row into the host's message type.
+ */
+export interface ToolCallAggregateOptions<T extends ToolCallRowLike> {
+  nextSeq: () => number;
+  nextArrival: () => number;
+  createRow: (row: ToolCallRowLike) => T;
+  /** Injectable clock so the reducer stays deterministic in tests. */
+  now?: () => number;
+}
+
+const TOOL_RUNNING_STATUSES = new Set([
+  "running",
+  "started",
+  "in_progress",
+  "executing",
+]);
+const TOOL_FINISHED_STATUSES = new Set([
+  "completed",
+  "complete",
+  "done",
+  "success",
+  "succeeded",
+  "failed",
+  "error",
+  "failure",
+]);
+/** Completed progress frames that carry a status word instead of parameters. */
+const TOOL_STATUS_ONLY_ARGS = new Set([
+  "已完成",
+  "完成",
+  "执行失败",
+  "失败",
+  "执行中",
+]);
+
+function _looksComplete(args: string): boolean {
+  try {
+    JSON.parse(args);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function _toolName(tc: ToolCallDelta): string {
+  return tc.function?.name?.trim() || "tool";
+}
+
+function _isToolRow(row: ToolCallRowLike): boolean {
+  return row.role === "tool";
+}
+
+/** Exact wire-id match, including ids Hermes changed mid-lifecycle. */
+function _findByWireId<T extends ToolCallRowLike>(
+  rows: readonly T[],
+  wireId: string,
+): number {
+  return rows.findIndex((row) => {
+    if (!_isToolRow(row)) return false;
+    const prev = row.toolCalls?.[0];
+    if (!prev) return false;
+    if (prev.id === wireId) return true;
+    return Boolean(prev.hermes_call_ids?.includes(wireId));
+  });
+}
+
+/**
+ * Newest same-name row that is still running.
+ *
+ * Used only to pair a completion that has no usable identity (or whose start
+ * row was created before the wire supplied an id).  Picking the newest —
+ * instead of the first — keeps parallel same-name calls LIFO-correct and stops
+ * a completion from touching an older row.
+ */
+function _findNewestRunning<T extends ToolCallRowLike>(
+  rows: readonly T[],
+  name: string,
+  onlyUnidentified = false,
+): number {
+  let best = -1;
+  let bestSeq = -Infinity;
+  rows.forEach((row, index) => {
+    if (!_isToolRow(row) || !row.isStreaming) return;
+    const prev = row.toolCalls?.[0];
+    if (!prev) return;
+    if ((prev.function?.name || row.content) !== name) return;
+    if (onlyUnidentified) {
+      if (prev.hermes_call_ids?.length) return;
+      if (!prev.id.startsWith("tc:")) return;
+    }
+    const seq = typeof prev.hermes_seq === "number" ? prev.hermes_seq : index;
+    if (seq >= bestSeq) {
+      bestSeq = seq;
+      best = index;
+    }
+  });
+  return best;
+}
+
+/**
+ * Stable identity for a call the wire did not identify.
+ *
+ * ``hermes_event_seq`` makes a replayed frame resolve to the same key; when the
+ * transport has no sequence at all an arrival ordinal keeps each call unique.
+ * The tool name is deliberately part of the *readable prefix* only — never the
+ * whole key — so repeated calls of one tool stay separate cards.
+ */
+function _syntheticCallKey(
+  name: string,
+  eventSeq: number | undefined,
+  arrival: number,
+): string {
+  return eventSeq !== undefined
+    ? `tc:${name}:seq:${eventSeq}`
+    : `tc:${name}:arrival:${arrival}`;
+}
+
+/**
+ * Apply a batch of tool-call deltas to a transcript.
+ *
+ * Invariants:
+ * - every call gets a unique identity: wire ``tool_call_id`` first, else the
+ *   SSE ``seq``, else a per-turn arrival ordinal — never the bare tool name;
+ * - a repeated ``started`` for the same identity updates that row (a replay
+ *   cannot add a duplicate card);
+ * - a ``completed`` with an id updates the row with that id; without an id it
+ *   consumes only the newest still-running same-name row, exactly once;
+ * - a completion with no matching start materialises as a finished row in
+ *   arrival order, so the group count still reflects real executions.
+ */
+export function applyToolCallDeltas<T extends ToolCallRowLike>(
+  rows: readonly T[],
+  deltas: readonly ToolCallDelta[],
+  opts: ToolCallAggregateOptions<T>,
+): T[] {
+  const next = [...rows];
+  const now = opts.now ?? Date.now;
+
+  for (const tc of deltas) {
+    const name = _toolName(tc);
+    const wireId = (tc.id || "").trim();
+    const rawArgs = tc.function?.arguments?.trim() ?? "";
+    const status = (tc.hermes_status || "").trim().toLowerCase();
+    const running = TOOL_RUNNING_STATUSES.has(status);
+    const finished = TOOL_FINISHED_STATUSES.has(status);
+    // A lifecycle frame always carries ``hermes_status``; a plain argument
+    // delta (legacy OpenAI stream) does not, and may be merged by tool name.
+    const lifecycle = status !== "";
+    const statusOnly = TOOL_STATUS_ONLY_ARGS.has(rawArgs);
+    const eventSeq =
+      typeof tc.hermes_event_seq === "number" &&
+      Number.isFinite(tc.hermes_event_seq)
+        ? tc.hermes_event_seq
+        : undefined;
+
+    // 1) Exact identity.  A started + completed pair with the same id always
+    //    resolves here, so a duplicate completion can only update its own row.
+    let existingIdx = wireId ? _findByWireId(next, wireId) : -1;
+
+    // 2) Identity-less completion: consume the newest running same-name row.
+    if (existingIdx < 0 && finished && !wireId) {
+      existingIdx = _findNewestRunning(next, name);
+    }
+
+    // 3) The wire added an id only on completion (or Hermes changed it): adopt
+    //    it onto a still-running row that had no wire id of its own.  Rows that
+    //    already have an id are never matched by name, so parallel calls stay
+    //    distinct.
+    if (existingIdx < 0 && finished && wireId) {
+      existingIdx = _findNewestRunning(next, name, true);
+    }
+
+    // 4) Legacy argument deltas without an id continue the newest running call
+    //    of that tool; they are not lifecycle frames, so no card is created.
+    if (existingIdx < 0 && !wireId && !lifecycle && !finished) {
+      existingIdx = _findNewestRunning(next, name);
+    }
+
+    // Replay of a no-id started frame with a known sequence resolves to the
+    // same synthetic key.
+    const syntheticKey = wireId
+      ? ""
+      : _syntheticCallKey(name, eventSeq, -1);
+    if (!wireId && eventSeq !== undefined) {
+      const replayed = next.findIndex(
+        (row) =>
+          _isToolRow(row) &&
+          row.toolCalls?.[0]?.id === syntheticKey,
+      );
+      if (replayed >= 0) existingIdx = replayed;
+    }
+
+    if (existingIdx >= 0) {
+      const target = next[existingIdx];
+      const prevTc = target.toolCalls?.[0];
+      const prevArgs = prevTc?.function?.arguments?.trim() ?? "";
+      const prevStatus = (prevTc?.hermes_status || "").toLowerCase();
+      const prevFinished = TOOL_FINISHED_STATUSES.has(prevStatus);
+      const prevLastSeq = prevTc?.hermes_last_seq;
+      // A replayed ``started`` that arrives after its own completion must not
+      // reopen the card.  Sequence comparison makes that deterministic.
+      const replayedStart =
+        lifecycle &&
+        running &&
+        prevFinished &&
+        eventSeq !== undefined &&
+        prevLastSeq !== undefined &&
+        eventSeq <= prevLastSeq;
+
+      if (replayedStart) {
+        next[existingIdx] = {
+          ...target,
+          toolCalls: [
+            {
+              ...prevTc,
+              hermes_last_seq: Math.max(prevLastSeq ?? -1, eventSeq),
+            },
+          ],
+        };
+        continue;
+      }
+
+      const nextArgs = statusOnly ? "" : rawArgs;
+      // Completed frames may carry a result preview in ``arguments`` on older
+      // bridges; never let it overwrite the parameters captured at started.
+      const args =
+        finished && prevArgs ? prevArgs : running ? nextArgs || prevArgs : prevArgs || nextArgs;
+      const startedAt =
+        prevTc?.hermes_started_at ?? (running ? now() : undefined);
+      const reportedDuration =
+        tc.hermes_duration_ms ?? prevTc?.hermes_duration_ms;
+      const duration =
+        finished && (!reportedDuration || reportedDuration <= 0) && startedAt
+          ? Math.max(0, now() - startedAt)
+          : reportedDuration;
+      const callIds = new Set(prevTc?.hermes_call_ids ?? []);
+      if (wireId) callIds.add(wireId);
+      const mergedTc: ToolCallDelta = {
+        ...prevTc,
+        ...tc,
+        id: prevTc?.id || wireId || syntheticKey,
+        function: {
+          name: tc.function?.name || prevTc?.function?.name || name,
+          arguments: args,
+        },
+        hermes_emoji: tc.hermes_emoji || prevTc?.hermes_emoji,
+        hermes_label:
+          running && !finished
+            ? tc.hermes_label || nextArgs || prevTc?.hermes_label
+            : prevTc?.hermes_label,
+        hermes_status: tc.hermes_status || prevTc?.hermes_status,
+        hermes_result: tc.hermes_result || prevTc?.hermes_result,
+        hermes_error: tc.hermes_error || prevTc?.hermes_error,
+        hermes_duration_ms: duration,
+        hermes_seq: prevTc?.hermes_seq,
+        hermes_started_at: startedAt,
+        hermes_event_seq: prevTc?.hermes_event_seq ?? eventSeq,
+        hermes_last_seq:
+          Math.max(prevLastSeq ?? -1, eventSeq ?? -1) >= 0
+            ? Math.max(prevLastSeq ?? -1, eventSeq ?? -1)
+            : undefined,
+        ...(callIds.size > 0 ? { hermes_call_ids: [...callIds] } : {}),
+      };
+      next[existingIdx] = {
+        ...target,
+        content: mergedTc.function?.name || target.content,
+        toolCalls: [mergedTc],
+        isStreaming: running
+          ? true
+          : finished
+            ? false
+            : Boolean(target.isStreaming),
+      };
+      continue;
+    }
+
+    // First appearance: append in arrival order.  ``nextArrival`` is consumed
+    // only when the wire supplied neither an id nor a sequence.
+    const key =
+      wireId ||
+      (eventSeq !== undefined
+        ? _syntheticCallKey(name, eventSeq, -1)
+        : _syntheticCallKey(name, undefined, opts.nextArrival()));
+    const seq = opts.nextSeq();
+    const mergedTc: ToolCallDelta = {
+      ...tc,
+      id: key,
+      function: {
+        name,
+        arguments: statusOnly ? "" : rawArgs,
+      },
+      hermes_seq: seq,
+      hermes_started_at: running ? now() : undefined,
+      hermes_duration_ms: tc.hermes_duration_ms,
+      hermes_event_seq: eventSeq,
+      hermes_last_seq: eventSeq,
+      ...(wireId ? { hermes_call_ids: [wireId] } : {}),
+    };
+    next.push(
+      opts.createRow({
+        id: `tool-${key}`,
+        role: "tool",
+        content: name,
+        toolCalls: [mergedTc],
+        isStreaming: running
+          ? true
+          : finished
+            ? false
+            : Boolean(mergedTc.function?.arguments) &&
+              !_looksComplete(mergedTc.function?.arguments ?? ""),
+      }),
+    );
+  }
+
+  return next;
+}
 
 /* ── One-turn image staging (A3) ─────────────────── */
 
@@ -989,6 +1337,8 @@ export async function* chatRunEvents(
 
   const decoder = new TextDecoder();
   let buffer = "";
+  /** Monotonic arrival index for frames that carry no SSE ``id:``. */
+  let ordinal = 0;
 
   try {
     while (true) {
@@ -1004,9 +1354,14 @@ export async function* chatRunEvents(
       for (const frame of frames) {
         const raw = _parseRunFrame(frame);
         if (!raw) continue;
-        const event = _normalizeRunEvent(raw);
+        ordinal += 1;
+        const event = normalizeRunEvent(raw.payload, {
+          seq: raw.seq,
+          ordinal,
+        });
         if (event) {
-          if (typeof raw.seq === "number") event.seq = raw.seq;
+          const seq = raw.seq;
+          if (typeof seq === "number") event.seq = seq;
           yield event;
         }
       }
@@ -1015,7 +1370,11 @@ export async function* chatRunEvents(
     // Flush a trailing frame that arrived without its blank-line terminator.
     const tail = _parseRunFrame(buffer);
     if (tail) {
-      const event = _normalizeRunEvent(tail);
+      ordinal += 1;
+      const event = normalizeRunEvent(tail.payload, {
+        seq: tail.seq,
+        ordinal,
+      });
       if (event) {
         if (typeof tail.seq === "number") event.seq = tail.seq;
         yield event;
@@ -1033,25 +1392,43 @@ export async function* chatRunEvents(
   }
 }
 
+/** One decoded run SSE frame: its JSON payload plus the SSE id (if any). */
+interface ParsedRunFrame {
+  payload: Record<string, unknown>;
+  seq?: number;
+}
+
 /** Decode one raw run SSE frame into its JSON payload (or ``null``). */
-function _parseRunFrame(frame: string): Record<string, unknown> | null {
+function _parseRunFrame(frame: string): ParsedRunFrame | null {
   const dataLines: string[] = [];
+  let seq: number | undefined;
   for (const line of frame.split("\n")) {
     if (!line || line.startsWith(":")) continue; // ': open' / ': keepalive' / ': stream closed'
-    if (!line.startsWith("data:")) continue; // 'id:' (and any future 'event:') lines
+    if (line.startsWith("id:")) {
+      // The Runs API writes the replay cursor on the ``id:`` line; the JSON
+      // body repeats it as ``seq``.  Either is a valid frame identity.
+      const parsed = Number(line.slice(3).trim());
+      if (Number.isInteger(parsed) && parsed >= 0) seq = parsed;
+      continue;
+    }
+    if (!line.startsWith("data:")) continue; // 'event:' (and any future fields)
     dataLines.push(line.slice(5).trimStart());
   }
   if (dataLines.length === 0) return null;
 
-  const payload = dataLines.join("\n");
-  if (payload === "[DONE]") return null;
+  const payloadText = dataLines.join("\n");
+  if (payloadText === "[DONE]") return null;
   try {
-    const parsed: unknown = JSON.parse(payload);
-    return parsed && typeof parsed === "object"
-      ? (parsed as Record<string, unknown>)
-      : null;
+    const parsed: unknown = JSON.parse(payloadText);
+    if (!parsed || typeof parsed !== "object") return null;
+    const payload = parsed as Record<string, unknown>;
+    if (seq === undefined) {
+      const bodySeq = Number(payload.seq);
+      if (Number.isInteger(bodySeq) && bodySeq >= 0) seq = bodySeq;
+    }
+    return { payload, seq };
   } catch {
-    console.warn("[chatRunEvents] unparseable SSE data:", payload.slice(0, 200));
+    console.warn("[chatRunEvents] unparseable SSE data:", payloadText.slice(0, 200));
     return null;
   }
 }
@@ -1352,6 +1729,57 @@ export function chatRunUsage(
   return _runUsage(raw);
 }
 
+/** Extra frame context handed to {@link normalizeRunEvent}. */
+export interface RunEventContext {
+  /** SSE ``id:`` / JSON ``seq`` of the frame. */
+  seq?: number;
+  /** Monotonic arrival ordinal inside the current subscription. */
+  ordinal?: number;
+}
+
+/**
+ * Summarise a completed tool's result for the card.
+ *
+ * Hermes' public run stream normally sends a bounded ``preview``; other
+ * adapters only expose structured fields.  Prefer the preview, then build one
+ * short sentence out of whatever is present so a row never shows an empty
+ * result after a tool actually ran.
+ */
+function _toolResultSummary(
+  raw: Record<string, unknown>,
+  failed: boolean,
+  completed: boolean,
+): string {
+  if (!completed) return "";
+  const preview = _runStr(raw.preview).trim();
+  if (preview) return preview;
+
+  const parts: string[] = [];
+  const exitCode = raw.exit_code ?? raw.exitCode;
+  if (typeof exitCode === "number" || (typeof exitCode === "string" && exitCode.trim())) {
+    parts.push(`exit_code=${String(exitCode).trim()}`);
+  }
+  for (const [key, label] of [
+    ["stdout_bytes", "stdout"],
+    ["stdoutBytes", "stdout"],
+    ["stderr_bytes", "stderr"],
+    ["stderrBytes", "stderr"],
+  ] as const) {
+    const value = raw[key];
+    if (typeof value === "number" && Number.isFinite(value)) {
+      parts.push(`${label} ${value} B`);
+      break;
+    }
+  }
+  if (typeof raw.error === "string" && raw.error.trim()) {
+    parts.push(raw.error.trim());
+  } else if (failed) {
+    parts.push("执行失败");
+  }
+  if (parts.length === 0) parts.push(failed ? "执行失败" : "执行成功");
+  return parts.join(" · ");
+}
+
 /**
  * Translate a raw Hermes run event into the UI's chat-event vocabulary.
  *
@@ -1364,8 +1792,16 @@ export function chatRunUsage(
  *   {output,usage,completed,partial,interrupted}, run.failed{error},
  *   run.cancelled / run.interrupted, subagent.start / subagent.complete,
  *   replay.truncated.  Unknown types are ignored (never crash the stream).
+ *
+ * Tool events keep their wire identity verbatim.  When ``tool_call_id`` is
+ * absent the id is left empty and the frame ``seq`` is attached as
+ * ``hermes_event_seq``; the aggregator then synthesises a unique key instead of
+ * falling back to the tool name (which used to merge every same-name call).
  */
-function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
+export function normalizeRunEvent(
+  raw: Record<string, unknown>,
+  ctx?: RunEventContext,
+): ChatRunEvent | null {
   const name = _runStr(raw.event) || _runStr(raw.type);
 
   switch (name) {
@@ -1391,18 +1827,30 @@ function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
         _runStr(raw.tool_name);
       if (misroutedTool) {
         const completed = _runStr(raw.status) === "completed";
+        const toolName =
+          _runStr(raw.tool) || _runStr(raw.tool_name) || "tool";
         return {
           type: "tool_call",
           tool_calls: [
             {
-              id: misroutedTool,
+              // Never use the tool name as identity: leave it empty and let
+              // the aggregator assign a per-frame unique key.
+              id:
+                _runStr(raw.tool_call_id) ||
+                _runStr(raw.call_id) ||
+                "",
               function: {
-                name:
-                  _runStr(raw.tool) || _runStr(raw.tool_name) || "tool",
-                arguments: _runStr(raw.preview) || "",
+                name: toolName,
+                arguments: completed ? "" : _runStr(raw.preview) || "",
               },
-              hermes_label: _runStr(raw.preview),
+              hermes_label: completed ? "" : _runStr(raw.preview),
               hermes_status: completed ? "completed" : "running",
+              ...(completed
+                ? { hermes_result: _toolResultSummary(raw, false, true) }
+                : {}),
+              ...(ctx?.seq !== undefined
+                ? { hermes_event_seq: ctx.seq }
+                : {}),
             },
           ],
         };
@@ -1448,16 +1896,22 @@ function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
         argumentsText = preview;
       }
       const durationMs = _runDurationMs(raw.duration);
-      const result = completed ? preview : "";
+      const result = _toolResultSummary(raw, failed, completed);
+      const errorText = failed
+        ? typeof raw.error === "string"
+          ? raw.error
+          : _runStr(raw.message) || "执行失败"
+        : "";
       return {
         type: "tool_call",
         tool_calls: [
           {
+            // ``tool_call_id`` is the only wire identity.  When it is absent
+            // the aggregator falls back to ``hermes_event_seq`` / arrival
+            // order — the tool name is never used as a key.
             id:
               _runStr(raw.tool_call_id) ||
-              _runStr(raw.call_id) ||
-              _runStr(raw.id) ||
-              toolName,
+              _runStr(raw.call_id),
             function: { name: toolName, arguments: argumentsText },
             // Keep the started preview as the label; the completed preview is
             // the result (see ``hermes_result``).
@@ -1468,15 +1922,9 @@ function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
                 ? "completed"
                 : "running",
             ...(result ? { hermes_result: result } : {}),
-            ...(failed
-              ? {
-                  hermes_error:
-                    typeof raw.error === "string"
-                      ? raw.error
-                      : _runStr(raw.message) || "执行失败",
-                }
-              : {}),
+            ...(errorText ? { hermes_error: errorText } : {}),
             ...(durationMs !== null ? { hermes_duration_ms: durationMs } : {}),
+            ...(ctx?.seq !== undefined ? { hermes_event_seq: ctx.seq } : {}),
           },
         ],
       };
@@ -2130,6 +2578,8 @@ export interface ChatSessionDetail extends ChatSessionSummary {
     id: number;
     role: string;
     content: string;
+    /** Present when the backend persists chain-of-thought (optional). */
+    reasoning?: string;
     tool_calls?: unknown;
     created_at: string;
   }>;
@@ -2230,7 +2680,13 @@ export const chatHistory = {
   },
   saveMessages(
     sessionId: number,
-    messages: Array<{ role: string; content: string; tool_calls?: unknown }>,
+    messages: Array<{
+      role: string;
+      content: string;
+      /** Already compacted client-side; ignored by older backends. */
+      reasoning?: string;
+      tool_calls?: unknown;
+    }>,
     title?: string,
     /**
      * Hermes linkage persisted in the same write.  Omit a key to leave the

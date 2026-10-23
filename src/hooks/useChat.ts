@@ -15,11 +15,13 @@ import { toast } from "sonner";
 import { uid } from "@/lib/uid";
 import {
   ApiError,
+  applyToolCallDeltas,
   chatHistory,
   chatRuns,
   chatRunEvents,
   chatRunUsage,
   chatStream,
+  collapseDuplicateReasoning,
   ReasoningDeduper,
   type ChatApprovalRequest,
   type ChatMessage,
@@ -224,6 +226,12 @@ export function useChat() {
   const isStreamingRef = useRef(false);
   /** Highest tool sequence number handed out this turn (first-seen order). */
   const toolSeqRef = useRef(0);
+  /**
+   * Arrival counter for tool calls the wire does not identify.  It is consumed
+   * only when neither ``tool_call_id`` nor a frame sequence exists, so each
+   * such call gets its own stable key instead of collapsing under its name.
+   */
+  const toolArrivalRef = useRef(0);
   /** Timer holding the 5s partial-save cadence for the current turn. */
   const partialSaveTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   /**
@@ -468,155 +476,22 @@ export function useChat() {
 
   /** Insert or update tool-call messages as separate, visible cards.
    *
-   * Every tool keeps ONE message for its whole lifecycle:
-   * - the first ``started`` event appends it at the end and assigns a stable
-   *   ``hermes_seq`` (first-seen order — parallel batches used to render
-   *   reversed because new rows were inserted *before* the assistant bubble);
-   * - later ``started`` / ``completed`` events match by ``tool_call_id`` and
-   *   update that same row (params, status, result, duration);
-   * - a completion with no matching start becomes a row in arrival order.
+   * Every execution owns exactly ONE message for its whole lifecycle, keyed by
+   * its wire ``tool_call_id``.  When Hermes omits that id the aggregator falls
+   * back to the frame ``seq`` or a per-turn arrival ordinal — never to the tool
+   * name, which would merge repeated ``terminal`` / ``execute_code`` calls into
+   * a single card.  The matching / merge / ordering rules live in
+   * {@link applyToolCallDeltas} so they are unit-testable without React.
    */
   const updateToolCalls = useCallback((toolCalls: ToolCallDelta[]) => {
-    setMessages((prev) => {
-      const next = [...prev];
-
-      for (const tc of toolCalls) {
-        const tcId = (tc.id || "").trim();
-        const name = tc.function?.name?.trim() || "tool";
-        const incomingArgs = tc.function?.arguments?.trim() ?? "";
-        // Completed events often carry only a status label ("已完成") or an
-        // empty preview.  Those must never overwrite the parameters captured
-        // from ``tool.started``.
-        const statusOnly =
-          incomingArgs === "已完成" ||
-          incomingArgs === "完成" ||
-          incomingArgs === "执行失败" ||
-          incomingArgs === "失败" ||
-          incomingArgs === "执行中";
-        const status = (tc.hermes_status || "").toLowerCase();
-        const running =
-          status === "running" || status === "started" || status === "in_progress";
-        const finished =
-          status === "completed" ||
-          status === "complete" ||
-          status === "done" ||
-          status === "success" ||
-          status === "failed" ||
-          status === "error" ||
-          status === "failure";
-
-        // 1) Exact lifecycle id, 2) a running row of the same tool when a
-        // completion arrives without an id, 3) a single running row with the
-        // same name (Hermes occasionally changes the id between events).
-        let existingIdx = -1;
-        if (tcId) {
-          existingIdx = next.findIndex(
-            (m) => m.role === "tool" && m.toolCalls?.[0]?.id === tcId,
-          );
-        }
-        if (existingIdx < 0 && finished) {
-          const runningSameName: number[] = [];
-          next.forEach((m, index) => {
-            if (m.role !== "tool" || !m.isStreaming) return;
-            const toolName = m.toolCalls?.[0]?.function?.name || m.content;
-            if (toolName === name) runningSameName.push(index);
-          });
-          if (runningSameName.length === 1) existingIdx = runningSameName[0];
-        }
-        if (existingIdx < 0 && !tcId && running) {
-          // Legacy streams can emit arg deltas before the id is known: update
-          // the newest row of the same tool instead of creating duplicates.
-          for (let index = next.length - 1; index >= 0; index -= 1) {
-            const m = next[index];
-            if (m.role !== "tool" || !m.isStreaming) continue;
-            const toolName = m.toolCalls?.[0]?.function?.name || m.content;
-            if (toolName === name) {
-              existingIdx = index;
-              break;
-            }
-          }
-        }
-
-        if (existingIdx >= 0) {
-          const target = next[existingIdx];
-          const prevTc = target.toolCalls?.[0];
-          const prevArgs = prevTc?.function?.arguments?.trim() ?? "";
-          const nextArgs = statusOnly ? "" : incomingArgs;
-          const args = nextArgs || prevArgs;
-          const startedAt =
-            prevTc?.hermes_started_at ?? (running ? Date.now() : undefined);
-          // Hermes sometimes reports 0 for a tool that clearly ran; prefer a
-          // positive reported duration, else fall back to the start→finish
-          // window observed on this client.
-          const reportedDuration = tc.hermes_duration_ms ?? prevTc?.hermes_duration_ms;
-          const duration =
-            finished && (!reportedDuration || reportedDuration <= 0) && startedAt
-              ? Math.max(0, Date.now() - startedAt)
-              : reportedDuration;
-          const mergedTc: ToolCallDelta = {
-            ...prevTc,
-            ...tc,
-            id: prevTc?.id || tc.id,
-            function: {
-              name: tc.function?.name || prevTc?.function?.name || name,
-              arguments: args,
-            },
-            hermes_emoji: tc.hermes_emoji || prevTc?.hermes_emoji,
-            // A started preview is the parameter summary; a completed preview
-            // is the result (``hermes_result``), never the label.
-            hermes_label: running
-              ? tc.hermes_label || nextArgs || prevTc?.hermes_label
-              : prevTc?.hermes_label,
-            hermes_status: tc.hermes_status || prevTc?.hermes_status,
-            hermes_result: tc.hermes_result ?? prevTc?.hermes_result,
-            hermes_error: tc.hermes_error ?? prevTc?.hermes_error,
-            hermes_duration_ms: duration,
-            hermes_seq: prevTc?.hermes_seq,
-            hermes_started_at: startedAt,
-          };
-          next[existingIdx] = {
-            ...target,
-            content: mergedTc.function?.name || target.content,
-            toolCalls: [mergedTc],
-            isStreaming: running
-              ? true
-              : finished
-                ? false
-                : Boolean(mergedTc.function?.arguments) &&
-                  !_looksComplete(mergedTc.function?.arguments ?? ""),
-          };
-          continue;
-        }
-
-        // First appearance: append (never prepend) and remember the order.
-        const seq = ++toolSeqRef.current;
-        const mergedTc: ToolCallDelta = {
-          ...tc,
-          id: tcId || `${name}-${seq}`,
-          function: {
-            name,
-            arguments: statusOnly ? "" : incomingArgs,
-          },
-          hermes_seq: seq,
-          hermes_started_at: running ? Date.now() : undefined,
-          hermes_duration_ms: tc.hermes_duration_ms,
-        };
-        next.push({
-          id: `tool-${mergedTc.id}`,
-          role: "tool",
-          content: name,
-          toolCalls: [mergedTc],
-          isStreaming: running
-            ? true
-            : finished
-              ? false
-              : Boolean(mergedTc.function?.arguments) &&
-                !_looksComplete(mergedTc.function?.arguments ?? ""),
-        });
-      }
-
-      return next;
-    });
+    if (toolCalls.length === 0) return;
+    setMessages((prev) =>
+      applyToolCallDeltas(prev, toolCalls, {
+        nextSeq: () => ++toolSeqRef.current,
+        nextArrival: () => ++toolArrivalRef.current,
+        createRow: (row) => row as DisplayMessage,
+      }),
+    );
   }, []);
 
   /** Attach token usage to the assistant message that just finished. */
@@ -1009,6 +884,7 @@ export function useChat() {
       pendingSeqRef.current = null;
       detachedRef.current = false;
       toolSeqRef.current = 0;
+      toolArrivalRef.current = 0;
       // New turn: reset the synchronous reasoning accumulator so a replayed
       // first chunk from a second source cannot be appended twice.
       resetReasoningAccumulator();
@@ -1649,7 +1525,12 @@ export function useChat() {
       // ``hermes_seq``, so assign one from their stored array order.  Without
       // a linked run nothing will ever finish these tools — settle stale
       // "running" rows so the group does not animate forever.
+      //
+      // Older transcripts may also carry a name-based tool id (the previous
+      // fallback) or the same id twice.  Re-key those rows here: a resumed run
+      // must never bind two historical cards to one live call.
       let toolSeq = 0;
+      const seenCallIds = new Set<string>();
       const restored: DisplayMessage[] = detail.messages.map((m) => {
         const calls = (m.tool_calls as ToolCallDelta[] | undefined) ?? undefined;
         const withSeq = calls?.map((call) => {
@@ -1662,8 +1543,18 @@ export function useChat() {
             (status === "running" ||
               status === "started" ||
               status === "in_progress");
+          const rawId = (call.id || "").trim();
+          const needsKey =
+            !rawId ||
+            seenCallIds.has(rawId) ||
+            rawId === (call.function?.name || "").trim();
+          const callId = needsKey
+            ? `tc:restored:${m.id}:${seq}`
+            : rawId;
+          seenCallIds.add(callId);
           return {
             ...call,
+            id: callId,
             hermes_seq: seq,
             ...(staleRunning ? { hermes_status: "completed" } : {}),
           };
@@ -1672,11 +1563,17 @@ export function useChat() {
           id: String(m.id),
           role: m.role as DisplayMessage["role"],
           content: m.content,
+          // Defensive: if a backend ever persists reasoning, compact it again
+          // on the render path (older rows may predate save-time compression).
+          ...(typeof m.reasoning === "string" && m.reasoning.trim()
+            ? { reasoning: collapseDuplicateReasoning(m.reasoning) }
+            : {}),
           toolCalls: withSeq,
           isStreaming: false,
         };
       });
       toolSeqRef.current = toolSeq;
+      toolArrivalRef.current = 0;
       messagesRef.current = restored;
       setMessages(restored);
       setSessionId(id);
@@ -1933,25 +1830,29 @@ async function probeRunCapabilities(
   };
 }
 
-/** Heuristic: does the JSON argument string look like a complete object? */
-function _looksComplete(args: string): boolean {
-  try {
-    JSON.parse(args);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /** Persistable messages (``error`` bubbles are UI-only). */
 function _saveableMessages(
   messages: DisplayMessage[],
-): Array<{ role: string; content: string; tool_calls?: ToolCallDelta[] }> {
+): Array<{
+  role: string;
+  content: string;
+  /** Compressed before saving (adjacent duplicate blocks removed). */
+  reasoning?: string;
+  tool_calls?: ToolCallDelta[];
+}> {
   return messages
     .filter((m) => m.role === "user" || m.role === "assistant" || m.role === "tool")
     .map((m) => ({
       role: m.role,
       content: m.content,
+      // Compaction happens *before* the transcript leaves the browser: a
+      // backend that persists reasoning must never store adjacent duplicates.
+      // (The current schema ignores this field, which is also why a reloaded
+      // transcript cannot replay duplicated thinking — reasoning is rendered
+      // live only, and both render paths run the same compaction.)
+      ...(m.reasoning
+        ? { reasoning: collapseDuplicateReasoning(m.reasoning) }
+        : {}),
       tool_calls: m.toolCalls ?? undefined,
     }));
 }

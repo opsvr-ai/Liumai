@@ -118,9 +118,13 @@ function orderTools(messages: DisplayMessage[]): DisplayMessage[] {
     index,
     seq: toolSeq(message),
   }));
-  if (indexed.every((entry) => entry.seq !== null)) {
-    indexed.sort((a, b) => (a.seq as number) - (b.seq as number) || a.index - b.index);
-  }
+  // ``hermes_seq`` is assigned on first appearance for every live row and
+  // back-filled for restored rows.  Sorting even when a single legacy row lacks
+  // it keeps the group in first-seen order instead of turning into a no-op.
+  indexed.sort(
+    (a, b) =>
+      (a.seq ?? a.index) - (b.seq ?? b.index) || a.index - b.index,
+  );
   return indexed.map((entry) => entry.message);
 }
 
@@ -188,8 +192,10 @@ const ToolRow: FC<{ message: DisplayMessage; isLast: boolean }> = ({
       : state === "error"
         ? "text-status-active"
         : "text-status-resolved";
-  const resultText = error || result;
+  const resultText =
+    error || result || (state === "done" ? "执行成功" : "");
   const resultLabel = state === "error" ? "失败" : "结果";
+  const callId = tool?.id ?? "";
 
   return (
     <div
@@ -198,6 +204,7 @@ const ToolRow: FC<{ message: DisplayMessage; isLast: boolean }> = ({
       data-tool-name={name}
       data-tool-status={state}
       data-tool-seq={tool?.hermes_seq ?? ""}
+      data-tool-call-id={callId}
     >
       {!isLast && (
         <span

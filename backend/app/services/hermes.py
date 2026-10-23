@@ -13,6 +13,7 @@ to a browser client via Server-Sent Events.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -749,6 +750,15 @@ class HermesClient:
                             # suffix is forwarded.
                             fresh_reasoning = reasoning_deduper.feed(reasoning)
                             if fresh_reasoning:
+                                # Adjacent duplicate lines/paragraphs inside one
+                                # snapshot are dropped before they leave the
+                                # server, so the legacy /chat/stream path gets
+                                # the same guard as the Runs path (whose
+                                # normaliser is handled client-side).
+                                fresh_reasoning = _collapse_duplicate_reasoning(
+                                    fresh_reasoning
+                                )
+                            if fresh_reasoning:
                                 yield {
                                     "type": "reasoning",
                                     "content": fresh_reasoning,
@@ -1292,6 +1302,59 @@ def _normalize_approval_choice(decision: str) -> str:
     return aliases.get(value, value)
 
 
+def _hermes_progress_result(
+    chunk: dict[str, Any], *, completed: bool, failed: bool
+) -> str:
+    """One-line result summary for a legacy ``hermes.tool.progress`` frame.
+
+    The Chat Completions bridge only emits ``tool``/``label``/``status`` on the
+    start frame; result detail is adapter-dependent.  Prefer an explicit
+    ``preview``/``result``, then assemble ``exit_code`` / stdout / stderr /
+    error fields, and finally fall back to a status sentence so a completed
+    card never shows an empty result.
+    """
+    if not completed:
+        return ""
+    preview = chunk.get("preview")
+    if isinstance(preview, str) and preview.strip():
+        return preview.strip()
+
+    parts: list[str] = []
+    exit_code = chunk.get("exit_code", chunk.get("exitCode"))
+    if isinstance(exit_code, (int, float)) or (
+        isinstance(exit_code, str) and exit_code.strip()
+    ):
+        parts.append(f"exit_code={str(exit_code).strip()}")
+    for key, label in (
+        ("stdout_bytes", "stdout"),
+        ("stdoutBytes", "stdout"),
+        ("stderr_bytes", "stderr"),
+        ("stderrBytes", "stderr"),
+    ):
+        value = chunk.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            parts.append(f"{label} {int(value)} B")
+            break
+    error = chunk.get("error")
+    if isinstance(error, str) and error.strip():
+        parts.append(error.strip())
+    elif failed:
+        parts.append("执行失败")
+    if not parts:
+        parts.append("执行成功" if not failed else "执行失败")
+    return " · ".join(parts)
+
+
+def _hermes_progress_duration_ms(chunk: dict[str, Any]) -> int | None:
+    """Convert a progress frame's ``duration`` (seconds) to milliseconds."""
+    seconds = chunk.get("duration")
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return None
+    if seconds < 0:
+        return None
+    return int(round(float(seconds) * 1000))
+
+
 def _parse_hermes_tool_progress(
     chunk: dict[str, Any],
     _tool_buf: dict[int, dict[str, Any]],
@@ -1309,27 +1372,62 @@ def _parse_hermes_tool_progress(
         }
 
     We normalise this into the same ``tool_call`` envelope the frontend
-    already understands, adding ``emoji`` and ``label`` for richer display.
+    already understands, adding ``emoji``, ``label``, result / error /
+    duration fields for richer display.
+
+    ``toolCallId`` is optional on this legacy bridge.  It is forwarded exactly
+    as received (empty when absent) and **never** replaced by the tool name:
+    the UI synthesises a per-arrival identity, otherwise every ``terminal``
+    call of a turn would collapse into one card.
     """
-    tool_name: str = chunk.get("tool", "unknown")
-    tool_call_id: str = chunk.get("toolCallId", "")
-    status: str = chunk.get("status", "running")
+    tool_name: str = str(chunk.get("tool") or chunk.get("tool_name") or "unknown")
+    raw_call_id = chunk.get("toolCallId")
+    if not raw_call_id:
+        raw_call_id = chunk.get("tool_call_id")
+    tool_call_id: str = str(raw_call_id) if raw_call_id else ""
+    status: str = str(chunk.get("status") or "running")
+    status_key = status.strip().lower()
+    completed = status_key in {
+        "completed",
+        "complete",
+        "done",
+        "success",
+        "succeeded",
+        "failed",
+        "error",
+        "failure",
+    }
+    failed = status_key in {"failed", "error", "failure"} or bool(chunk.get("error"))
     emoji: str | None = chunk.get("emoji")  # None → frontend preserves previous emoji
-    label: str = chunk.get("label", "")
+    label: str = str(chunk.get("label") or "")
 
     tool_call = {
         "id": tool_call_id,
         "function": {
             "name": tool_name,
-            "arguments": label,  # repurpose: Hermes puts description here
+            # ``label`` is the parameter summary while running.  On completion
+            # it may describe the result, so it must not overwrite parameters.
+            "arguments": "" if completed else label,
         },
     }
 
+    result = _hermes_progress_result(chunk, completed=completed, failed=failed)
+    duration_ms = _hermes_progress_duration_ms(chunk)
+    error_text = ""
+    if failed:
+        raw_error = chunk.get("error")
+        error_text = (
+            raw_error.strip()
+            if isinstance(raw_error, str) and raw_error.strip()
+            else str(chunk.get("message") or "执行失败")
+        )
+
     logger.info(
-        "Hermes SSE → tool progress: tool={} status={} label={!r}",
+        "Hermes SSE → tool progress: tool={} status={} label={!r} id={!r}",
         tool_name,
         status,
         label,
+        tool_call_id,
     )
 
     return {
@@ -1341,8 +1439,11 @@ def _parse_hermes_tool_progress(
         "error": None,
         # Hermes-specific fields forwarded to the frontend
         "hermes_emoji": emoji,
-        "hermes_label": label,
+        "hermes_label": "" if completed else label,
         "hermes_status": status,
+        **({"hermes_result": result} if result else {}),
+        **({"hermes_error": error_text} if error_text else {}),
+        **({"hermes_duration_ms": duration_ms} if duration_ms is not None else {}),
     }
 
 
@@ -1518,6 +1619,70 @@ def _dedupe_reasoning(accumulated: str, chunk: str) -> str:
             return "" if size == len(chunk) else chunk[size:]
 
     return chunk
+
+
+def _collapse_duplicate_reasoning(text: str) -> str:
+    """Remove *adjacent* duplicate lines / paragraphs from reasoning text.
+
+    Mirrors the frontend ``collapseDuplicateReasoning`` so both transports
+    (Runs SSE and legacy ``/chat/stream``) apply the same guard.  Only adjacent
+    repeats are removed: a model legitimately returning to an earlier idea
+    stays intact, while a whole-block replay that arrived inside one snapshot
+    no longer renders twice.
+    """
+    if not text:
+        return ""
+    source = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    def collapse_lines(block: str) -> str:
+        kept: list[str] = []
+        previous = ""
+        for line in block.split("\n"):
+            key = line.strip()
+            if not key:
+                if not kept or kept[-1] == "":
+                    continue
+                kept.append("")
+                previous = ""
+                continue
+            if previous == key:
+                continue
+            kept.append(line.rstrip(" \t"))
+            previous = key
+        while kept and kept[0] == "":
+            kept.pop(0)
+        while kept and kept[-1] == "":
+            kept.pop()
+        return "\n".join(kept)
+
+    paragraphs: list[str] = []
+    for raw in re.split(r"\n[ \t]*\n+", source):
+        block = collapse_lines(raw)
+        if not block.strip():
+            continue
+        if paragraphs and paragraphs[-1] == block:
+            continue
+        paragraphs.append(block)
+
+    result = "\n\n".join(paragraphs)
+    # A whole block replayed without a blank line ("A\nB\nA\nB") is only
+    # collapsed when the text is exactly one block repeated twice on a line
+    # boundary, matching the frontend rule.
+    while len(result) >= 3:
+        even = len(result) % 2 == 0
+        half = len(result) // 2 if even else (len(result) - 1) // 2
+        if half <= 0:
+            break
+        if not even and result[half] != "\n":
+            break
+        first = result[:half]
+        second = result[half if even else half + 1 :]
+        if "\n" not in first:
+            break
+        if first.rstrip() != second.lstrip():
+            break
+        result = first.rstrip()
+    return result
 
 
 class _ReasoningDeduper:

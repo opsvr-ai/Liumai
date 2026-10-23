@@ -509,11 +509,14 @@ async def chat_stream_endpoint(
                         event_type = "tool_call"
                         raw_calls = event.get("tool_calls") or [
                             {
+                                # Never use the tool name as a call identity:
+                                # an empty id lets the UI synthesise a unique
+                                # per-frame key instead of collapsing every
+                                # same-name call into one card.
                                 "id": (
                                     event.get("tool_call_id")
                                     or event.get("toolCallId")
-                                    or event.get("tool")
-                                    or "tool"
+                                    or ""
                                 ),
                                 "function": {
                                     "name": event.get("tool") or "tool",
@@ -525,7 +528,14 @@ async def chat_stream_endpoint(
                             }
                         ]
                         for tc in raw_calls:
-                            for key in ("hermes_emoji", "hermes_label", "hermes_status"):
+                            for key in (
+                                "hermes_emoji",
+                                "hermes_label",
+                                "hermes_status",
+                                "hermes_result",
+                                "hermes_error",
+                                "hermes_duration_ms",
+                            ):
                                 if key in event and key not in tc:
                                     tc[key] = event[key]
                         payload["type"] = "tool_call"
@@ -540,7 +550,14 @@ async def chat_stream_endpoint(
                 elif event_type == "tool_call":
                     raw_calls = event.get("tool_calls", [])
                     for tc in raw_calls:
-                        for key in ("hermes_emoji", "hermes_label", "hermes_status"):
+                        for key in (
+                            "hermes_emoji",
+                            "hermes_label",
+                            "hermes_status",
+                            "hermes_result",
+                            "hermes_error",
+                            "hermes_duration_ms",
+                        ):
                             if key in event and key not in tc:
                                 tc[key] = event[key]
                     payload["tool_calls"] = raw_calls
