@@ -23,7 +23,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import type { DisplayMessage } from "@/hooks/useChat";
-import { dedupeReasoningChunk } from "@/lib/api";
+import { collapseDuplicateReasoning, dedupeReasoningChunk } from "@/lib/api";
 import { LiumaiLogo } from "@/components/liumai-logo";
 import { cn } from "@/lib/utils";
 import { clockTime, copyText, fullTime } from "./chat-utils";
@@ -74,7 +74,11 @@ function useThrottledValue(
     [],
   );
 
-  return throttled;
+  // Force-flush once streaming ends: any delta still sitting in the throttle
+  // timer/state must be rendered on the same pass that shows the final answer.
+  // (Reading ``value`` directly also covers the terminal reconciliation, which
+  // can replace the body after the last delta.)
+  return streaming ? throttled : value;
 }
 
 /* ==========================================================================
@@ -307,15 +311,23 @@ const AssistantTurn: FC<AssistantTurnProps> = ({
   // Merge reasoning across the turn's assistant bubbles.  A whole-block
   // snapshot may be stored on a later bubble while earlier bubbles already
   // hold the same text; keeping only the unseen suffix stops the block from
-  // being rendered twice.
-  const reasoning = assistantMessages.reduce((merged, message) => {
-    const block = message.reasoning?.trim() ?? "";
-    if (!block) return merged;
-    const fresh = dedupeReasoningChunk(merged, block);
-    if (!fresh) return merged;
-    if (!merged) return fresh;
-    return fresh === block ? `${merged}\n\n${fresh}` : `${merged}${fresh}`;
-  }, "");
+  // being rendered twice.  A final adjacent-duplicate pass covers replays that
+  // arrived *inside* a single block, which chunk-level de-duplication cannot
+  // see (e.g. the same sentence twice in one ``reasoning.available`` snapshot).
+  const reasoning = useMemo(
+    () =>
+      collapseDuplicateReasoning(
+        assistantMessages.reduce((merged, message) => {
+          const block = message.reasoning?.trim() ?? "";
+          if (!block) return merged;
+          const fresh = dedupeReasoningChunk(merged, block);
+          if (!fresh) return merged;
+          if (!merged) return fresh;
+          return fresh === block ? `${merged}\n\n${fresh}` : `${merged}${fresh}`;
+        }, ""),
+      ),
+    [assistantMessages],
+  );
   const content = assistantMessages
     .map((message) => message.content)
     .filter(Boolean)
@@ -538,6 +550,21 @@ export const MessageList: FC<MessageListProps> = ({
   const turns = useMemo(() => buildTurns(messages, hiddenIds), [messages, hiddenIds]);
   const pendingAssistant =
     isStreaming && (turns.length === 0 || turns[turns.length - 1].kind === "user");
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  // Terminal reconciliation can enlarge the final answer after the last
+  // streamed frame; follow it down so the complete answer is actually visible.
+  useEffect(() => {
+    const handler = () => {
+      const viewport = rootRef.current?.closest<HTMLElement>(".chat-thin-scroll");
+      if (!viewport) return;
+      requestAnimationFrame(() => {
+        viewport.scrollTop = viewport.scrollHeight;
+      });
+    };
+    window.addEventListener("chat:scroll-bottom", handler);
+    return () => window.removeEventListener("chat:scroll-bottom", handler);
+  }, []);
 
   // UI-only timestamp map: restored messages use numeric DB ids and therefore
   // stay without a clock (their original time is not part of DisplayMessage).
@@ -553,7 +580,7 @@ export const MessageList: FC<MessageListProps> = ({
   }, []);
 
   return (
-    <div className="flex flex-col gap-6 py-2 sm:gap-7">
+    <div ref={rootRef} className="flex flex-col gap-6 py-2 sm:gap-7">
       {turns.map((turn, index) =>
         turn.kind === "user" ? (
           <UserMessage

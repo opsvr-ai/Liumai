@@ -8,6 +8,7 @@
 
 import { useEffect, useRef, useState, type FC } from "react";
 import { ChevronDown } from "lucide-react";
+import { collapseDuplicateReasoning } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 export interface ReasoningBlockProps {
@@ -32,9 +33,15 @@ export const ReasoningBlock: FC<ReasoningBlockProps> = ({
     setOpen(active);
   }, [active]);
 
-  if (!text.trim()) return null;
+  // Adjacent duplicate lines / paragraphs (whole-block replays) are collapsed
+  // before rendering, so reasoning can never show the same thought twice even
+  // when the source snapshot contained it twice.  Idempotent, so applying it
+  // again after the message-list merge is harmless.
+  const display = collapseDuplicateReasoning(text);
 
-  const chars = [...text.trim()].length;
+  if (!display.trim()) return null;
+
+  const chars = [...display.trim()].length;
 
   return (
     <div className="min-w-0">
@@ -77,7 +84,7 @@ export const ReasoningBlock: FC<ReasoningBlockProps> = ({
       {open && (
         <div className="relative mt-1.5">
           <div className="chat-thin-scroll max-h-64 overflow-y-auto whitespace-pre-wrap break-words border-l-2 border-border/70 pl-3 pr-1 text-[12.5px] leading-[1.75] text-text-secondary/85 select-text">
-            {text}
+            {display}
             {active && <span className="lm-chat-caret ml-0.5" aria-hidden="true" />}
           </div>
           {active && (

@@ -529,10 +529,17 @@ export type ChatStreamEvent =
       usage?: { prompt_tokens: number; completion_tokens: number };
       /** Present when the turn ended abnormally (context overflow, provider error…). */
       error?: string;
+      /**
+       * Authoritative final answer carried by a Runs-API ``run.completed``
+       * frame.  Used as the terminal-reconciliation fallback when the follow-up
+       * ``GET /runs/{id}`` cannot be reached; ordinary ``/chat/stream`` turns
+       * do not set it.
+       */
+      output?: string;
       /** Raw Hermes diagnostics attached to the finish chunk. */
       hermes?: unknown;
     }
-  | { type: "error"; error: string };
+  | { type: "error"; error: string; output?: string };
 
 /* ── One-turn image staging (A3) ─────────────────── */
 
@@ -1145,6 +1152,82 @@ export function dedupeReasoningChunk(
 }
 
 /**
+ * Collapse adjacent duplicate lines and paragraphs in reasoning text.
+ *
+ * Reasoning is occasionally delivered as a *whole block replay* — the same
+ * sentence / paragraph is present twice back to back inside one snapshot (two
+ * SSE sources, a reconnect, or a provider that repeats the previous block).
+ * The chunk-level {@link dedupeReasoningChunk} guard only compares a chunk with
+ * the text that came before it, so a duplicate *inside* one block slipped
+ * through and the UI showed the same thought twice.
+ *
+ * The rule is deliberately narrow: only **adjacent** identical lines and
+ * adjacent identical paragraphs (including blank-line separated replays) are
+ * removed.  Non-adjacent repetitions — a model legitimately returning to an
+ * earlier idea — are preserved, and the original line text (indentation,
+ * punctuation) is kept for everything that survives.
+ */
+export function collapseDuplicateReasoning(text: string): string {
+  if (!text) return "";
+  const source = text.replace(/\r\n?/g, "\n");
+
+  // Within one paragraph: drop a line identical to the line right before it.
+  const collapseLines = (block: string): string => {
+    const kept: string[] = [];
+    let previous = "";
+    for (const line of block.split("\n")) {
+      const key = line.trim();
+      if (key === "") {
+        // A run of blank lines is never meaningful content — keep at most one.
+        if (kept.length === 0 || kept[kept.length - 1] === "") continue;
+        kept.push("");
+        previous = "";
+        continue;
+      }
+      if (previous === key) continue;
+      kept.push(line.replace(/[ \t]+$/g, ""));
+      previous = key;
+    }
+    while (kept.length > 0 && kept[0] === "") kept.shift();
+    while (kept.length > 0 && kept[kept.length - 1] === "") kept.pop();
+    return kept.join("\n");
+  };
+
+  // Paragraphs first: a replayed whole snapshot (or several paragraphs) is
+  // separated by blank lines and collapses as a unit.
+  const paragraphs: string[] = [];
+  for (const raw of source.split(/\n[ \t]*\n+/)) {
+    const block = collapseLines(raw);
+    if (!block.trim()) continue;
+    if (paragraphs.length > 0 && paragraphs[paragraphs.length - 1] === block) {
+      continue;
+    }
+    paragraphs.push(block);
+  }
+
+  let result = paragraphs.join("\n\n");
+
+  // A whole block replayed without a blank-line separator ("A\nB\nA\nB") is
+  // only collapsed when the text is exactly one block repeated twice on a line
+  // boundary (optionally joined by a single newline).  Anything less
+  // deterministic is left untouched, so genuinely repeated content survives.
+  for (;;) {
+    if (result.length < 3) break;
+    const even = result.length % 2 === 0;
+    const half = even ? result.length / 2 : (result.length - 1) / 2;
+    if (half <= 0) break;
+    if (!even && result[half] !== "\n") break;
+    const first = result.slice(0, half);
+    const second = result.slice(even ? half : half + 1);
+    if (!first.includes("\n")) break;
+    if (first.trimEnd() !== second.trimStart()) break;
+    result = first.trimEnd();
+  }
+
+  return result;
+}
+
+/**
  * Stateful reasoning de-duplicator for one chat turn.
  *
  * ``dedupeReasoningChunk`` compares one incoming block with the text already
@@ -1172,6 +1255,23 @@ export class ReasoningDeduper {
   /** Forget the accumulated text (new turn / stop / session switch). */
   reset(): void {
     this.seen = "";
+    this.probe = null;
+  }
+
+  /**
+   * Collapse adjacent duplicate lines/paragraphs in the accepted text.
+   *
+   * Called after {@link feed} so the accumulator matches what the UI renders
+   * (and what would be persisted): a duplicate that arrived inside one block is
+   * removed from the comparison baseline too, otherwise a later replay would be
+   * compared against invisible text.
+   */
+  compact(): void {
+    if (!this.seen) return;
+    const compacted = collapseDuplicateReasoning(this.seen);
+    if (compacted === this.seen) return;
+    this.seen = compacted;
+    // Any buffered replay probe belonged to the pre-compaction text.
     this.probe = null;
   }
 
@@ -1238,6 +1338,18 @@ function _runUsage(
   const prompt = Number(usage.input_tokens ?? usage.prompt_tokens ?? 0) || 0;
   const completion = Number(usage.output_tokens ?? usage.completion_tokens ?? 0) || 0;
   return { prompt_tokens: prompt, completion_tokens: completion };
+}
+
+/**
+ * Normalise a Runs-API ``usage`` payload for the chat UI.
+ *
+ * Exposed for terminal reconciliation (``GET /runs/{id}``), which receives the
+ * raw Hermes shape rather than the already-normalised stream event.
+ */
+export function chatRunUsage(
+  raw: unknown,
+): { prompt_tokens: number; completion_tokens: number } | undefined {
+  return _runUsage(raw);
 }
 
 /**
@@ -1393,12 +1505,24 @@ function _normalizeRunEvent(raw: Record<string, unknown>): ChatRunEvent | null {
       };
     }
     case "run.completed":
-      return { type: "done", finish_reason: "stop", usage: _runUsage(raw.usage) };
+      return {
+        type: "done",
+        finish_reason: "stop",
+        usage: _runUsage(raw.usage),
+        // Carry the authoritative final answer: the terminal reconciliation
+        // prefers GET /runs/{id}, but this frame already holds the full output
+        // even if the follow-up request fails.
+        output: _runStr(raw.output) || undefined,
+      };
     case "run.cancelled":
     case "run.interrupted":
       return { type: "done", finish_reason: "cancelled" };
     case "run.failed":
-      return { type: "error", error: _runStr(raw.error) || "运行失败" };
+      return {
+        type: "error",
+        error: _runStr(raw.error) || "运行失败",
+        output: _runStr(raw.output) || undefined,
+      };
     case "error":
       return {
         type: "error",

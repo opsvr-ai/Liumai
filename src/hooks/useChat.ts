@@ -18,6 +18,7 @@ import {
   chatHistory,
   chatRuns,
   chatRunEvents,
+  chatRunUsage,
   chatStream,
   ReasoningDeduper,
   type ChatApprovalRequest,
@@ -421,6 +422,11 @@ export function useChat() {
       (reasoningDeduperRef.current = new ReasoningDeduper());
     const fresh = deduper.feed(content);
     if (!fresh) return;
+    // Adjacent duplicates can arrive *inside* one block (two sources, a replay
+    // split across chunks).  Compact before writing state so the visible text
+    // and the saved transcript never carry them; the deduper baseline is
+    // compacted too, keeping later replay detection accurate.
+    deduper.compact();
     const next = deduper.text;
     setMessages((prev) => {
       const resumeId = resumeAssistantIdRef.current;
@@ -1126,7 +1132,79 @@ export function useChat() {
         }
       };
 
-      /** Runs path: create → subscribe → (resume on drop). */
+      /**
+       * Authoritative terminal reconciliation for a Runs-API turn.
+       *
+       * The SSE stream is a best-effort *view*: Hermes may deliver fewer
+       * ``message.delta`` frames than its final answer (observed with long
+       * agent turns), and a dropped subscription can truncate the tail while
+       * the run itself completed.  Once the stream reaches a terminal event —
+       * or simply closes — ask ``GET /runs/{id}`` for the server's own
+       * ``status`` / ``output`` / ``usage`` and treat that as the truth:
+       *
+       * - output longer than the rendered assistant text (or rendered text
+       *   still empty) replaces that body in place, keeping reasoning separate;
+       * - a failed / cancelled / interrupted run surfaces an error even when
+       *   the stream closed without one;
+       * - the reconciled transcript is persisted immediately.
+       *
+       * On failure the current transcript is left untouched (the stream path
+       * never depended on this call).
+       */
+      const reconcileRun = async (runId: string, fallbackOutput = "") => {
+        if (stoppedRef.current || turnTokenRef.current !== turnToken) return;
+
+        let state: Awaited<ReturnType<typeof chatRuns.status>> | null = null;
+        try {
+          state = await chatRuns.status(runId);
+        } catch (err) {
+          // Keep whatever the stream produced; the done frame's output (when
+          // present) is still applied as a fallback below.
+          console.warn("[useChat] 终态对账失败，保留流式内容", err);
+        }
+        if (stoppedRef.current || turnTokenRef.current !== turnToken) return;
+        if (runIdRef.current && runIdRef.current !== runId) return;
+
+        const statusText = state
+          ? String(state.status || "").toUpperCase()
+          : "UNAVAILABLE";
+        const serverOutput =
+          typeof state?.output === "string" ? state.output : "";
+        const output = serverOutput || fallbackOutput;
+        const usage = chatRunUsage(state?.usage);
+        const result = _mergeAuthoritativeRunOutput(messagesRef.current, output, usage);
+
+        console.info("[chat] reconciled", {
+          runId,
+          status: statusText,
+          outLen: output.trim().length,
+          curLen: result.currentLength,
+        });
+
+        if (result.messages !== messagesRef.current) {
+          messagesRef.current = result.messages;
+          setMessages(result.messages);
+          if (result.replaced) {
+            // The final answer arrived after the transcript was already drawn:
+            // follow it down so the complete answer is visible without a
+            // manual scroll.
+            window.dispatchEvent(new CustomEvent("chat:scroll-bottom"));
+          }
+          // Persist the authoritative body now instead of waiting for the
+          // post-turn autosave (which may race with this update).
+          saveStreamingSnapshot(true);
+        }
+
+        if (statusText === "FAILED") {
+          setError(state?.error || "任务执行失败");
+        } else if (statusText === "CANCELLED") {
+          setError("任务已取消");
+        } else if (statusText === "INTERRUPTED") {
+          setError("任务已中断");
+        }
+      };
+
+      /** Runs path: create → subscribe → resume on drop → reconcile. */
       const streamViaRuns = async () => {
         // Without a reusable Hermes session the agent has no context, so replay
         // the prior turns (the newest message travels as ``input``).
@@ -1163,6 +1241,8 @@ export function useChat() {
 
         let lastSeq: number | null = null;
         let attempt = 0;
+        /** Authoritative answer carried by a terminal frame (GET fallback). */
+        let terminalOutput = "";
         while (true) {
           try {
             for await (const event of chatRunEvents(created.run_id, {
@@ -1170,9 +1250,14 @@ export function useChat() {
               lastEventId: lastSeq,
             })) {
               if (typeof event.seq === "number") lastSeq = event.seq;
+              if (event.type === "done" || event.type === "error") {
+                if (event.output) terminalOutput = event.output;
+              }
               applyEvent(event);
             }
-            return; // stream closed (terminal run event received)
+            // Stream closed (terminal run event received, or the subscription
+            // ended).  Fall through to the authoritative reconciliation.
+            break;
           } catch (err) {
             if (controller.signal.aborted || stoppedRef.current) throw err;
             attempt += 1;
@@ -1185,6 +1270,10 @@ export function useChat() {
             );
           }
         }
+
+        // The stream is only a preview: the run's own terminal state decides
+        // what the transcript shows and what gets saved.
+        await reconcileRun(created.run_id, terminalOutput);
       };
 
       try {
@@ -1873,6 +1962,77 @@ function _titleForMessages(messages: DisplayMessage[]): string {
   if (!firstUser) return "新对话";
   const { content } = firstUser;
   return content.slice(0, 40) + (content.length > 40 ? "…" : "");
+}
+
+/**
+ * Apply the server's authoritative run result to the live transcript.
+ *
+ * The Runs API is the source of truth: its ``output`` is the complete final
+ * answer even when the SSE preview delivered fewer ``message.delta`` frames.
+ * The last assistant bubble of the current turn is replaced in place when the
+ * server output is longer (or when nothing was rendered yet); reasoning and
+ * tool rows are preserved, and server usage is attached to the same bubble.
+ *
+ * Returns the original array when nothing changed so callers can skip a
+ * re-render / save.
+ */
+function _mergeAuthoritativeRunOutput(
+  messages: DisplayMessage[],
+  output: string,
+  usage?: { prompt_tokens: number; completion_tokens: number },
+): {
+  messages: DisplayMessage[];
+  replaced: boolean;
+  /** Length of the assistant body before reconciliation (for diagnostics). */
+  currentLength: number;
+} {
+  const text = output.trim();
+  let index = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i].role === "assistant") {
+      index = i;
+      break;
+    }
+  }
+
+  if (index === -1) {
+    if (!text && !usage) {
+      return { messages, replaced: false, currentLength: 0 };
+    }
+    return {
+      messages: [
+        ...messages,
+        {
+          id: uid(),
+          role: "assistant",
+          content: text,
+          ...(usage ? { usage } : {}),
+          isStreaming: false,
+        },
+      ],
+      replaced: Boolean(text),
+      currentLength: 0,
+    };
+  }
+
+  const target = messages[index];
+  const current = target.content ?? "";
+  // "More complete" is deliberately mechanical: empty → always take the
+  // server text; otherwise only a strictly longer output wins.  Equal content
+  // is already complete and a shorter server snapshot must not truncate it.
+  const replace = text.length > 0 && (current.length === 0 || text.length > current.length);
+  if (!replace && !usage) {
+    return { messages, replaced: false, currentLength: current.length };
+  }
+
+  const next = [...messages];
+  next[index] = {
+    ...target,
+    ...(replace ? { content: text } : {}),
+    ...(usage ? { usage } : {}),
+    isStreaming: false,
+  };
+  return { messages: next, replaced: replace, currentLength: current.length };
 }
 
 /**

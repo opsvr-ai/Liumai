@@ -820,10 +820,23 @@ async def get_chat_run(
     if not hermes.base_url:
         raise HTTPException(status_code=503, detail="Hermes 未配置")
     try:
-        return await hermes.get_run(run_id)
+        status = await hermes.get_run(run_id)
     except HermesRunError as exc:
         _raise_for_run_error(exc)
         raise  # unreachable — keeps type-checkers happy
+
+    # Terminal reconciliation on the client consumes ``status`` / ``output`` /
+    # ``usage`` verbatim: this endpoint must never project or truncate the
+    # payload (``output`` is the authoritative final answer when the SSE preview
+    # was incomplete).  Log its size to make that visible in production.
+    raw_output = status.get("output")
+    logger.debug(
+        "Chat run status: run_id={} status={} output_chars={}",
+        run_id,
+        status.get("status"),
+        len(raw_output) if isinstance(raw_output, str) else 0,
+    )
+    return status
 
 
 @router.get(
