@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- **智能对话：助手正文重复输出两遍** — Hermes Runs API 的 `message.interim` 投递的是整条中途消息的完整文本（同一文本此前已按 `message.delta` 逐 token 到达），前端把两者都当增量追加。`message.interim` 现在按整块快照合并（`_mergeAssistantChunk`），并在回合终态前裁剪完全重复的整块尾部；`COMPLETED` 的 run 以服务端 `output` 为准覆盖正文。
+- **智能对话：刷新 / 切换导航页返回后不再继续输出** — 返回时若 run 的 `seq` 游标丢失（刷新会中断落盘请求），此前只能走 `run-state` 轮询并等 `COMPLETED` 才一次性补全。现在只要在 Hermes 5 分钟重放窗口内就优先重订阅 SSE（无游标时从头吸收重放，不重复已显示文本），轮询兜底也会在 RUNNING 阶段刷新进度，间隔由 3s 缩短到 1.5s。
+
 ## [0.4.0] — 2026-07-21
 
 ### Added

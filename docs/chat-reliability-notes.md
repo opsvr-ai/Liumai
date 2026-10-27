@@ -138,3 +138,31 @@ SELECT column_name, data_type, character_maximum_length
   `/chat/stream`；此时会改为**全量历史重放**（不会只发最新一条），保证上下文不丢。
 - 直连 LLM 模式（`provider: "llm"`）没有服务端 agent 上下文，即使会话记录了
   Hermes session 也仍走全量历史重放，避免模式切换后上下文缺失。
+
+## 6. 二次修复：正文重复两遍 / 切页返回不再输出（2026-10-27）
+
+### 6.1 根因
+
+| 现象 | 根因 |
+| --- | --- |
+| 每条助手正文出现两遍 | Hermes Runs API 对**同一条**中途说明会投递两种事件：`message.delta`（逐 token 增量）与 `message.interim`（整条消息的**完整文本**）。`normalizeRunEvent` 把两者都归一成 `{type:"delta"}`，`appendToAssistant` 无条件 `current + chunk` 追加 → 整句渲染两次。思考过程早前有 `ReasoningDeduper` 去重，正文这一路一直没有对应保护。 |
+| 重复内容无法被终态纠正 | `_mergeAuthoritativeRunOutput` 只在「服务端 output **更长**」时替换；本地因重复而更长的文本反而被保留。`_withRunOutput` 在内容不一致时**追加**一条新消息。 |
+| 刷新 / 切页返回后不再继续输出 | 返回时若 localStorage 里没有该 run 的 `seq` 游标（刷新会中断写请求），`reattachRun` 直接走 `run-state` 轮询；而 Hermes 在 RUNNING 阶段 `output` 通常为空，轮询要等 `COMPLETED` 才一次性补全 → 界面上表现为「卡住、不继续输出」。 |
+
+### 6.2 改动
+
+- `src/lib/api.ts`：`ChatStreamEvent` 的 `delta` 增加 `snapshot?: boolean`；`message.interim` 归一为 `{type:"delta", snapshot:true}`（整块快照语义）。
+- `src/hooks/useChat.ts`
+  - 新增 `_mergeAssistantChunk`：快照延长正文则替换、已包含则丢弃、否则只追加未见面后缀；普通增量照常追加，仅「≥10 字符且与尾部完全重复」的重放帧被丢弃。
+  - 新增 `replayRef` + `beginReplayFromStart`：无游标重订阅 SSE 时，先用恢复出的气泡文本作 baseline 吸收重放，追上后再恢复正常追加（15s 未追上则放弃，交给终态对账）。
+  - `reattachRun`：**只要在 Hermes 5 分钟重放窗口内就优先 SSE 续订**（无游标时从头发起并吸收），SSE 失败仍回落轮询。
+  - `pollRunState`：RUNNING/QUEUED 阶段把 `run-state.output` 以「替换」方式刷进气泡，轮询间隔 3s → 1.5s。
+  - `_mergeAuthoritativeRunOutput(…, authoritative)`：`COMPLETED` 的 run 无条件采用服务端 `output`（即使更短），据此清掉重复正文。
+  - `collapseDoubledTail`：回合终态前，仅裁剪**完全重复的整块尾部**（≥20 字符），正常重复措辞不受影响。
+  - `_withRunOutput`：恢复的正文已包含服务端 output 时原地替换，不再追加第二条。
+
+### 6.3 验收
+
+1. 发一条会触发工具调用的 agent 消息：中途说明只出现一次，最终回答只出现一次。
+2. 流式期间切到其它导航页再返回：气泡原地继续增长（SSE 续订），或每 1.5s 刷新一次（轮询兜底）；结束后内容与 Hermes `output` 完全一致。
+3. 流式期间刷新页面：恢复历史后继续补全，且**不重复**已显示的文本。

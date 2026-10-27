@@ -108,8 +108,12 @@ const RUN_RECONNECT_ATTEMPTS = 2;
  */
 const RUN_EVENT_REPLAY_TTL_MS = 5 * 60 * 1000;
 
-/** Poll cadence for ``GET /sessions/{id}/run-state`` after a page return. */
-const RUN_STATE_POLL_MS = 3000;
+/**
+ * Poll cadence for ``GET /sessions/{id}/run-state`` after a page return.  Kept
+ * short so the answer visibly keeps growing when the SSE resume is unavailable
+ * (Hermes' replay window expired, or the run finished while we were away).
+ */
+const RUN_STATE_POLL_MS = 1500;
 
 /** Stop polling an unreachable run after ~2 minutes (40 × 3s). */
 const RUN_STATE_MAX_UNKNOWN_POLLS = 40;
@@ -267,6 +271,19 @@ export function useChat() {
   const reattachTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Token identifying the current turn; stale turns must not settle state. */
   const turnTokenRef = useRef(0);
+  /**
+   * Replay guard for a reattached run whose event stream is resubscribed from
+   * the beginning (no saved seq cursor).  ``baseline`` is the text the restored
+   * bubble already shows and ``acc`` accumulates the replayed chunks until they
+   * catch up — without it the replay appended the whole answer a second time.
+   * Kept in a ref and updated *outside* ``setMessages``: StrictMode
+   * double-invokes state updaters in development, which would double ``acc``.
+   */
+  const replayRef = useRef<{
+    baseline: string;
+    acc: string;
+    startedAt: number;
+  } | null>(null);
 
   /** Merge newly probed capabilities (called by the chat panel on mount). */
   const configureRunCapabilities = useCallback(
@@ -368,41 +385,111 @@ export function useChat() {
     setMessages(next);
   }, []);
 
-  /** Append a text chunk to the current assistant bubble (or create one). */
-  const appendToAssistant = useCallback((content: string) => {
+  /**
+   * Append a text chunk to the current assistant bubble (or create one).
+   *
+   * ``snapshot`` marks a whole-block payload (Hermes ``message.interim``) that
+   * repeats text already streamed as ``message.delta``; merging rules live in
+   * {@link _mergeAssistantChunk}, so the same sentence is never rendered twice.
+   */
+  const appendToAssistant = useCallback((content: string, snapshot = false) => {
+    if (!content) return;
+
+    // Replay guard for a run resubscribed from seq 0: the replayed chunks
+    // repeat what the restored bubble already shows, so hold them until they
+    // catch up and then continue with plain appends.  Computed outside the
+    // state updater because the accumulator is mutable (StrictMode).
+    let replayed: string | null = null;
+    const replay = replayRef.current;
+    if (replay) {
+      replay.acc += content;
+      const caughtUp = replay.acc.length > replay.baseline.length;
+      if (!caughtUp) {
+        // Still inside the replayed prefix.  Give up when the replay is clearly
+        // truncated (Hermes only keeps ~5 min): guessing would duplicate text,
+        // so the terminal reconciliation applies the server output instead.
+        if (Date.now() - replay.startedAt <= REPLAY_CATCHUP_MAX_MS) return;
+        replayRef.current = null;
+        return;
+      }
+      replayRef.current = null;
+      replayed = replay.acc.startsWith(replay.baseline)
+        ? replay.acc
+        : replay.baseline +
+          replay.acc.slice(_commonPrefixLength(replay.acc, replay.baseline));
+    }
+
     setMessages((prev) => {
       // A restored run must keep writing into the bubble it was streaming
       // into, even when the saved partial turn ends with tool rows.
+      let index = -1;
       const resumeId = resumeAssistantIdRef.current;
       if (resumeId) {
-        const resumeIndex = prev.findIndex((m) => m.id === resumeId);
-        if (resumeIndex >= 0) {
-          const next = [...prev];
-          next[resumeIndex] = {
-            ...next[resumeIndex],
-            content: next[resumeIndex].content + content,
-            isStreaming: true,
-          };
-          return next;
+        index = prev.findIndex((m) => m.id === resumeId);
+        if (index < 0) resumeAssistantIdRef.current = null;
+      }
+      if (index < 0) {
+        const last = prev[prev.length - 1];
+        if (last && last.role === "assistant" && last.isStreaming) {
+          index = prev.length - 1;
         }
-        resumeAssistantIdRef.current = null;
       }
-      const last = prev[prev.length - 1];
-      if (last && last.role === "assistant" && last.isStreaming) {
-        return [
-          ...prev.slice(0, -1),
-          { ...last, content: last.content + content },
-        ];
-      }
-      return [
-        ...prev,
-        {
+      if (index < 0) {
+        const created: DisplayMessage = {
           id: uid(),
           role: "assistant",
-          content,
+          content: replayed ?? content,
           isStreaming: true,
-        },
-      ];
+        };
+        return [...prev, created];
+      }
+      const target = prev[index];
+      const nextContent =
+        replayed ?? _mergeAssistantChunk(target.content ?? "", content, snapshot);
+      if (nextContent === null) return prev;
+      const next = [...prev];
+      next[index] = { ...target, content: nextContent, isStreaming: true };
+      return next;
+    });
+  }, []);
+
+  /**
+   * Start replay mode for a reattached run's stream: remember what the restored
+   * bubble already shows so the replayed deltas can be absorbed instead of
+   * appended (see ``replayRef``).
+   */
+  const beginReplayFromStart = useCallback(() => {
+    const resumeId = resumeAssistantIdRef.current;
+    const target = resumeId
+      ? messagesRef.current.find((m) => m.id === resumeId)
+      : undefined;
+    replayRef.current = {
+      baseline: target?.content ?? "",
+      acc: "",
+      startedAt: Date.now(),
+    };
+  }, []);
+
+  /**
+   * Collapse a doubled tail before a turn is settled.
+   *
+   * Two sources can stream the same text (``message.delta`` + ``message.interim``
+   * , or a replay that slipped past the guards), and the runs were long enough
+   * that per-chunk comparison cannot catch them.  Only an exact duplicated
+   * tail block is removed, so genuine repetition in the answer survives.
+   */
+  const collapseDoubledTail = useCallback(() => {
+    setMessages((prev) => {
+      for (let index = prev.length - 1; index >= 0; index -= 1) {
+        if (prev[index].role !== "assistant") continue;
+        const text = prev[index].content ?? "";
+        const collapsed = _collapseDoubledTail(text);
+        if (collapsed === text) return prev;
+        const next = [...prev];
+        next[index] = { ...next[index], content: collapsed };
+        return next;
+      }
+      return prev;
     });
   }, []);
 
@@ -578,7 +665,9 @@ export function useChat() {
       if (stoppedRef.current || turnTokenRef.current !== turnToken) return;
       switch (event.type) {
         case "delta":
-          appendToAssistant(event.content);
+          // ``snapshot`` payloads (``message.interim``) restate text that has
+          // already been streamed — merge instead of appending verbatim.
+          appendToAssistant(event.content, event.snapshot === true);
           break;
         case "reasoning":
           appendReasoning(event.content, event.replace === true);
@@ -607,10 +696,14 @@ export function useChat() {
           // an `error` alongside the finish reason.
           if (event.error) setError(event.error);
           if (event.usage) attachUsage(event.usage);
+          // Last line of defence against a doubled answer before it is shown
+          // as final (and saved).
+          collapseDoubledTail();
           finishAssistant();
           break;
         case "error":
           setError(event.error);
+          collapseDoubledTail();
           finishAssistant();
           break;
       }
@@ -619,6 +712,7 @@ export function useChat() {
       appendReasoning,
       appendToAssistant,
       attachUsage,
+      collapseDoubledTail,
       finishAssistant,
       persistSessionLinks,
       updateToolCalls,
@@ -660,6 +754,7 @@ export function useChat() {
       activeRunIdRef.current = null;
       resumeAssistantIdRef.current = null;
       pendingSeqRef.current = null;
+      replayRef.current = null;
       setActiveRunId(null);
       setIsStreaming(false);
       setRecoveringRun(false);
@@ -675,6 +770,22 @@ export function useChat() {
     },
     [appendReattachedOutput, cancelReattach, finishAssistant, persistSessionLinks],
   );
+
+  /**
+   * Show a polled run's progress text inside the assistant bubble.
+   *
+   * Replace-only: the Runs API ``output`` is the complete text produced so far,
+   * so it can only ever *replace* the bubble (never append).  Without this the
+   * UI stayed frozen after a page switch until the run finished.
+   */
+  const applyProgressOutput = useCallback((output: string) => {
+    const text = output.trim();
+    if (!text) return;
+    const result = _mergeAuthoritativeRunOutput(messagesRef.current, text);
+    if (result.messages === messagesRef.current) return;
+    messagesRef.current = result.messages;
+    setMessages(result.messages);
+  }, []);
 
   /** Poll ``run-state`` every 3s until a recovered run reaches a final state. */
   const pollRunState = useCallback(
@@ -720,6 +831,12 @@ export function useChat() {
         }
 
         const status = (state.status || "").toUpperCase();
+        // Keep the visible answer growing while the run is still working: the
+        // run-state ``output`` is the complete text so far, so it replaces the
+        // bubble instead of appending (idempotent on every poll).
+        if (status !== "COMPLETED" && status !== "FAILED" && status !== "CANCELLED") {
+          if (state.output) applyProgressOutput(state.output);
+        }
         if (status === "COMPLETED") {
           settleRecoveredRun(runId, { output: state.output });
           return;
@@ -756,7 +873,7 @@ export function useChat() {
 
       void tick();
     },
-    [cancelReattach, resetReasoningAccumulator, settleRecoveredRun],
+    [applyProgressOutput, cancelReattach, resetReasoningAccumulator, settleRecoveredRun],
   );
 
   /**
@@ -764,12 +881,21 @@ export function useChat() {
    * replay TTL; otherwise — or when the subscription fails — poll run-state.
    */
   const resumeRunEvents = useCallback(
-    async (runId: string, lastSeq: number | null, token: number) => {
+    async (
+      runId: string,
+      lastSeq: number | null,
+      token: number,
+      replayFromStart = false,
+    ) => {
       const controller = new AbortController();
       abortRef.current = controller;
       const turnToken = turnTokenRef.current;
       let terminal = false;
       pendingSeqRef.current = lastSeq;
+      // Resubscribed without a cursor: Hermes replays the whole run, so absorb
+      // the replayed deltas against the text the restored bubble already shows
+      // instead of appending them twice.
+      if (replayFromStart) beginReplayFromStart();
       // Persist the replayed transcript on the same 5s cadence as a live turn
       // so a second page switch keeps making progress instead of replaying.
       const saveTimer = setInterval(() => {
@@ -801,7 +927,7 @@ export function useChat() {
         pollRunState(runId);
       }
     },
-    [dispatchRunEvent, pollRunState, saveStreamingSnapshot, settleRecoveredRun],
+    [beginReplayFromStart, dispatchRunEvent, pollRunState, saveStreamingSnapshot, settleRecoveredRun],
   );
 
   /** Reattach to a run recorded on a restored chat session. */
@@ -821,8 +947,12 @@ export function useChat() {
       const saved = _readRunSeq(runId);
       const withinTtl =
         saved !== null && Date.now() - saved.at <= RUN_EVENT_REPLAY_TTL_MS;
-      if (withinTtl) {
-        void resumeRunEvents(runId, saved.seq, token);
+      if (saved === null || withinTtl) {
+        // SSE is the only path that keeps the answer growing in real time after
+        // a page switch.  A cursor-less resume replays from the beginning and
+        // is absorbed against the restored text (``replayRef``); a run Hermes
+        // has already expired in turn 404s and falls back to polling below.
+        void resumeRunEvents(runId, saved?.seq ?? null, token, saved === null);
       } else {
         void pollRunState(runId);
       }
@@ -882,6 +1012,7 @@ export function useChat() {
       isStreamingRef.current = true;
       resumeAssistantIdRef.current = null;
       pendingSeqRef.current = null;
+      replayRef.current = null;
       detachedRef.current = false;
       toolSeqRef.current = 0;
       toolArrivalRef.current = 0;
@@ -1048,7 +1179,15 @@ export function useChat() {
           typeof state?.output === "string" ? state.output : "";
         const output = serverOutput || fallbackOutput;
         const usage = chatRunUsage(state?.usage);
-        const result = _mergeAuthoritativeRunOutput(messagesRef.current, output, usage);
+        // A COMPLETED run's ``output`` is the authoritative answer: take it even
+        // when it is *shorter* than what the stream rendered, which is how a
+        // doubled / replayed body gets corrected instead of kept.
+        const result = _mergeAuthoritativeRunOutput(
+          messagesRef.current,
+          output,
+          usage,
+          statusText === "COMPLETED",
+        );
 
         console.info("[chat] reconciled", {
           runId,
@@ -1226,6 +1365,7 @@ export function useChat() {
           runIdRef.current = null;
           resumeAssistantIdRef.current = null;
           pendingSeqRef.current = null;
+          replayRef.current = null;
           if (finishedRunId) {
             // A naturally finished run must not remain reattachable.  A turn
             // detached by a route change (``detachedRef``) keeps its link: the
@@ -1264,6 +1404,7 @@ export function useChat() {
           runIdRef.current = null;
           resumeAssistantIdRef.current = null;
           pendingSeqRef.current = null;
+          replayRef.current = null;
           abortRef.current = null;
           toast.error(`发送失败: ${msg}`);
         }
@@ -1301,6 +1442,7 @@ export function useChat() {
     isStreamingRef.current = false;
     resumeAssistantIdRef.current = null;
     pendingSeqRef.current = null;
+    replayRef.current = null;
     if (partialSaveTimerRef.current !== null) {
       clearInterval(partialSaveTimerRef.current);
       partialSaveTimerRef.current = null;
@@ -1347,6 +1489,7 @@ export function useChat() {
     isStreamingRef.current = false;
     resumeAssistantIdRef.current = null;
     pendingSeqRef.current = null;
+    replayRef.current = null;
     if (partialSaveTimerRef.current !== null) {
       clearInterval(partialSaveTimerRef.current);
       partialSaveTimerRef.current = null;
@@ -1465,6 +1608,7 @@ export function useChat() {
     isStreamingRef.current = false;
     resumeAssistantIdRef.current = null;
     pendingSeqRef.current = null;
+    replayRef.current = null;
     if (partialSaveTimerRef.current !== null) {
       clearInterval(partialSaveTimerRef.current);
       partialSaveTimerRef.current = null;
@@ -1506,6 +1650,7 @@ export function useChat() {
       isStreamingRef.current = false;
       resumeAssistantIdRef.current = null;
       pendingSeqRef.current = null;
+      replayRef.current = null;
       if (partialSaveTimerRef.current !== null) {
         clearInterval(partialSaveTimerRef.current);
         partialSaveTimerRef.current = null;
@@ -1857,9 +2002,87 @@ function _saveableMessages(
     }));
 }
 
+/**
+ * Shortest chunk that may still be a whole-sentence replay of the tail.  Token
+ * deltas are far shorter, so a short chunk is always appended.
+ */
+const ASSISTANT_REPLAY_MIN_CHARS = 10;
+
+/**
+ * How long a cursor-less reattach keeps absorbing replayed deltas before it
+ * gives up and lets the terminal reconciliation settle the answer.
+ */
+const REPLAY_CATCHUP_MAX_MS = 15000;
+
+/** Shortest block that is treated as a duplicated tail when settling a turn. */
+const ASSISTANT_DOUBLED_MIN_CHARS = 20;
+
+/** Length of the common opening of two strings. */
+function _commonPrefixLength(a: string, b: string): number {
+  const limit = Math.min(a.length, b.length);
+  let index = 0;
+  while (index < limit && a[index] === b[index]) index += 1;
+  return index;
+}
+
+/**
+ * Merge one incoming delta into the assistant body.
+ *
+ * Two delivery shapes exist on the wire and they overlap:
+ *
+ * - incremental chunks (``message.delta``) that must be appended;
+ * - whole-block snapshots (``message.interim``) that restate text which was
+ *   already streamed — appending them rendered every mid-turn sentence twice,
+ *   which is exactly the "输出重复两次" symptom.
+ *
+ * A snapshot therefore replaces the body when it extends it, is dropped when it
+ * is already contained, and only appends its unseen part otherwise.  Plain
+ * chunks are appended, except for a long exact repetition of the tail (a
+ * replayed frame), which is dropped.
+ *
+ * @returns the new body, or ``null`` when the chunk carries nothing new.
+ */
+function _mergeAssistantChunk(
+  current: string,
+  chunk: string,
+  snapshot: boolean,
+): string | null {
+  if (!chunk) return null;
+  if (!current) return chunk;
+  if (chunk === current) return null;
+  // Whole-block snapshot that is longer than what we show: it is the same text
+  // plus more (Hermes re-sends the accumulated interim message).
+  if (snapshot && chunk.startsWith(current)) return chunk;
+  // Already shown at the tail — either a snapshot or a replayed long chunk.
+  if (current.endsWith(chunk) && (snapshot || chunk.length >= ASSISTANT_REPLAY_MIN_CHARS)) {
+    return null;
+  }
+  // Snapshot restating an earlier paragraph of this turn.
+  if (snapshot && current.includes(chunk)) return null;
+  return current + chunk;
+}
+
+/**
+ * Drop an exactly duplicated tail block from a finished answer.
+ *
+ * When the same text arrived through both channels for a long stretch, the
+ * per-chunk guards cannot see it (`current.endsWith(chunk)` never matches a
+ * one-token chunk).  Only an *exact* repetition of a whole block (≥ 20 chars)
+ * is removed, so genuinely repeated phrases in an answer survive.
+ */
+function _collapseDoubledTail(text: string): string {
+  const length = text.length;
+  const maxBlock = Math.floor(length / 2);
+  for (let block = maxBlock; block >= ASSISTANT_DOUBLED_MIN_CHARS; block -= 1) {
+    if (text.slice(length - block) === text.slice(length - 2 * block, length - block)) {
+      return text.slice(0, length - block);
+    }
+  }
+  return text;
+}
+
 /** Session title derived from the first user message. */
-function _titleForMessages(messages: DisplayMessage[]): string {
-  const firstUser = messages.find((m) => m.role === "user");
+function _titleForMessages(messages: DisplayMessage[]): string {  const firstUser = messages.find((m) => m.role === "user");
   if (!firstUser) return "新对话";
   const { content } = firstUser;
   return content.slice(0, 40) + (content.length > 40 ? "…" : "");
@@ -1881,6 +2104,7 @@ function _mergeAuthoritativeRunOutput(
   messages: DisplayMessage[],
   output: string,
   usage?: { prompt_tokens: number; completion_tokens: number },
+  authoritative = false,
 ): {
   messages: DisplayMessage[];
   replaced: boolean;
@@ -1921,7 +2145,13 @@ function _mergeAuthoritativeRunOutput(
   // "More complete" is deliberately mechanical: empty → always take the
   // server text; otherwise only a strictly longer output wins.  Equal content
   // is already complete and a shorter server snapshot must not truncate it.
-  const replace = text.length > 0 && (current.length === 0 || text.length > current.length);
+  //
+  // ``authoritative`` (a COMPLETED run) overrides that: the server output is
+  // the answer, so it also replaces a *longer* local body — that body is a
+  // stream artefact (doubled deltas / a replayed interim), not real content.
+  const replace = authoritative
+    ? text.length > 0
+    : text.length > 0 && (current.length === 0 || text.length > current.length);
   if (!replace && !usage) {
     return { messages, replaced: false, currentLength: current.length };
   }
@@ -1963,6 +2193,13 @@ function _withRunOutput(
   const last = messages[lastAssistant];
   if (last.content === output) return messages;
   if (last.content.length === 0 || output.startsWith(last.content)) {
+    const next = [...messages];
+    next[lastAssistant] = { ...last, content: output, isStreaming: false };
+    return next;
+  }
+  // The saved body already carries this output (a doubled / replayed turn):
+  // replace it in place — appending would show the answer one more time.
+  if (last.content.includes(output)) {
     const next = [...messages];
     next[lastAssistant] = { ...last, content: output, isStreaming: false };
     return next;

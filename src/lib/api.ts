@@ -529,7 +529,17 @@ export interface ToolCallDelta {
 
 /** Parsed SSE event from the chat stream endpoint. */
 export type ChatStreamEvent =
-  | { type: "delta"; content: string }
+  | {
+      type: "delta";
+      content: string;
+      /**
+       * The payload is a whole-block snapshot (Hermes ``message.interim``), not
+       * an incremental chunk.  The same mid-turn text also arrives token by
+       * token on ``message.delta``, so a consumer that appended both rendered
+       * every interim message twice — snapshots are merged instead.
+       */
+      snapshot?: boolean;
+    }
   | { type: "reasoning"; content: string; replace?: boolean }
   | { type: "session"; session_id: string }
   | { type: "tool_call"; tool_calls: ToolCallDelta[] }
@@ -1811,8 +1821,11 @@ export function normalizeRunEvent(
     }
     case "message.interim": {
       // Mid-turn commentary beside tool calls — render as normal answer text.
+      // ``text`` is the *complete* interim message (it was already streamed as
+      // ``message.delta`` frames), so it travels as a snapshot: appending it as
+      // a delta duplicated the sentence, which is the "每句输出两次" bug.
       const content = _runStr(raw.text);
-      return content ? { type: "delta", content } : null;
+      return content ? { type: "delta", content, snapshot: true } : null;
     }
     case "reasoning.delta":
     case "reasoning.available":
